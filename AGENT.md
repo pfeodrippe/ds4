@@ -1,53 +1,34 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
-GGUF runner. The goal is a small, readable, high-performance C codebase with
-Objective-C only where Metal requires it and Metal kernels under `metal/`.
+`ds4.c` is being rewritten in place as a Qwen3-Coder-30B-A3B-Instruct specific
+native inference engine. It remains deliberately narrow: not a generic GGUF
+runner, not an Ollama wrapper, and not a multi-model framework.
 
 ## Goals
 
-- Keep the production path as whole-model Metal graph inference.
+- Keep the original DS4 project shape: C core, Objective-C only for Metal,
+  kernels under `metal/`, narrow public API in `ds4.h`, CLI/server outside
+  tensor internals.
+- Support exactly one model: `Qwen3-Coder-30B-A3B-Instruct`.
 - Keep model loading mmap-backed; do not eagerly copy the full GGUF.
-- Keep the CPU backend CPU-only and use it only as reference/debug code.
-- Preserve correctness before speed. Do not keep a faster path with unexplained
-  attention, KV cache, or logits drift.
-- Make long local agent sessions practical through live KV reuse and disk KV
-  checkpoints.
+- Preserve strict GGUF metadata and tensor validation.
+- Prefer correctness before speed; add Metal acceleration only after the CPU
+  graph semantics are clear.
 
-## Quality Rules
+## Current Conversion State
 
-- Comment important inference code where the model mechanics, cache lifetime,
-  memory policy, or API orchestration are not obvious from the local code.
-- Prefer comments beside the implementation over separate design documents.
-- Keep comments instructive and compact: explain why a shape, ordering, cache
-  boundary, or memory choice exists.
-- Keep public APIs narrow. CLI/server code should not know tensor internals.
-- Do not add permanent semantic variants behind flags. Diagnostic switches are
-  fine when they validate the one release path.
-- Do not introduce C++.
-
-## Safety
-
-- Avoid large CPU inference runs on macOS; the CPU path has previously exposed
-  kernel VM failures with very large mappings.
-- Do not run multiple huge model processes concurrently. The instance lock is
-  intentional.
-- Prefer short Metal smoke tests for build verification.
-
-## Layout
-
-- `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
-  sessions, disk-cache payload serialization.
-- `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
-  tool-call mapping, disk KV cache policy.
-- `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
-- `tests/`: unit and live integration tests.
-- `misc/`: ignored notes, experiments, and old planning material.
+- Download target: Qwen3-Coder Q4_K_M GGUF.
+- Default model path: `qwen3-coder.gguf`.
+- Metadata validation: `qwen3moe` fixed shape.
+- Tensor binding: Qwen attention and MoE tensor names.
+- Chat rendering: Qwen ChatML.
+- Native CPU reference generation: Qwen GQA, q/k RMSNorm, RoPE, top-8 MoE, and
+  Q4_K/Q6_K matvec kernels.
+- Metal graph: still needs a Qwen rewrite; CPU is the default backend until
+  that graph is Qwen-shaped.
 
 ## Testing
 
-Use `make` for build validation. Use `make test` for unit/regression tests when a
-model and Metal are available. Use live server tests only when intentionally
-testing the API surface.
+Use `make ds4` for build validation. Use `./ds4 --inspect -m qwen3-coder.gguf`
+after downloading the model to validate the real GGUF. Use a tiny CPU smoke such
+as `./ds4 -p "hi" -n 1 --ctx 64 --backend cpu` to verify generation.

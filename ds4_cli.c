@@ -3,7 +3,7 @@
 
 /* ds4 CLI.
  *
- * One-shot mode builds a single DeepSeek chat prompt and exits.  Interactive
+ * One-shot mode builds a single Qwen3-Coder chat prompt and exits.  Interactive
  * mode keeps a rendered token transcript plus one ds4_session, so follow-up
  * turns reuse the live Metal KV checkpoint just like the server does.  The CLI
  * deliberately keeps policy here and leaves graph/cache mechanics inside the
@@ -85,7 +85,7 @@ static void usage(FILE *fp) {
         "\n"
         "Model and runtime:\n"
         "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
+        "      GGUF model path. Default: qwen3-coder.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -95,11 +95,11 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
+        "      Use the Metal graph backend. Qwen support is not enabled yet.\n"
         "  --cuda\n"
-        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
+        "      Use the CUDA graph backend. Qwen support is not enabled yet.\n"
         "  --cpu\n"
-        "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
+        "      Use the native Qwen CPU backend. This is the current default.\n"
         "  --backend NAME\n"
         "      Select backend explicitly: metal, cuda, or cpu.\n"
         "  -t, --threads N\n"
@@ -135,11 +135,11 @@ static void usage(FILE *fp) {
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
-        "      Use normal thinking mode. This is the default.\n"
+        "      Accepted for compatibility; Qwen ChatML ignores DS4 thinking tags.\n"
         "  --think-max\n"
-        "      Use Think Max when --ctx is at least 393216 tokens; otherwise normal thinking.\n"
+        "      Accepted for compatibility; Qwen ChatML ignores DS4 Think Max.\n"
         "  --nothink\n"
-        "      Start assistant turns with </think> for direct non-thinking replies.\n"
+        "      Default Qwen mode.\n"
         "\n"
         "Interactive commands:\n"
         "  /help\n"
@@ -192,11 +192,11 @@ static void usage(FILE *fp) {
         "Normal CLI commands:\n"
         "  ./ds4\n"
         "  ./ds4 -p \"Scrivi una storia su una papera scansafatiche\"\n"
-        "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
+        "  ./ds4 --prompt-file prompt.txt --ctx 32768\n"
         "\n"
         "Notes:\n"
         "  The CLI keeps KV cache state across interactive turns on session backends.\n"
-        "  CPU mode supports interactive chat too, but it is a slow reference/debug path.\n"
+        "  CPU mode is the current Qwen execution path.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -244,13 +244,7 @@ static ds4_backend parse_backend(const char *s) {
 }
 
 static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
-    return DS4_BACKEND_CUDA;
-#endif
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -332,8 +326,8 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 }
 
 static bool is_rendered_chat_prompt(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
+    const char *mark = "<|im_start|>";
+    return prompt && strncmp(prompt, mark, strlen(mark)) == 0;
 }
 
 typedef struct {
@@ -1386,7 +1380,7 @@ static char *read_prompt_file(const char *path, bool fatal) {
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "qwen3-coder.gguf",
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -1400,7 +1394,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_NONE,
         },
     };
 
@@ -1547,6 +1541,7 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.inspect) cfg.engine.backend = DS4_BACKEND_CPU;
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");

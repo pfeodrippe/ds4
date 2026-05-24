@@ -1,12 +1,8 @@
 #!/bin/sh
 set -e
 
-REPO="antirez/deepseek-v4-gguf"
-Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
-Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
-Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf"
-Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+REPO="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+MODEL_FILE="Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -18,39 +14,15 @@ TOKEN=${HF_TOKEN:-}
 
 usage() {
     cat <<EOF
-DeepSeek V4 Flash GGUF downloader
+Qwen3-Coder-30B-A3B-Instruct GGUF downloader
 
 Usage:
-  ./download_model.sh q2-imatrix [--token TOKEN]
-  ./download_model.sh q4-imatrix [--token TOKEN]
-  ./download_model.sh q2 [--token TOKEN]
-  ./download_model.sh q4 [--token TOKEN]
-  ./download_model.sh mtp [--token TOKEN]
+  ./download_model.sh [--token TOKEN]
 
-Targets:
-  *** PREFERRED GGUF FILES: USE THE IMATRIX VERSIONS BELOW ***
-
-  q2-imatrix
-       2-bit routed experts, about 81 GB on disk.
-       Recommended model for 96 and 128 GB RAM machines.
-
-  q4-imatrix
-       4-bit routed experts, about 153 GB on disk.
-       Recommended model for machines with 256 GB RAM or more.
-
-  Legacy GGUF files:
-
-  q2   2-bit routed experts, about 81 GB on disk.
-       Older non-imatrix model for 96 and 128 GB RAM machines. Prefer
-       q2-imatrix unless you specifically need the legacy quant.
-
-  q4   4-bit routed experts, about 153 GB on disk.
-       Older non-imatrix model for machines with 256 GB RAM or more. Prefer
-       q4-imatrix unless you specifically need the legacy quant.
-
-  mtp  Optional speculative decoding component, about 3.5 GB on disk.
-       It is useful with q2-imatrix, q4-imatrix, q2, and q4, but must be
-       enabled explicitly with --mtp when running ds4 or ds4-server.
+Target:
+  $MODEL_FILE
+      Q4_K_M GGUF, about 17.3 GiB.
+      This is the only supported model target for this repository.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -60,43 +32,10 @@ Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
-After q2-imatrix/q4-imatrix/q2/q4 downloads the script updates:
-  ./ds4flash.gguf -> <download directory>/<selected model>
-
-Then the default commands work:
-  ./ds4 -p "Hello"
-  ./ds4-server --ctx 100000
-
-After downloading mtp, enable it explicitly, for example:
-  ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
+After download the script updates:
+  ./qwen3-coder.gguf -> <download directory>/$MODEL_FILE
 EOF
 }
-
-if [ $# -eq 0 ]; then
-    usage
-    exit 1
-fi
-
-MODEL=$1
-shift
-
-case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
-    q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
-    q2) MODEL_FILE=$Q2_FILE ;;
-    q4) MODEL_FILE=$Q4_FILE ;;
-    mtp) MODEL_FILE=$MTP_FILE ;;
-    -h|--help|help)
-        usage
-        exit 0
-        ;;
-    *)
-        echo "Unknown model: $MODEL" >&2
-        echo >&2
-        usage >&2
-        exit 1
-        ;;
-esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -108,8 +47,14 @@ while [ $# -gt 0 ]; do
             fi
             TOKEN=$1
             ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
         *)
             echo "Unknown option: $1" >&2
+            echo >&2
+            usage >&2
             exit 1
             ;;
     esac
@@ -155,16 +100,8 @@ download_one() {
 
 download_one "$MODEL_FILE"
 
-if [ "$MODEL" = "mtp" ]; then
-    echo
-    echo "MTP is an optional component for q2-imatrix, q4-imatrix, q2, and q4."
-    echo "Enable it explicitly, for example:"
-    echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-else
-    cd "$ROOT"
-    ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
-    echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
-fi
-
+cd "$ROOT"
+ln -sfn "$OUT_DIR/$MODEL_FILE" qwen3-coder.gguf
+echo "Linked ./qwen3-coder.gguf -> $OUT_DIR/$MODEL_FILE"
 echo
 echo "Done."

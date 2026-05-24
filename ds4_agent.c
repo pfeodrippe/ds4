@@ -448,13 +448,7 @@ static ds4_backend parse_backend(const char *s) {
 }
 
 static ds4_backend default_backend(void) {
-#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
-    return DS4_BACKEND_CUDA;
-#endif
 }
 
 static double now_sec(void) {
@@ -472,7 +466,7 @@ static void usage(FILE *fp) {
         "the live KV session.\n"
         "\n"
         "Options:\n"
-        "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
+        "  -m, --model FILE        GGUF model path. Default: qwen3-coder.gguf\n"
         "  --mtp FILE             Optional MTP support GGUF.\n"
         "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
         "  --mtp-margin F         MTP verifier margin. Default: 3\n"
@@ -487,9 +481,9 @@ static void usage(FILE *fp) {
         "  --top-p F              Nucleus sampling probability. Default: 1\n"
         "  --min-p F              Min-p sampling threshold. Default: 0.05\n"
         "  --seed N               Sampling seed.\n"
-        "  --think                Use normal thinking mode. Default.\n"
-        "  --think-max            Use Think Max when context is large enough.\n"
-        "  --nothink              Disable thinking.\n"
+        "  --think                Accepted for compatibility; Qwen ignores DS4 thinking tags.\n"
+        "  --think-max            Accepted for compatibility; Qwen ignores DS4 Think Max.\n"
+        "  --nothink              Default Qwen mode.\n"
         "  --backend NAME         metal, cuda, or cpu.\n"
         "  --metal, --cuda, --cpu Select backend explicitly.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -526,7 +520,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 static agent_config parse_options(int argc, char **argv) {
     agent_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "qwen3-coder.gguf",
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -538,7 +532,7 @@ static agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_NONE,
         },
     };
 
@@ -893,11 +887,9 @@ static char *agent_build_system_prompt_reminder(void) {
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra) {
-    /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
-     * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
-     * the model's dedicated DSML token.  Do not apply that tokenizer to user
-     * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
-     * ｜DSML｜ must remain plain content, not control tokens. */
+    /* The built-in tool prompt is trusted control text.  Tokenize it like a
+     * rendered chat prompt so literal ChatML markers in examples are handled as
+     * control tokens.  Do not apply that tokenizer to user supplied -sys text. */
     char *tools_prompt = agent_build_tools_prompt();
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
@@ -3118,7 +3110,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char start[] = "<｜DSML｜tool_calls>";
     agent_stream_note_thinking_byte(sr, c);
 
-    /* DeepSeek usually emits one or more blank lines after </think> before
+    /* Qwen usually emits one or more blank lines after </think> before
      * either prose or a DSML tool stanza.  At that point the bytes are just a
      * visual gap between the hidden thinking phase and the real answer, and
      * printing them makes tool calls appear after odd empty lines.  We only
@@ -4002,8 +3994,8 @@ static char *agent_session_title_from_prompt(const char *prompt,
  * that render to the terminal pass an explicit display budget. */
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
+    static const char user_mark[] = "<|im_start|>user\n";
+    static const char assistant_mark[] = "<|im_start|>assistant\n";
     const char *p = text ? strstr(text, user_mark) : NULL;
     if (!p) return xstrdup("(no user prompt)");
     p += strlen(user_mark);
@@ -4095,9 +4087,9 @@ static const char *agent_memmem(const char *hay, size_t hay_len,
 static const char *agent_history_next_marker(const char *p, const char *end,
                                              agent_history_mark *mark,
                                              size_t *mark_len) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    static const char eos_mark[] = "<｜end▁of▁sentence｜>";
+    static const char user_mark[] = "<|im_start|>user\n";
+    static const char assistant_mark[] = "<|im_start|>assistant\n";
+    static const char eos_mark[] = "<|im_end|>";
     const char *u = agent_memmem(p, (size_t)(end - p),
                                  user_mark, sizeof(user_mark) - 1);
     const char *a = agent_memmem(p, (size_t)(end - p),
@@ -6509,7 +6501,7 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int target = bottom - tail_budget;
     if (target < sys_len) target = sys_len;
 
-    int user_id = agent_special_token_id(w->engine, "<｜User｜>");
+    int user_id = agent_special_token_id(w->engine, "<|im_start|>");
     if (user_id < 0) return target;
 
     for (int i = target; i < bottom; i++) {

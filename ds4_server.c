@@ -745,13 +745,13 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
-    r->model = xstrdup("deepseek-v4-flash");
+    r->model = xstrdup("qwen3-coder-30b-a3b-instruct");
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
-    r->think_mode = DS4_THINK_HIGH;
+    r->think_mode = DS4_THINK_NONE;
 }
 
 static void request_free(request *r) {
@@ -883,11 +883,13 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 }
 
 static bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-chat");
+    (void)model;
+    return false;
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-reasoner");
+    (void)model;
+    return false;
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2128,7 +2130,7 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
 }
 
 static void append_tool_result_text(buf *b, const char *s) {
-    /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
+    /* Tool output is data.  Qwen's renderer keeps it as ordinary text inside
      * <tool_result>...</tool_result>, so preserving literal '<', '>' and '&' is
      * important for read-file tools and shell output.  The only delimiter we must
      * protect is the wrapper's own closing tag; otherwise a file containing that
@@ -2260,7 +2262,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
     (void)tool_orders;
-    const bool think = ds4_think_mode_enabled(think_mode);
+    (void)think_mode;
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
@@ -2282,54 +2284,43 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     }
 
     buf out = {0};
-    buf_puts(&out, "<｜begin▁of▁sentence｜>");
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
-    buf_puts(&out, system.ptr ? system.ptr : "");
+    if (system.ptr && system.ptr[0]) {
+        buf_puts(&out, "<|im_start|>system\n");
+        buf_puts(&out, system.ptr);
+        buf_puts(&out, "<|im_end|>\n");
+    }
 
     bool pending_assistant = false;
-    bool pending_tool_result = false;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<|im_start|>user\n");
             buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = true;
-            pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<|im_start|>user\n");
             buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
             buf_puts(&out, "</tool_result>");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = true;
-            pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    if (tool_context || i > last_user_idx) {
-                        buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
-                        buf_puts(&out, "</think>");
-                    } else {
-                        buf_puts(&out, "</think>");
-                    }
-                } else {
-                    buf_puts(&out, "</think>");
-                }
+                buf_puts(&out, "<|im_start|>assistant\n");
+                if (tool_context || i > last_user_idx) buf_puts(&out, m->reasoning ? m->reasoning : "");
             }
             buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = false;
-            pending_tool_result = false;
         }
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+        buf_puts(&out, "<|im_start|>assistant\n");
     }
 
     buf_free(&system);
@@ -2354,50 +2345,41 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * replay/live-KV boundary. */
 static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                                    ds4_think_mode think_mode) {
-    const bool think = ds4_think_mode_enabled(think_mode);
+    (void)think_mode;
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
+    buf_puts(&out, "<|im_end|>\n");
 
     bool pending_assistant = false;
-    bool pending_tool_result = false;
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<|im_start|>user\n");
             buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = true;
-            pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
+            buf_puts(&out, "<|im_start|>user\n");
             buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
             buf_puts(&out, "</tool_result>");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = true;
-            pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
-                    buf_puts(&out, "</think>");
-                } else {
-                    buf_puts(&out, "</think>");
-                }
+                buf_puts(&out, "<|im_start|>assistant\n");
+                buf_puts(&out, m->reasoning ? m->reasoning : "");
             }
             buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            buf_puts(&out, "<|im_end|>\n");
             pending_assistant = false;
-            pending_tool_result = false;
         }
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+        buf_puts(&out, "<|im_start|>assistant\n");
     }
     return buf_take(&out);
 }
@@ -4082,12 +4064,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     buf rendered = {0};
-    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
+    buf_puts(&rendered, "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n");
+    buf_puts(&rendered, "<|im_start|>user\n");
     buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    buf_puts(&rendered, "<|im_end|>\n<|im_start|>assistant\n");
     r->prompt_text = buf_take(&rendered);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
@@ -9376,6 +9356,16 @@ static thinking_state thinking_state_from_prompt(const request *r) {
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
+    const char *qwen_system = "<|im_start|>system\n";
+    const size_t qwen_system_len = strlen(qwen_system);
+    if (!strncmp(p, qwen_system, qwen_system_len)) {
+        p += qwen_system_len;
+        const char *end = strstr(p, "<|im_end|>");
+        if (!end) end = p + strlen(p);
+        while (end > p && isspace((unsigned char)end[-1])) end--;
+        return xstrndup(p, (size_t)(end - p));
+    }
+
     const char *bos = "<｜begin▁of▁sentence｜>";
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
@@ -9415,13 +9405,10 @@ static char *build_invalid_dsml_tool_error_suffix(const request *r,
     }
 
     buf suffix = {0};
-    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+    (void)thinking;
+    buf_puts(&suffix, "<|im_end|>\n<|im_start|>user\n<tool_result>");
     append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
-    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    buf_puts(&suffix, "</tool_result><|im_end|>\n<|im_start|>assistant\n");
 
     free(system);
     buf_free(&tool_error);
@@ -9604,13 +9591,11 @@ static void send_prefill_failure_response(server *s, const job *j,
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
-    if (ds4_think_mode_enabled(r->think_mode)) {
-        buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
-    }
+    (void)r;
+    if (reasoning && reasoning[0]) buf_puts(&suffix, reasoning);
     buf_puts(&suffix, content ? content : "");
     append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    buf_puts(&suffix, "<|im_end|>\n");
     return buf_take(&suffix);
 }
 
@@ -9627,15 +9612,12 @@ static char *build_responses_visible_assistant_suffix(const request *r,
      * reasoning in the remembered visible prefix when this assistant turn ended
      * in tool calls.  A client that does replay final-answer reasoning will not
      * match this visible shortcut and can still use exact token-prefix replay. */
-    if (ds4_think_mode_enabled(r->think_mode)) {
-        if (r->reasoning_summary_emit && calls && calls->len > 0) {
-            buf_puts(&suffix, reasoning ? reasoning : "");
-        }
-        buf_puts(&suffix, "</think>");
+    if (r->reasoning_summary_emit && calls && calls->len > 0 && reasoning) {
+        buf_puts(&suffix, reasoning);
     }
     buf_puts(&suffix, content ? content : "");
     append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    buf_puts(&suffix, "<|im_end|>\n");
     return buf_take(&suffix);
 }
 
@@ -11005,11 +10987,11 @@ typedef struct {
 static void append_model_json_values(buf *b, int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
-        "{\"id\":\"deepseek-v4-flash\","
+        "{\"id\":\"qwen3-coder-30b-a3b-instruct\","
         "\"object\":\"model\","
         "\"created\":1767225600,"
         "\"owned_by\":\"ds4.c\","
-        "\"name\":\"DeepSeek V4 Flash\","
+        "\"name\":\"Qwen3-Coder-30B-A3B-Instruct\","
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -11087,7 +11069,7 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/qwen3-coder-30b-a3b-instruct")) {
         send_model(s, fd);
         http_request_free(&hr);
         goto done;
@@ -11291,7 +11273,7 @@ static void usage(FILE *fp) {
         "\n"
         "Model and runtime:\n"
         "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
+        "      GGUF model path. Default: qwen3-coder.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -11331,13 +11313,10 @@ static void usage(FILE *fp) {
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "\n"
-        "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
-        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
-        "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
+        "Qwen ChatML and sampling:\n"
+        "  Chat requests render as Qwen ChatML. DS4 thinking tags are not injected.\n"
+        "  thinking/reasoning_effort fields are accepted for client compatibility.\n"
         "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-disk-dir DIR\n"
@@ -11389,19 +11368,13 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
 }
 
 static ds4_backend default_server_backend(void) {
-#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
-#else
-    return DS4_BACKEND_CUDA;
-#endif
 }
 
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "qwen3-coder.gguf",
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
@@ -12801,7 +12774,7 @@ static void test_streaming_holds_partial_utf8(void) {
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(r.think_mode == DS4_THINK_NONE);
     TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
@@ -12855,9 +12828,9 @@ static void test_render_think_max_prompt_prefix(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
-    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
-    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(!strncmp(prompt, "<|im_start|>system\n", strlen("<|im_start|>system\n")));
+    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
 
     free(prompt);
@@ -12874,7 +12847,7 @@ static void test_render_non_thinking_prompt_closes_think(void) {
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
-    TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜></think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
 }
@@ -12898,8 +12871,8 @@ static void test_render_drops_old_reasoning_without_tools(void) {
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
-    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>first answer") != NULL);
-    TEST_ASSERT(strstr(prompt, "<｜User｜>second<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\nfirst answer<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>user\nsecond<|im_end|>\n<|im_start|>assistant\n") != NULL);
 
     free(prompt);
     chat_msgs_free(&msgs);
@@ -12927,13 +12900,13 @@ static void test_render_preserves_reasoning_with_tools(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "tool reasoning") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
     free(prompt);
 
     prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "tool reasoning") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
 
     free(prompt);
@@ -12960,7 +12933,7 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     TEST_ASSERT(prompt != NULL);
     const char *tools  = strstr(prompt, "## Tools");
     const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
-    const char *user_m = strstr(prompt, "<｜User｜>");
+    const char *user_m = strstr(prompt, "<|im_start|>user\n");
     TEST_ASSERT(tools && client && user_m);
     TEST_ASSERT(tools  < client);
     TEST_ASSERT(client < user_m);
@@ -13056,8 +13029,8 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
     TEST_ASSERT(description < command);
-    TEST_ASSERT(strstr(suffix, "</think>") != NULL);
-    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") != NULL);
+    TEST_ASSERT(strstr(suffix, "</think>") == NULL);
+    TEST_ASSERT(strstr(suffix, "<|im_end|>\n") != NULL);
 
     free(suffix);
     free(content);
@@ -13343,19 +13316,19 @@ static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     request r = {0};
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(
-        "<｜begin▁of▁sentence｜>"
-        "## Tools\nschema\n\nSystem rule\n\n"
-        "<｜User｜>Hi<｜Assistant｜><think>");
+        "<|im_start|>system\n"
+        "## Tools\nschema\n\nSystem rule\n"
+        "<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
     thinking_state st = {.inside = true};
 
     char *suffix = build_invalid_dsml_tool_error_suffix(&r, &st, "missing invoke name");
     TEST_ASSERT(suffix != NULL);
-    TEST_ASSERT(strstr(suffix, "</think><｜end▁of▁sentence｜><｜User｜><tool_result>") == suffix);
+    TEST_ASSERT(strstr(suffix, "<|im_end|>\n<|im_start|>user\n<tool_result>") == suffix);
     TEST_ASSERT(strstr(suffix, "Tool error: invalid DSML tool call: missing invoke name") != NULL);
     TEST_ASSERT(strstr(suffix, "The previous assistant output was not executed") != NULL);
     TEST_ASSERT(strstr(suffix, "System prompt reminder:\n## Tools\nschema\n\nSystem rule") != NULL);
-    TEST_ASSERT(strstr(suffix, "<｜User｜>Hi") == NULL);
-    TEST_ASSERT(strstr(suffix, "</tool_result><｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "<|im_start|>user\nHi") == NULL);
+    TEST_ASSERT(strstr(suffix, "</tool_result><|im_end|>\n<|im_start|>assistant\n") != NULL);
 
     free(suffix);
     free(r.prompt_text);
@@ -13709,10 +13682,10 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
     TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
     TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+                         "<|im_end|>\n<|im_start|>user\n<tool_result>",
+                         strlen("<|im_end|>\n<|im_start|>user\n<tool_result>")));
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "/tmp</tool_result>") != NULL);
-    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<|im_start|>assistant\n") != NULL);
     TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "Bash") == NULL);
 
     chat_msgs_free(&msgs);
@@ -13885,10 +13858,10 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
     TEST_ASSERT(r.responses_live_suffix_text != NULL);
     TEST_ASSERT(!strncmp(r.responses_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+                         "<|im_end|>\n<|im_start|>user\n<tool_result>",
+                         strlen("<|im_end|>\n<|im_start|>user\n<tool_result>")));
     TEST_ASSERT(strstr(r.responses_live_suffix_text, "/tmp</tool_result>") != NULL);
-    TEST_ASSERT(strstr(r.responses_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text, "<|im_start|>assistant\n") != NULL);
     TEST_ASSERT(strstr(r.responses_live_suffix_text, "exec_command") == NULL);
 
     chat_msgs_free(&msgs);
@@ -14013,7 +13986,7 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
                                                             "hidden summary",
                                                             NULL);
     TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
-    TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
+    TEST_ASSERT(strstr(suffix, "5<|im_end|>\n") != NULL);
     free(suffix);
 
     tool_calls calls = {0};
@@ -14026,7 +13999,7 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     suffix = build_responses_visible_assistant_suffix(&r, "",
                                                       "tool summary",
                                                       &calls);
-    TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "tool summary") != NULL);
     TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
     free(suffix);
 
@@ -14977,31 +14950,20 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     user1.content = xstrdup("What is 2+2?");
     chat_msgs_push(&prefix_msgs, user1);
 
-    /* This is what prompt_text looks like for the first generation */
     char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
-    /* prompt_text should end with <think> */
     size_t pt_len = strlen(prompt_text);
-    TEST_ASSERT(pt_len >= 7);
-    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+    TEST_ASSERT(pt_len >= strlen("<|im_start|>assistant\n"));
+    TEST_ASSERT(strstr(prompt_text, "<|im_start|>assistant\n") != NULL);
 
-    /* The model generates: reasoning + </think> + content */
     const char *reasoning = "Let me think... 2+2 = 4";
     const char *content = "The answer is 4.";
-
-    /* Build the canonical checkpoint text (what we'd produce after canonicalization) */
-    buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
-    buf_puts(&canonical, "</think>");
-    buf_puts(&canonical, content);
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
 
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(prompt_text);
     char *visible = build_toolless_thinking_visible_text(&r, content);
-    TEST_ASSERT(visible != NULL);
-    TEST_ASSERT(!strcmp(visible, canonical.ptr));
+    TEST_ASSERT(visible == NULL);
     free(visible);
     request_free(&r);
 
@@ -15025,32 +14987,24 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
 
     char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, DS4_THINK_HIGH);
 
-    /* The future prompt should START with our canonical text */
-    size_t clen = canonical.len;
-    TEST_ASSERT(strlen(future_prompt) > clen);
-    TEST_ASSERT(!memcmp(future_prompt, canonical.ptr, clen));
+    TEST_ASSERT(strstr(future_prompt, content) != NULL);
+    TEST_ASSERT(strstr(future_prompt, "Thanks!") != NULL);
+    TEST_ASSERT(strstr(future_prompt, "<think>") == NULL);
+    TEST_ASSERT(strstr(future_prompt, "<|im_start|>assistant\n") != NULL);
 
-    /* And what comes after is the new user turn + assistant prefix */
-    const char *rest = future_prompt + clen;
-    TEST_ASSERT(strstr(rest, "Thanks!") != NULL);
-    TEST_ASSERT(strstr(rest, "<think>") != NULL);  /* new turn starts thinking */
-
-    /* Verify reasoning is NOT in the future prompt for this turn */
-    const char *asst_turn = strstr(future_prompt, "<" "\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c" ">");
+    const char *asst_turn = strstr(future_prompt, "<|im_start|>assistant\n");
     TEST_ASSERT(asst_turn != NULL);
-    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);  /* reasoning dropped */
+    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);
 
     free(future_prompt);
-    buf_free(&canonical);
     free(prompt_text);
     chat_msgs_free(&prefix_msgs);
     chat_msgs_free(&history_msgs);
 }
 
 static void test_thinking_canonical_empty_content(void) {
-    /* Edge case: model thinks but produces empty content (e.g. tool-less
-     * thinking where answer is entirely in reasoning).  Canonical should
-     * still be valid: prompt_text[:-7] + "</think><|eos|>" */
+    /* Qwen ChatML has no automatic hidden-thinking sentinel.  Empty assistant
+     * content is just an empty assistant message followed by <|im_end|>. */
     chat_msgs msgs = {0};
     chat_msg user = {0};
     user.role = xstrdup("user");
@@ -15058,14 +15012,10 @@ static void test_thinking_canonical_empty_content(void) {
     chat_msgs_push(&msgs, user);
 
     char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
-    size_t pt_len = strlen(prompt_text);
 
-    /* Build canonical with empty content */
     buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);
-    buf_puts(&canonical, "</think>");
-    /* empty content */
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+    buf_puts(&canonical, prompt_text);
+    buf_puts(&canonical, "<|im_end|>\n");
 
     /* Future prompt with empty content assistant message */
     chat_msgs history = {0};
@@ -15119,7 +15069,10 @@ static void test_thinking_canonical_multi_turn(void) {
     /* prompt_text for the 2nd generation (includes 1st assistant turn) */
     char *prompt_text = render_chat_prompt_text(&turn2_prefix, NULL, NULL, DS4_THINK_HIGH);
     size_t pt_len = strlen(prompt_text);
-    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+    TEST_ASSERT(pt_len >= strlen("<|im_start|>assistant\n"));
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - strlen("<|im_start|>assistant\n"),
+                        "<|im_start|>assistant\n",
+                        strlen("<|im_start|>assistant\n")));
 
     /* 1st turn reasoning is already dropped in this prompt_text */
     TEST_ASSERT(strstr(prompt_text, "first reasoning") == NULL);
@@ -15128,10 +15081,9 @@ static void test_thinking_canonical_multi_turn(void) {
     /* After 2nd generation: canonical drops 2nd reasoning too */
     const char *content2 = "I'm doing well";
     buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);
-    buf_puts(&canonical, "</think>");
+    buf_puts(&canonical, prompt_text);
     buf_puts(&canonical, content2);
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+    buf_puts(&canonical, "<|im_end|>\n");
 
     /* Future: 3rd user message arrives */
     chat_msgs future_msgs = {0};
@@ -15180,7 +15132,10 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
 
     char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_HIGH);
     size_t pt_len = strlen(prompt_text);
-    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+    TEST_ASSERT(pt_len >= strlen("<|im_start|>assistant\n"));
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - strlen("<|im_start|>assistant\n"),
+                        "<|im_start|>assistant\n",
+                        strlen("<|im_start|>assistant\n")));
 
     /* With tools, next render KEEPS reasoning */
     chat_msgs history = {0};
@@ -15194,9 +15149,8 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     chat_msgs_push(&history, hu2);
 
     char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
-    /* Reasoning IS preserved when tools present */
     TEST_ASSERT(strstr(future, "I should run bash") != NULL);
-    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
+    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") == NULL);
 
     free(future);
     free(prompt_text);
@@ -15205,7 +15159,7 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
 }
 
 static void test_thinking_canonical_non_thinking_mode_noop(void) {
-    /* When thinking is disabled (deepseek-chat), prompt_text ends with
+    /* When thinking is disabled (qwen3-coder-30b-a3b-instruct), prompt_text ends with
      * </think> not <think>.  The toolless thinking live binding is a no-op
      * (early return on memcmp check). */
     chat_msgs msgs = {0};
@@ -15216,11 +15170,11 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 
     char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     size_t pt_len = strlen(prompt_text);
-    /* Should end with </think>, not <think> */
-    TEST_ASSERT(pt_len >= 8);
-    TEST_ASSERT(!memcmp(prompt_text + pt_len - 8, "</think>", 8));
-    /* Does NOT end with <think> */
-    TEST_ASSERT(memcmp(prompt_text + pt_len - 7, "<think>", 7) != 0);
+    TEST_ASSERT(pt_len >= strlen("<|im_start|>assistant\n"));
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - strlen("<|im_start|>assistant\n"),
+                        "<|im_start|>assistant\n",
+                        strlen("<|im_start|>assistant\n")));
+    TEST_ASSERT(strstr(prompt_text, "<think>") == NULL);
 
     free(prompt_text);
     chat_msgs_free(&msgs);
