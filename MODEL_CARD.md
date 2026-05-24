@@ -73,9 +73,11 @@ accelerator files. Internals are being rewritten in place for Qwen3-Coder:
 - tensor binding now targets Qwen attention and MoE tensor names
 - chat rendering now targets Qwen ChatML
 - download defaults now target the single Q4_K_M Qwen GGUF
-- native CPU generation now uses Qwen grouped-query attention, per-head q/k
-  RMSNorm, full-head RoPE with theta 10,000,000, normalized top-8 MoE routing,
-  and Q4_K/Q6_K GGUF tensor kernels
+- native CPU and Metal generation now use Qwen grouped-query attention,
+  per-head q/k RMSNorm, full-head RoPE with theta 10,000,000, normalized top-8
+  MoE routing, and Q4_K/Q6_K GGUF tensor kernels
+- the Metal backend is Qwen-specific and supports the server/session path plus
+  directional steering
 
-Remaining work is performance work: replace full-prompt CPU recompute with a
-standard Qwen KV cache and adapt the Metal graph to this tensor layout.
+Remaining work is optimization work: the current Metal graph is correctness
+oriented and token-major.

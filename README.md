@@ -14,7 +14,7 @@ and it is not an Ollama wrapper.
 ## Status
 
 The in-place conversion now runs the Qwen3-Coder Q4_K_M GGUF through a native
-CPU reference graph:
+Qwen graph:
 
 - `download_model.sh` downloads only `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`.
 - `qwen3-coder.gguf` is the default model symlink.
@@ -24,12 +24,13 @@ CPU reference graph:
   `blk.N.attn_k.weight`, `blk.N.attn_v.weight`,
   `blk.N.ffn_gate_exps.weight`, and related MoE tensors.
 - Chat rendering uses Qwen ChatML.
-- Generation uses Qwen grouped-query attention, q/k RMSNorm, RoPE theta
+- CPU and Metal generation use Qwen grouped-query attention, q/k RMSNorm, RoPE theta
   10,000,000, normalized top-8 MoE routing, and Q4_K/Q6_K GGUF matvec kernels.
+- The Metal backend is the default on macOS and uses Qwen-specific K/V caches,
+  attention, router, MoE, output projection, and directional steering.
 
-The default backend is CPU while the Metal graph is rewritten for Qwen tensor
-shapes. The CPU path is correct-first and intentionally narrow; it is slow
-because it recomputes the prompt for each generated token.
+The CPU backend remains available as a reference/debug backend. It is not the
+macOS default.
 
 ## Model
 
@@ -87,13 +88,13 @@ Metal graph.
 ## Generate
 
 ```sh
-./ds4 -p "hello" -n 1 --ctx 64 --backend cpu
+./ds4 -p "hello" -n 3 --ctx 64 --backend metal
 ```
 
-The first native smoke test with the downloaded GGUF generated:
+The native Metal smoke test with the downloaded GGUF generated:
 
 ```text
-Hello
+Hello! How
 ```
 
 ## Prompt Format
@@ -112,14 +113,15 @@ The renderer uses Qwen ChatML:
 
 ## Porting Checklist
 
-- Replace DS4 compressed-attention CPU path with Qwen3 GQA. Done for the CPU
-  reference graph.
+- Replace DS4 compressed-attention path with Qwen3 GQA. Done for CPU and Metal.
 - Replace DS4 mHC residual flow with Qwen RMSNorm residual blocks. Done for the
-  CPU reference graph.
+  CPU and Metal graphs.
 - Implement Qwen MoE router top-k and expert execution. Done for Q4_K/Q6_K
   routed experts.
-- Dispatch Q4_K_M GGUF tensor types in matvec/matmul kernels. Done for the CPU
-  reference graph.
-- Replace full-prompt recompute with an ordinary per-layer K/V cache.
-- Rewrite Metal kernels around Qwen tensor shapes.
+- Dispatch Q4_K_M GGUF tensor types in matvec/matmul kernels. Done for CPU and
+  Metal.
+- Replace full-prompt recompute with an ordinary per-layer K/V cache. Done for
+  CPU and Metal.
+- Rewrite Metal kernels around Qwen tensor shapes. Done for token-major
+  generation and sessions.
 - Tighten server disk-cache semantics around Qwen's standard KV layout.

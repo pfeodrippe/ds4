@@ -63,6 +63,291 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
+#define QWEN_QK_K 256
+
+struct qwen_block_q4_K {
+    ushort d;
+    ushort dmin;
+    uchar scales[12];
+    uchar qs[QWEN_QK_K/2];
+};
+
+struct qwen_block_q6_K {
+    uchar ql[QWEN_QK_K/2];
+    uchar qh[QWEN_QK_K/4];
+    char  scales[QWEN_QK_K/16];
+    ushort d;
+};
+
+struct ds4_metal_qwen_matvec_args {
+    uint in_dim;
+    uint out_dim;
+    uint row_bytes;
+};
+
+struct ds4_metal_qwen_row_args {
+    uint width;
+};
+
+struct ds4_metal_qwen_moe_args {
+    uint expert_in_dim;
+    uint expert_mid_dim;
+    uint out_dim;
+    uint n_expert_used;
+    uint gate_row_bytes;
+    uint gate_expert_bytes;
+    uint down_row_bytes;
+    uint down_expert_bytes;
+};
+
+static inline float qwen_f16_to_f32(ushort bits) {
+    return float(as_type<half>(bits));
+}
+
+static inline void qwen_get_scale_min_k4(uint j, device const uchar *q, thread uchar &d, thread uchar &m) {
+    if (j < 4u) {
+        d = q[j] & 63u;
+        m = q[j + 4u] & 63u;
+    } else {
+        d = (q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u);
+        m = (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u);
+    }
+}
+
+static inline float qwen_dequant_q4_k(device const qwen_block_q4_K *blocks, uint i) {
+    device const qwen_block_q4_K &b = blocks[i / QWEN_QK_K];
+    const uint l0 = i % QWEN_QK_K;
+    const uint chunk = l0 / 64u;
+    const uint l = l0 % 64u;
+    uchar sc = 0;
+    uchar mn = 0;
+    qwen_get_scale_min_k4(chunk * 2u + (l >= 32u ? 1u : 0u), b.scales, sc, mn);
+    const uchar q = b.qs[chunk * 32u + (l & 31u)];
+    const float v = l < 32u ? float(q & 0x0Fu) : float(q >> 4u);
+    return qwen_f16_to_f32(b.d) * float(sc) * v - qwen_f16_to_f32(b.dmin) * float(mn);
+}
+
+static inline float qwen_dequant_q6_k(device const qwen_block_q6_K *blocks, uint i) {
+    device const qwen_block_q6_K &b = blocks[i / QWEN_QK_K];
+    const uint l0 = i % QWEN_QK_K;
+    const uint n = (l0 / 128u) * 128u;
+    const uint r = l0 - n;
+    const uint l = r & 31u;
+    const uint group = r / 32u;
+    const uint base = n / 2u;
+    const uint hbase = n / 4u;
+    const uint sbase = n / 16u;
+    const int is = int(l / 16u);
+    int q = 0;
+    int scale = 0;
+    if (group == 0u) {
+        q = int((b.ql[base + l] & 0x0Fu) | (((b.qh[hbase + l] >> 0u) & 3u) << 4u)) - 32;
+        scale = int(b.scales[sbase + is + 0]);
+    } else if (group == 1u) {
+        q = int((b.ql[base + l + 32u] & 0x0Fu) | (((b.qh[hbase + l] >> 2u) & 3u) << 4u)) - 32;
+        scale = int(b.scales[sbase + is + 2]);
+    } else if (group == 2u) {
+        q = int((b.ql[base + l] >> 4u) | (((b.qh[hbase + l] >> 4u) & 3u) << 4u)) - 32;
+        scale = int(b.scales[sbase + is + 4]);
+    } else {
+        q = int((b.ql[base + l + 32u] >> 4u) | (((b.qh[hbase + l] >> 6u) & 3u) << 4u)) - 32;
+        scale = int(b.scales[sbase + is + 6]);
+    }
+    return qwen_f16_to_f32(b.d) * float(scale) * float(q);
+}
+
+template<bool Q6>
+kernel void kernel_qwen_dequant_k_row(
+        constant ds4_metal_qwen_row_args &args,
+        device const char *src,
+        device float *dst,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.width) return;
+    if (Q6) {
+        dst[tid] = qwen_dequant_q6_k((device const qwen_block_q6_K *)src, tid);
+    } else {
+        dst[tid] = qwen_dequant_q4_k((device const qwen_block_q4_K *)src, tid);
+    }
+}
+
+template [[host_name("kernel_qwen_dequant_q4_K_row")]] kernel void kernel_qwen_dequant_k_row<false>(
+        constant ds4_metal_qwen_row_args &args,
+        device const char *src,
+        device float *dst,
+        uint tid [[thread_position_in_grid]]);
+
+template [[host_name("kernel_qwen_dequant_q6_K_row")]] kernel void kernel_qwen_dequant_k_row<true>(
+        constant ds4_metal_qwen_row_args &args,
+        device const char *src,
+        device float *dst,
+        uint tid [[thread_position_in_grid]]);
+
+template<bool Q6>
+kernel void kernel_qwen_matvec_k_f32(
+        constant ds4_metal_qwen_matvec_args &args,
+        device const char *w,
+        device const float *x,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= args.out_dim) return;
+    device const char *rowp = w + (uint64_t)row * args.row_bytes;
+    float acc = 0.0f;
+    if (Q6) {
+        device const qwen_block_q6_K *blocks = (device const qwen_block_q6_K *)rowp;
+        for (uint i = tid; i < args.in_dim; i += nth) {
+            acc += qwen_dequant_q6_k(blocks, i) * x[i];
+        }
+    } else {
+        device const qwen_block_q4_K *blocks = (device const qwen_block_q4_K *)rowp;
+        for (uint i = tid; i < args.in_dim; i += nth) {
+            acc += qwen_dequant_q4_k(blocks, i) * x[i];
+        }
+    }
+    scratch[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out[row] = scratch[0];
+}
+
+template [[host_name("kernel_qwen_matvec_q4_K_f32")]] kernel void kernel_qwen_matvec_k_f32<false>(
+        constant ds4_metal_qwen_matvec_args &args,
+        device const char *w,
+        device const float *x,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]);
+
+template [[host_name("kernel_qwen_matvec_q6_K_f32")]] kernel void kernel_qwen_matvec_k_f32<true>(
+        constant ds4_metal_qwen_matvec_args &args,
+        device const char *w,
+        device const float *x,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]);
+
+kernel void kernel_qwen_moe_gate_up_q4_K(
+        constant ds4_metal_qwen_moe_args &args,
+        device const char *gate_w,
+        device const char *up_w,
+        device const float *x,
+        device const int *selected,
+        device const float *weights,
+        device float *gate,
+        device float *up,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 gid [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint tid = tpitg.x;
+    const uint nth = ntg.x;
+    const uint row = gid.x;
+    const uint slot = gid.y;
+    if (row >= args.expert_mid_dim || slot >= args.n_expert_used) return;
+    const uint expert = uint(selected[slot]);
+    device const char *gbase = gate_w + (uint64_t)expert * args.gate_expert_bytes + (uint64_t)row * args.gate_row_bytes;
+    device const char *ubase = up_w   + (uint64_t)expert * args.gate_expert_bytes + (uint64_t)row * args.gate_row_bytes;
+    device const qwen_block_q4_K *gblocks = (device const qwen_block_q4_K *)gbase;
+    device const qwen_block_q4_K *ublocks = (device const qwen_block_q4_K *)ubase;
+    float ga = 0.0f;
+    float ua = 0.0f;
+    for (uint i = tid; i < args.expert_in_dim; i += nth) {
+        const float xv = x[i];
+        ga += qwen_dequant_q4_k(gblocks, i) * xv;
+        ua += qwen_dequant_q4_k(ublocks, i) * xv;
+    }
+    scratch[tid] = ga;
+    scratch[nth + tid] = ua;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) {
+            scratch[tid] += scratch[tid + step];
+            scratch[nth + tid] += scratch[nth + tid + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        const uint off = slot * args.expert_mid_dim + row;
+        const float gv = scratch[0];
+        const float uv = scratch[nth];
+        gate[off] = gv;
+        up[off] = uv;
+        mid[off] = (gv / (1.0f + exp(-gv))) * uv * weights[slot];
+    }
+}
+
+template<bool Q6>
+kernel void kernel_qwen_moe_down_k(
+        constant ds4_metal_qwen_moe_args &args,
+        device const char *down_w,
+        device const float *mid,
+        device const int *selected,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= args.out_dim) return;
+    float total = 0.0f;
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const uint expert = uint(selected[slot]);
+        device const char *base = down_w + (uint64_t)expert * args.down_expert_bytes + (uint64_t)row * args.down_row_bytes;
+        float acc = 0.0f;
+        if (Q6) {
+            device const qwen_block_q6_K *blocks = (device const qwen_block_q6_K *)base;
+            for (uint i = tid; i < args.expert_mid_dim; i += nth) {
+                acc += qwen_dequant_q6_k(blocks, i) * mid[slot * args.expert_mid_dim + i];
+            }
+        } else {
+            device const qwen_block_q4_K *blocks = (device const qwen_block_q4_K *)base;
+            for (uint i = tid; i < args.expert_mid_dim; i += nth) {
+                acc += qwen_dequant_q4_k(blocks, i) * mid[slot * args.expert_mid_dim + i];
+            }
+        }
+        scratch[tid] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint step = nth >> 1; step > 0; step >>= 1) {
+            if (tid < step) scratch[tid] += scratch[tid + step];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) total += scratch[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) out[row] = total;
+}
+
+template [[host_name("kernel_qwen_moe_down_q4_K")]] kernel void kernel_qwen_moe_down_k<false>(
+        constant ds4_metal_qwen_moe_args &args,
+        device const char *down_w,
+        device const float *mid,
+        device const int *selected,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]);
+
+template [[host_name("kernel_qwen_moe_down_q6_K")]] kernel void kernel_qwen_moe_down_k<true>(
+        constant ds4_metal_qwen_moe_args &args,
+        device const char *down_w,
+        device const float *mid,
+        device const int *selected,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]);
+
 template<short NR0>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,

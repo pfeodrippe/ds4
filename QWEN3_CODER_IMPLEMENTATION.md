@@ -1,4 +1,4 @@
-# Qwen3-Coder Implementation Plan
+# Qwen3-Coder Implementation
 
 This file records the narrow model decision and the in-place porting work for
 the DS4 codebase.
@@ -65,6 +65,16 @@ The downloaded Q4_K_M GGUF contains 579 tensors:
 - Token embeddings can expand Q4_K rows from the mmaped GGUF.
 - Dense projections dispatch F32, F16, Q8_0, Q4_K, and Q6_K.
 - Routed expert matvec dispatch handles the selected Q4_K/Q6_K expert tensors.
+- Metal generation uses the Qwen graph directly:
+  - Q4_K/Q6_K token embedding row expansion
+  - Q4_K/Q6_K dense matvecs
+  - Qwen per-head Q/K RMSNorm
+  - NeoX full-head RoPE
+  - separate K and V caches
+  - grouped-query causal attention
+  - Qwen top-8 router softmax
+  - Qwen routed MoE
+  - directional steering after attention and FFN outputs
 - Native CPU generation now executes:
   - RMSNorm residual blocks
   - grouped-query causal attention
@@ -84,20 +94,23 @@ make ds4_test ds4-eval
 ./ds4-eval --self-test-extractors
 ./ds4_test --server
 ./ds4 -m qwen3-coder.gguf -p 'hi' -n 1 --ctx 64 --backend cpu --nothink
+./ds4 -m qwen3-coder.gguf -p 'hi' -n 3 --ctx 64 --backend metal --temp 0
+./ds4-server -m qwen3-coder.gguf --ctx 64 --tokens 8 --backend metal --host 127.0.0.1 --port 18000
 ```
 
-The one-token smoke generated `Hello`.
+Results:
 
-## Remaining Engineering Work
+- CPU one-token smoke generated `Hello`.
+- Metal three-token smoke generated `Hello! How`.
+- CPU vs Metal prefill logits for `hi` matched the same argmax token with
+  max absolute difference `1.52587890625e-05` and RMS `2.648593903499274e-06`.
+- `/v1/chat/completions` on the Metal server returned `Hello there!`.
+- Directional steering allocation and projection ran on Metal with a zero-vector
+  steering file and generated `Hello`.
 
-The current CPU graph is a correctness-first reference path. It recomputes the
-full prompt for each generated token, so it is slow but model-native.
+## Notes
 
-Next work should stay in the existing DS4 files:
-
-- Replace full-prompt recompute with a standard per-layer Qwen K/V cache.
-- Rewrite the Metal graph and Metal kernels for Qwen tensor shapes.
-- Adjust server disk session payloads from DS4 compressed KV state to Qwen
-  standard KV state.
-- Add a deterministic logits comparison against a known Qwen reference run when
-  an official or locally generated fixture is available.
+The current Metal path is correctness-oriented and token-major. It keeps the
+existing DS4 CLI/server/session surfaces, but the executed graph is Qwen-only.
+Future optimization work should keep the same Qwen graph and improve batching or
+kernel fusion without reintroducing DS4 architecture branches.

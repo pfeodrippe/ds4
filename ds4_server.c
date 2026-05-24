@@ -2594,7 +2594,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -2765,7 +2765,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *system = NULL;
@@ -3654,7 +3654,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
@@ -3946,7 +3946,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
 
     json_ws(&p);
@@ -11368,7 +11368,13 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
 }
 
 static ds4_backend default_server_backend(void) {
+#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
 }
 
 static server_config parse_options(int argc, char **argv) {

@@ -95,11 +95,11 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. Qwen support is not enabled yet.\n"
+        "      Use the Metal graph backend.\n"
         "  --cuda\n"
         "      Use the CUDA graph backend. Qwen support is not enabled yet.\n"
         "  --cpu\n"
-        "      Use the native Qwen CPU backend. This is the current default.\n"
+        "      Use the native Qwen CPU backend for reference/debug runs.\n"
         "  --backend NAME\n"
         "      Select backend explicitly: metal, cuda, or cpu.\n"
         "  -t, --threads N\n"
@@ -196,7 +196,7 @@ static void usage(FILE *fp) {
         "\n"
         "Notes:\n"
         "  The CLI keeps KV cache state across interactive turns on session backends.\n"
-        "  CPU mode is the current Qwen execution path.\n"
+        "  Metal is the default backend on macOS for the Qwen3-Coder graph.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -244,7 +244,13 @@ static ds4_backend parse_backend(const char *s) {
 }
 
 static ds4_backend default_backend(void) {
+#ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
