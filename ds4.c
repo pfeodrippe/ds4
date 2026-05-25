@@ -9071,6 +9071,7 @@ static bool qwen_graph_alloc(
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
@@ -9093,6 +9094,7 @@ static bool qwen_graph_alloc(
     g->batch_routed_gate = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->batch_routed_down = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EMBD * sizeof(float));
 
     bool cache_ok = true;
@@ -9109,7 +9111,7 @@ static bool qwen_graph_alloc(
                     g->router_logits && g->router_probs &&
                     g->router_selected && g->router_weights &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
-                    g->routed_out && g->output_norm && g->logits &&
+                    g->routed_down && g->routed_out && g->output_norm && g->logits &&
                     g->prefill_tokens && g->batch_cur_hc && g->batch_next_hc &&
                     g->batch_attn_norm && g->batch_q && g->batch_kv_raw &&
                     g->batch_kv && g->batch_heads && g->batch_attn_out &&
@@ -9117,7 +9119,8 @@ static bool qwen_graph_alloc(
                     g->batch_router_logits && g->batch_router_probs &&
                     g->batch_router_selected && g->batch_router_weights &&
                     g->batch_routed_gate && g->batch_routed_up &&
-                    g->batch_routed_mid && g->batch_routed_out;
+                    g->batch_routed_mid && g->batch_routed_down &&
+                    g->batch_routed_out;
     if (!ok) metal_graph_free(g);
     return ok;
 }
@@ -10648,8 +10651,36 @@ static bool qwen_graph_encode_token(
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t vocab_dim = weights->output->dim[1];
+    const bool qwen_stage_profile = getenv("DS4_QWEN_TOKEN_STAGE_PROFILE") != NULL;
+    const char *qwen_stage_filter = getenv("DS4_QWEN_TOKEN_STAGE_PROFILE_FILTER");
+    double qwen_stage_t0 = qwen_stage_profile ? now_sec() : 0.0;
+#define DS4_PROFILE_QWEN_TOKEN_STAGE(layer_id, name) do { \
+        if (ok && qwen_stage_profile) { \
+            const double encoded_s = now_sec(); \
+            if (ds4_gpu_end_commands() == 0) { \
+                ok = false; \
+            } else { \
+                const double done_s = now_sec(); \
+                const char *stage_name = (name); \
+                const bool print_stage = \
+                    !qwen_stage_filter || !qwen_stage_filter[0] || \
+                    strstr(stage_name, qwen_stage_filter) != NULL; \
+                if (print_stage) { \
+                    fprintf(stderr, \
+                            "ds4: qwen token stage pos=%u layer=%d %s encode=%.3f ms execute=%.3f ms total=%.3f ms\n", \
+                            pos, (int)(layer_id), stage_name, \
+                            (encoded_s - qwen_stage_t0) * 1000.0, \
+                            (done_s - encoded_s) * 1000.0, \
+                            (done_s - qwen_stage_t0) * 1000.0); \
+                } \
+                qwen_stage_t0 = now_sec(); \
+                if (ds4_gpu_begin_commands() == 0) ok = false; \
+            } \
+        } \
+    } while (0)
 
     bool ok = qwen_graph_embed_token(g, model, weights, token);
+    DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "embed");
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
@@ -10671,31 +10702,30 @@ static bool qwen_graph_encode_token(
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
         if (ok) ok = metal_graph_matmul_plain_tensor(g->kv, model, layer->attn_kv,
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
-        if (ok) ok = ds4_gpu_qwen_head_rms_norm_weight_tensor(g->q,
-                                                               model->map,
-                                                               model->size,
-                                                               layer->attn_q_a_norm->abs_offset,
-                                                               DS4_N_HEAD,
-                                                               DS4_N_HEAD_DIM,
-                                                               DS4_RMS_EPS) != 0;
-        if (ok) ok = ds4_gpu_qwen_head_rms_norm_weight_tensor(g->kv_raw,
-                                                               model->map,
-                                                               model->size,
-                                                               layer->attn_kv_a_norm->abs_offset,
-                                                               DS4_N_HEAD_KV,
-                                                               DS4_N_HEAD_DIM,
-                                                               DS4_RMS_EPS) != 0;
-        if (ok) ok = ds4_gpu_qwen_rope_tensor(g->q, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                              pos, DS4_ROPE_FREQ_BASE) != 0;
-        if (ok) ok = ds4_gpu_qwen_rope_tensor(g->kv_raw, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                              pos, DS4_ROPE_FREQ_BASE) != 0;
-        if (ok) ok = ds4_gpu_qwen_store_kv_tensor(g->layer_raw_cache[il],
-                                                  g->layer_v_cache[il],
-                                                  g->kv_raw,
-                                                  g->kv,
-                                                  pos,
-                                                  g->raw_cap,
-                                                  (uint32_t)kv_dim) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qkv");
+        if (ok) ok = ds4_gpu_qwen_norm_rope_weight_tensor(g->q,
+                                                          model->map,
+                                                          model->size,
+                                                          layer->attn_q_a_norm->abs_offset,
+                                                          DS4_N_HEAD,
+                                                          DS4_N_HEAD_DIM,
+                                                          pos,
+                                                          DS4_ROPE_FREQ_BASE,
+                                                          DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_qwen_norm_rope_store_kv_tensor(g->layer_raw_cache[il],
+                                                            g->layer_v_cache[il],
+                                                            g->kv_raw,
+                                                            g->kv,
+                                                            model->map,
+                                                            model->size,
+                                                            layer->attn_kv_a_norm->abs_offset,
+                                                            pos,
+                                                            g->raw_cap,
+                                                            DS4_N_HEAD_KV,
+                                                            DS4_N_HEAD_DIM,
+                                                            DS4_ROPE_FREQ_BASE,
+                                                            DS4_RMS_EPS) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qk_norm_rope_store");
         if (ok) ok = ds4_gpu_qwen_attention_tensor(g->heads,
                                                    g->q,
                                                    g->layer_raw_cache[il],
@@ -10707,10 +10737,12 @@ static bool qwen_graph_encode_token(
                                                    DS4_N_HEAD_DIM) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(g->attn_out, model, layer->attn_output_a,
                                                      q_dim, DS4_N_EMBD, g->heads, 1);
+        if (ok) metal_graph_debug_dump_tensor("attn_out", g->attn_out, DS4_N_EMBD, il, pos);
         if (ok && metal_graph_directional_steering_attn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
         }
         if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->cur_hc, g->attn_out, DS4_N_EMBD) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "attention_out");
 
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
                                                     g->after_ffn_hc,
@@ -10727,32 +10759,41 @@ static bool qwen_graph_encode_token(
                                                        g->router_logits,
                                                        DS4_N_EXPERT,
                                                        DS4_N_EXPERT_USED) != 0;
-        if (ok) ok = ds4_gpu_qwen_routed_moe_tensor(g->routed_out,
-                                                    g->routed_gate,
-                                                    g->routed_up,
-                                                    g->routed_mid,
-                                                    model->map,
-                                                    model->size,
-                                                    layer->ffn_gate_exps->abs_offset,
-                                                    layer->ffn_up_exps->abs_offset,
-                                                    layer->ffn_down_exps->abs_offset,
-                                                    layer->ffn_gate_exps->type,
-                                                    layer->ffn_down_exps->type,
-                                                    gate_expert_bytes,
-                                                    gate_row_bytes,
-                                                    down_expert_bytes,
-                                                    down_row_bytes,
-                                                    DS4_N_EMBD,
-                                                    DS4_N_FF_EXP,
-                                                    DS4_N_EMBD,
-                                                    g->router_selected,
-                                                    g->router_weights,
-                                                    DS4_N_EXPERT_USED,
-                                                    g->ffn_norm) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "router");
+        if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->routed_out,
+                                                     g->routed_gate,
+                                                     g->routed_up,
+                                                     g->routed_mid,
+                                                     g->routed_down,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->ffn_gate_exps->abs_offset,
+                                                     layer->ffn_up_exps->abs_offset,
+                                                     layer->ffn_down_exps->abs_offset,
+                                                     layer->ffn_gate_exps->type,
+                                                     layer->ffn_down_exps->type,
+                                                     gate_expert_bytes,
+                                                     gate_row_bytes,
+                                                     down_expert_bytes,
+                                                     down_row_bytes,
+                                                     DS4_N_EMBD,
+                                                     DS4_N_FF_EXP,
+                                                     DS4_N_EMBD,
+                                                     g->router_selected,
+                                                     g->router_weights,
+                                                     DS4_N_EXPERT_USED,
+                                                     0.0f,
+                                                     g->ffn_norm,
+                                                     il,
+                                                     1,
+                                                     NULL) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "routed_moe");
+        if (ok) metal_graph_debug_dump_tensor("ffn_out", g->routed_out, DS4_N_EMBD, il, pos);
         if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->routed_out, il, 1);
         }
         if (ok) ok = ds4_gpu_add_tensor(g->cur_hc, g->after_ffn_hc, g->routed_out, DS4_N_EMBD) != 0;
+        DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "ffn_resid");
     }
 
     if (need_logits) {
@@ -10765,7 +10806,9 @@ static bool qwen_graph_encode_token(
                                                     DS4_RMS_EPS) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(g->logits, model, weights->output,
                                                      DS4_N_EMBD, vocab_dim, g->output_norm, 1);
+        DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "output_head");
     }
+#undef DS4_PROFILE_QWEN_TOKEN_STAGE
     return ok;
 }
 
@@ -10777,7 +10820,7 @@ static bool qwen_graph_eval_token(
         uint32_t pos,
         float *logits_out) {
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = qwen_graph_encode_token(g, model, weights, token, pos, true);
+    if (ok) ok = qwen_graph_encode_token(g, model, weights, token, pos, logits_out != NULL);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) {
         (void)ds4_gpu_end_commands();
@@ -10926,29 +10969,33 @@ static bool qwen_graph_encode_layer_batch(
     }
     if (ok) {
         stage = "routed_moe";
-        ok = ds4_gpu_qwen_routed_moe_batch_tensor(g->batch_routed_out,
-                                                  g->batch_routed_gate,
-                                                  g->batch_routed_up,
-                                                  g->batch_routed_mid,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->ffn_gate_exps->abs_offset,
-                                                  layer->ffn_up_exps->abs_offset,
-                                                  layer->ffn_down_exps->abs_offset,
-                                                  layer->ffn_gate_exps->type,
-                                                  layer->ffn_down_exps->type,
-                                                  gate_expert_bytes,
-                                                  gate_row_bytes,
-                                                  down_expert_bytes,
-                                                  down_row_bytes,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_FF_EXP,
-                                                  DS4_N_EMBD,
-                                                  g->batch_router_selected,
-                                                  g->batch_router_weights,
-                                                  DS4_N_EXPERT_USED,
-                                                  n_tokens,
-                                                  g->batch_ffn_norm) != 0;
+        ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                             g->batch_routed_gate,
+                                             g->batch_routed_up,
+                                             g->batch_routed_mid,
+                                             g->batch_routed_down,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes,
+                                             gate_row_bytes,
+                                             down_expert_bytes,
+                                             down_row_bytes,
+                                             DS4_N_EMBD,
+                                             DS4_N_FF_EXP,
+                                             DS4_N_EMBD,
+                                             g->batch_router_selected,
+                                             g->batch_router_weights,
+                                             DS4_N_EXPERT_USED,
+                                             0.0f,
+                                             g->batch_ffn_norm,
+                                             il,
+                                             n_tokens,
+                                             &g->batch_routed_mid_is_f16) != 0;
     }
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->batch_routed_out, il, n_tokens);
@@ -18464,13 +18511,27 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     {
         const uint32_t start = (uint32_t)s->checkpoint.len;
         const uint32_t n = (uint32_t)(prompt->len - s->checkpoint.len);
-        if (n > 0 &&
-            !qwen_graph_prefill_tokens(&s->graph, &e->model, &e->weights,
-                                       prompt, start, n, s->logits,
-                                       s->progress, s->progress_ud)) {
-            snprintf(err, errlen, "%s Qwen prefill failed while extending checkpoint", backend_name);
-            s->checkpoint_valid = false;
-            return 1;
+        if (n > 0) {
+            const uint32_t decode_suffix_limit = 16u;
+            if (n <= decode_suffix_limit) {
+                for (uint32_t i = 0; i < n; i++) {
+                    const uint32_t pos = start + i;
+                    float *dst_logits = (i + 1u == n) ? s->logits : NULL;
+                    if (!qwen_graph_eval_token(&s->graph, &e->model, &e->weights,
+                                               prompt->v[pos], pos, dst_logits)) {
+                        snprintf(err, errlen, "%s Qwen decode failed while extending checkpoint", backend_name);
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                    if (s->progress) s->progress(s->progress_ud, "prefill_chunk", (int)(pos + 1u), prompt->len);
+                }
+            } else if (!qwen_graph_prefill_tokens(&s->graph, &e->model, &e->weights,
+                                                  prompt, start, n, s->logits,
+                                                  s->progress, s->progress_ud)) {
+                snprintf(err, errlen, "%s Qwen prefill failed while extending checkpoint", backend_name);
+                s->checkpoint_valid = false;
+                return 1;
+            }
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;

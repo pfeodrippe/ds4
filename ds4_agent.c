@@ -532,7 +532,7 @@ static agent_config parse_options(int argc, char **argv) {
             .mtp_margin = 3.0f,
         },
         .gen = {
-            .system = "You are a helpful coding assistant running inside ds4-agent.",
+            .system = "",
             .n_predict = 50000,
             .ctx_size = 32768,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -646,63 +646,29 @@ static ds4_think_mode effective_think_mode(const agent_config *cfg) {
  */
 
 static const char agent_tools_prompt_intro[] =
-    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
-    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
-    "then summarize results briefly.\n\n"
-    "## Tools\n\n"
-    "You have access to native DSML tools: bash, bash_status, bash_stop, read, more, write, edit, search, and list. "
-    "The ds4-agent runtime executes the DSML tool calls you emit, then returns the tool result to you. "
-    "Never claim that no tools are available, that you cannot inspect the filesystem, or that you cannot run commands. "
-    "For any request that needs local files, directories, or shell output, emit a DSML tool call first and no prose before it.\n\n"
-    "Invoke tools by writing exactly this shape:\n\n"
+    "You are ds4-agent, a local coding agent. Native DSML tools are: "
+    "bash, bash_status, bash_stop, read, more, write, edit, search, list. "
+    "You have direct local filesystem and shell access through DSML. Do not say you cannot access local files. "
+    "Never say no tools are available. If asked which tools you can use, answer with only that list. "
+    "For local filesystem or shell work, emit DSML; ds4-agent executes it. "
+    "DSML is this tool protocol, not UML.\n\n"
     "<｜DSML｜tool_calls>\n"
     "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
     "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n\n"
-    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
-    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
-    "Example for listing the current directory:\n"
-    "<｜DSML｜tool_calls>\n"
-    "<｜DSML｜invoke name=\"list\">\n"
-    "<｜DSML｜parameter name=\"path\" string=\"true\">.</｜DSML｜parameter>\n"
-    "<｜DSML｜parameter name=\"max_entries\" string=\"false\">40</｜DSML｜parameter>\n"
-    "</｜DSML｜invoke>\n"
-    "</｜DSML｜tool_calls>\n\n";
+    "Use string=\"true\" for strings and string=\"false\" for numbers/booleans. "
+    "Do not put DSML inside <think></think>.\n\n";
 
 static const char agent_tools_prompt_edit_line[] =
-    "## Editing files\n\n"
-    "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
-    "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
-    "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
-    "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
-    "After [upto], always write unique final lines before closing old; never close old immediately after [upto].\n"
-    "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
-    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+    "For edits, read/search first; edit(path, old, new) requires old to match exactly once. "
+    "Use write only for new files or intentional whole-file replacement.\n\n";
 
 static const char agent_tools_prompt_after_edit[] =
-    "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
-    "bash_status to check it early or bash_stop to terminate it.\n\n"
-    "### Available Tools\n\n"
-    "- bash(command string, timeout_sec number?, refresh_sec number?): run a shell command.\n"
-    "- bash_status(job number, pid number?, refresh_sec number?): report new output for a running bash job.\n"
-    "- bash_stop(job number, pid number?, refresh_sec number?): stop a running bash job and report final output.\n"
-    "- read(path string, start_line number?, max_lines number?, whole boolean?, raw boolean?): read a text file chunk; default is first 500 lines.\n"
-    "- more(count number?): continue the previous read, search, or bash output.\n"
-    "- write(path string, content string): create or overwrite a text file.\n"
-    "- edit(path string, old string, new string): replace one exact old match; old may contain [upto] between unique anchors.\n"
-    "- search(query string, path string?, mode string?, glob string?, context number?, max_results number?, case_sensitive boolean?): search files.\n"
-    "- list(path string, max_entries number?): list one directory compactly; default max_entries is 80.\n\n"
-    "# Rules\n\n"
-    "- Always use strict syntax for DSML tool stanzas.\n"
-    "- This system runs on local inference of a few hundred tokens/s of prefill, "
-    "and a few tens of tokens/s decoding speed. Use read/search to get the "
-    "anchors you need, then use anchored edit to avoid having to "
-    "retype large text.\n"
-    "- Write code that is reliable and works well; always have a mental model of "
-    "what is going on in complex parts of the code.\n"
-    "- Work in a way that preserves the current system configuration integrity, "
-    "unless explicitly asked otherwise by the user.\n";
+    "Params: bash(command, timeout_sec?, refresh_sec?), bash_status(job?, pid?), bash_stop(job?, pid?), "
+    "read(path, start_line?, max_lines?, whole?, raw?), more(count?), write(path, content), edit(path, old, new), "
+    "search(query, path?, mode?, glob?, context?, max_results?), list(path, max_entries?). "
+    "Use bash_status/bash_stop only for a prior bash job id. After a successful tool result, answer in prose unless another tool is necessary.\n";
 
 static char *agent_build_tools_prompt(void) {
     const char *edit = agent_tools_prompt_edit_line;
@@ -851,6 +817,29 @@ static void agent_publishf(agent_worker *w, const char *fmt, ...) {
 }
 
 static bool worker_is_idle(agent_worker *w);
+
+static bool agent_text_contains_ci(const char *s, const char *needle) {
+    if (!s || !needle || !needle[0]) return false;
+    size_t n = strlen(needle);
+    for (const char *p = s; *p; p++) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               (unsigned char)tolower((unsigned char)p[i]) ==
+               (unsigned char)tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static bool agent_is_tool_list_query(const char *s) {
+    if (!agent_text_contains_ci(s, "tool")) return false;
+    if (agent_text_contains_ci(s, "dsml")) return true;
+    return agent_text_contains_ci(s, "what tools") ||
+           agent_text_contains_ci(s, "which tools") ||
+           agent_text_contains_ci(s, "available tools");
+}
 
 static void agent_set_status(agent_worker *w, agent_worker_state state) {
     pthread_mutex_lock(&w->mu);
@@ -3573,6 +3562,14 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    ds4_chat_append_message(w->engine, out, "user",
+                            "List the current directory.");
+    ds4_chat_append_message(w->engine, out, "assistant",
+                            "<｜DSML｜tool_calls>\n"
+                            "<｜DSML｜invoke name=\"list\">\n"
+                            "<｜DSML｜parameter name=\"path\" string=\"true\">.</｜DSML｜parameter>\n"
+                            "</｜DSML｜invoke>\n"
+                            "</｜DSML｜tool_calls>");
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -6587,9 +6584,6 @@ static int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
-        return 1;
-
     ds4_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
@@ -6598,6 +6592,9 @@ static int worker_accept_generated_token(agent_worker *w,
     agent_stream_text(stream, text, text_len, false);
     free(text);
     (*generated)++;
+
+    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+        return 1;
 
     double dt = now_sec() - t0;
     pthread_mutex_lock(&w->mu);
@@ -6661,6 +6658,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                    w->session_sha);
     }
     ds4_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    if (agent_is_tool_list_query(user_text)) {
+        const char *tools = "bash, bash_status, bash_stop, read, more, write, edit, search, list";
+        ds4_chat_append_message(w->engine, &w->transcript, "assistant", tools);
+        agent_publish(w, tools, strlen(tools));
+        agent_publish(w, "\n", 1);
+        pthread_mutex_lock(&w->mu);
+        w->user_activity = true;
+        w->session_dirty = true;
+        w->status.state = AGENT_WORKER_IDLE;
+        w->status.error[0] = '\0';
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+        return 0;
+    }
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());

@@ -286,6 +286,32 @@ int ds4_gpu_qwen_head_rms_norm_weight_tensor(
         uint32_t                head_dim,
         float                   eps);
 
+int ds4_gpu_qwen_norm_rope_weight_tensor(
+        ds4_gpu_tensor       *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                pos,
+        float                   freq_base,
+        float                   eps);
+
+int ds4_gpu_qwen_norm_rope_store_kv_tensor(
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                row,
+        uint32_t                cap,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   freq_base,
+        float                   eps);
+
 int ds4_gpu_qwen_rope_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_head,

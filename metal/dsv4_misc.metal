@@ -103,6 +103,23 @@ struct ds4_metal_args_qwen_head_norm {
     float    eps;
 };
 
+struct ds4_metal_args_qwen_norm_rope {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t pos;
+    float    freq_base;
+    float    eps;
+};
+
+struct ds4_metal_args_qwen_norm_rope_store {
+    uint32_t row;
+    uint32_t cap;
+    uint32_t n_head;
+    uint32_t head_dim;
+    float    freq_base;
+    float    eps;
+};
+
 struct ds4_metal_args_qwen_store_kv {
     uint32_t row;
     uint32_t cap;
@@ -160,6 +177,81 @@ kernel void kernel_qwen_head_rms_norm_weight_f32(
     }
     const float scale = rsqrt(scratch[0] / float(args.head_dim) + args.eps);
     for (uint i = tid; i < args.head_dim; i += nth) row[i] = row[i] * scale * weight[i];
+}
+
+kernel void kernel_qwen_norm_rope_weight_f32(
+        constant ds4_metal_args_qwen_norm_rope &args,
+        device float *x,
+        device const float *weight,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (head >= args.n_head || args.head_dim == 0 || (args.head_dim & 1u) != 0) return;
+    device float *row = x + (uint64_t)head * args.head_dim;
+    float ss = 0.0f;
+    for (uint i = tid; i < args.head_dim; i += nth) ss += row[i] * row[i];
+    scratch[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = rsqrt(scratch[0] / float(args.head_dim) + args.eps);
+    const uint half_dim = args.head_dim >> 1;
+    for (uint i = tid; i < half_dim; i += nth) {
+        const uint j0 = i;
+        const uint j1 = i + half_dim;
+        const float x0 = row[j0] * scale * weight[j0];
+        const float x1 = row[j1] * scale * weight[j1];
+        const float theta = float(args.pos) * pow(args.freq_base, -2.0f * float(i) / float(args.head_dim));
+        const float c = cos(theta);
+        const float s = sin(theta);
+        row[j0] = x0 * c - x1 * s;
+        row[j1] = x0 * s + x1 * c;
+    }
+}
+
+kernel void kernel_qwen_norm_rope_store_kv_f32(
+        constant ds4_metal_args_qwen_norm_rope_store &args,
+        device float *k_cache,
+        device float *v_cache,
+        device const float *k,
+        device const float *v,
+        device const float *weight,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (head >= args.n_head || args.head_dim == 0 || (args.head_dim & 1u) != 0 || args.row >= args.cap) return;
+    device const float *krow = k + (uint64_t)head * args.head_dim;
+    device const float *vrow = v + (uint64_t)head * args.head_dim;
+    const uint64_t cache_base = ((uint64_t)args.row * args.n_head + head) * args.head_dim;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < args.head_dim; i += nth) ss += krow[i] * krow[i];
+    scratch[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale = rsqrt(scratch[0] / float(args.head_dim) + args.eps);
+    const uint half_dim = args.head_dim >> 1;
+    for (uint i = tid; i < half_dim; i += nth) {
+        const uint j0 = i;
+        const uint j1 = i + half_dim;
+        const float x0 = krow[j0] * scale * weight[j0];
+        const float x1 = krow[j1] * scale * weight[j1];
+        const float theta = float(args.row) * pow(args.freq_base, -2.0f * float(i) / float(args.head_dim));
+        const float c = cos(theta);
+        const float s = sin(theta);
+        k_cache[cache_base + j0] = x0 * c - x1 * s;
+        k_cache[cache_base + j1] = x0 * s + x1 * c;
+    }
+    for (uint i = tid; i < args.head_dim; i += nth) {
+        v_cache[cache_base + i] = vrow[i];
+    }
 }
 
 kernel void kernel_qwen_store_kv_f32(
@@ -250,6 +342,65 @@ kernel void kernel_qwen_attention_f32_reduce(
             heads[(uint64_t)head * args.head_dim + d] = scratch[nth] / denom;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void kernel_qwen_attention_f32_cached(
+        constant ds4_metal_args_qwen_attention &args,
+        device float *heads,
+        device const float *q,
+        device const float *k_cache,
+        device const float *v_cache,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (head >= args.n_head || args.n_ctx == 0 || args.n_ctx > args.cap) return;
+    const uint kv_group = args.n_head / args.n_head_kv;
+    const uint kh = head / kv_group;
+    device const float *qh = q + (uint64_t)head * args.head_dim;
+    threadgroup float *scores = scratch;
+    threadgroup float *reduce = scratch + args.n_ctx;
+
+    float m = -INFINITY;
+    for (uint p = tid; p < args.n_ctx; p += nth) {
+        device const float *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
+                                 (uint64_t)kh * args.head_dim;
+        float s = 0.0f;
+        for (uint i = 0; i < args.head_dim; i++) s += qh[i] * kp[i];
+        s *= args.scale;
+        scores[p] = s;
+        m = max(m, s);
+    }
+    reduce[tid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_score = reduce[0];
+
+    float denom_part = 0.0f;
+    for (uint p = tid; p < args.n_ctx; p += nth) {
+        const float a = exp(scores[p] - max_score);
+        scores[p] = a;
+        denom_part += a;
+    }
+    reduce[tid] = denom_part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1; step > 0; step >>= 1) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float denom = max(reduce[0], 1.0e-20f);
+
+    for (uint d = tid; d < args.head_dim; d += nth) {
+        float acc = 0.0f;
+        for (uint p = 0; p < args.n_ctx; p++) {
+            acc += scores[p] * v_cache[(uint64_t)p * args.n_head_kv * args.head_dim +
+                                       (uint64_t)kh * args.head_dim + d];
+        }
+        heads[(uint64_t)head * args.head_dim + d] = acc / denom;
     }
 }
 

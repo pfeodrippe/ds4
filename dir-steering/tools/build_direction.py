@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build a DS4 directional-steering vector from paired prompt sets.
+"""Build a Qwen3-Coder directional-steering vector from paired prompt sets.
 
-The extractor asks ds4 to dump one 4096-wide activation row per layer, averages
-the target and control rows, and writes a flat f32 file with 43 layer vectors.
+The extractor asks ds4 to dump one 2048-wide activation row per layer, averages
+the target and control rows, and writes a flat f32 file with 48 layer vectors.
 At runtime ds4 applies:
 
     y = y - scale * direction[layer] * dot(direction[layer], y)
@@ -20,15 +20,12 @@ import tempfile
 from pathlib import Path
 
 
-N_LAYER = 43
-N_EMBD = 4096
+N_LAYER = 48
+N_EMBD = 2048
 
 SPECIALS = {
-    "bos": "<｜begin▁of▁sentence｜>",
-    "user": "<｜User｜>",
-    "assistant": "<｜Assistant｜>",
-    "think": "<think>",
-    "nothink": "</think>",
+    "im_start": "<|im_start|>",
+    "im_end": "<|im_end|>",
 }
 
 
@@ -46,16 +43,13 @@ def read_prompt_file(path: Path) -> list[str]:
 
 
 def render_ds4_prompt(system: str, user: str, think: bool) -> str:
-    """Render the minimal DS4 chat prefix used for activation capture."""
-    pieces = [SPECIALS["bos"]]
+    """Render the Qwen ChatML prefix used for activation capture."""
+    del think
+    pieces: list[str] = []
     if system:
-        pieces.append(system)
-    pieces += [
-        SPECIALS["user"],
-        user,
-        SPECIALS["assistant"],
-        SPECIALS["think"] if think else SPECIALS["nothink"],
-    ]
+        pieces.append(f"{SPECIALS['im_start']}system\n{system}{SPECIALS['im_end']}\n")
+    pieces.append(f"{SPECIALS['im_start']}user\n{user}{SPECIALS['im_end']}\n")
+    pieces.append(f"{SPECIALS['im_start']}assistant\n")
     return "".join(pieces)
 
 
@@ -124,7 +118,7 @@ def add_rows(total: list[list[float]], rows: list[list[float]]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ds4", default="./ds4", help="path to the ds4 CLI")
-    ap.add_argument("--model", default="ds4flash.gguf", help="GGUF model path")
+    ap.add_argument("--model", default="qwen3-coder.gguf", help="GGUF model path")
     ap.add_argument("--good-file", required=True,
                     help="desired/target prompts, one per line")
     ap.add_argument("--bad-file", required=True,
@@ -137,7 +131,7 @@ def main() -> None:
                     choices=("ffn_out", "attn_out"),
                     help="runtime-editable 4096-wide activation stream")
     ap.add_argument("--think", action="store_true",
-                    help="capture after <think>; default captures direct answers")
+                    help="accepted for compatibility; Qwen ChatML ignores this")
     ap.add_argument("--pair-normalize", action="store_true",
                     help="average normalized per-pair differences")
     ap.add_argument("--no-orthogonalize", action="store_true",

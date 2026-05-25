@@ -79,6 +79,9 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum8_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_q6_k_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_q6_k_sum8_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
@@ -2014,6 +2017,34 @@ static ds4_gpu_q8_0_matvec_args ds4_gpu_make_q8_0_mv_args(uint64_t in_dim, uint6
     };
 }
 
+static ds4_gpu_q8_0_matvec_args ds4_gpu_make_k_mv_args(
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t row_bytes,
+        int32_t  nr0) {
+    return (ds4_gpu_q8_0_matvec_args) {
+        .ne00 = (int32_t)in_dim,
+        .ne01 = (int32_t)out_dim,
+        .ne02 = 1,
+        .nb00 = row_bytes / (in_dim / 256u),
+        .nb01 = row_bytes,
+        .nb02 = row_bytes * out_dim,
+        .nb03 = row_bytes * out_dim,
+        .ne10 = (int32_t)in_dim,
+        .ne11 = 1,
+        .ne12 = 1,
+        .nb10 = sizeof(float),
+        .nb11 = in_dim * sizeof(float),
+        .nb12 = in_dim * sizeof(float),
+        .nb13 = in_dim * sizeof(float),
+        .ne0 = (int32_t)out_dim,
+        .ne1 = 1,
+        .nr0 = nr0,
+        .r2 = 1,
+        .r3 = 1,
+    };
+}
+
 static ds4_gpu_f16_matvec_args ds4_gpu_make_f16_mv_args(uint64_t in_dim, uint64_t out_dim) {
     const uint64_t row_bytes = in_dim * sizeof(uint16_t);
     return (ds4_gpu_f16_matvec_args) {
@@ -2642,6 +2673,23 @@ typedef struct {
     uint32_t head_dim;
     float    eps;
 } ds4_gpu_qwen_head_norm_args;
+
+typedef struct {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t pos;
+    float    freq_base;
+    float    eps;
+} ds4_gpu_qwen_norm_rope_args;
+
+typedef struct {
+    uint32_t row;
+    uint32_t cap;
+    uint32_t n_head;
+    uint32_t head_dim;
+    float    freq_base;
+    float    eps;
+} ds4_gpu_qwen_norm_rope_store_args;
 
 typedef struct {
     uint32_t row;
@@ -3722,6 +3770,66 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_q4_K_sum8_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_sum8_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_q4_k_sum8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_q4_k_sum8_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_sum8_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_q6_K_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q6_K_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_q6_k_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_q6_k_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q6_K_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_q6_K_sum8_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q6_K_sum8_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_q6_k_sum8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_q6_k_sum8_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q6_K_sum8_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_rope_tail_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_rope_tail_f32 function not found\n");
@@ -4538,6 +4646,9 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_q4_k_pair_pipeline = nil;
         g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_id_q4_k_sum6_pipeline = nil;
+        g_moe_mul_mv_id_q4_k_sum8_pipeline = nil;
+        g_moe_mul_mv_id_q6_k_pipeline = nil;
+        g_moe_mul_mv_id_q6_k_sum8_pipeline = nil;
         g_rope_tail_batch_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
@@ -6235,12 +6346,12 @@ int ds4_gpu_matmul_k_tensor(
     if (row_bytes == 0 || weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = nil;
-        if (tensor_type == DS4_METAL_TENSOR_Q4_K) {
-            pipeline = ds4_gpu_get_pipeline("kernel_qwen_matvec_q4_K_f32");
-        } else if (tensor_type == DS4_METAL_TENSOR_Q6_K) {
-            pipeline = ds4_gpu_get_pipeline("kernel_qwen_matvec_q6_K_f32");
-        }
+        const int16_t nsg = 2;
+        const int32_t nr0 = tensor_type == DS4_METAL_TENSOR_Q6_K ? 2 : 2;
+        const char *kernel_name = tensor_type == DS4_METAL_TENSOR_Q6_K
+            ? "kernel_mul_mv_q6_K_f32"
+            : "kernel_mul_mv_q4_K_f32";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(kernel_name, nsg);
         if (!pipeline) return 0;
 
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -6255,23 +6366,20 @@ int ds4_gpu_matmul_k_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        const NSUInteger nth = 256u;
-        ds4_gpu_qwen_matvec_args args = {
-            .in_dim = (uint32_t)in_dim,
-            .out_dim = (uint32_t)out_dim,
-            .row_bytes = (uint32_t)row_bytes,
-        };
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_k_mv_args(in_dim, out_dim, row_bytes, nr0);
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)(nr0 * nsg) - 1u) /
+                                              (NSUInteger)(nr0 * nsg),
+                                              1,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen K matvec")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen optimized K matvec")) return 0;
     }
     return 1;
 }
@@ -6667,6 +6775,130 @@ int ds4_gpu_qwen_head_rms_norm_weight_tensor(
     return 1;
 }
 
+int ds4_gpu_qwen_norm_rope_weight_tensor(
+        ds4_gpu_tensor       *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                pos,
+        float                   freq_base,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !model_map || n_head == 0 || head_dim == 0 || (head_dim & 1u) != 0) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen_norm_rope_weight_f32");
+        if (!pipeline) return 0;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t bytes = (uint64_t)n_head * head_dim * sizeof(float);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < bytes ||
+            weight_offset > model_size || bytes > model_size - weight_offset) {
+            return 0;
+        }
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, bytes, &inner);
+        if (!wbuf) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        NSUInteger nth = head_dim < 256u ? head_dim : 256u;
+        ds4_gpu_qwen_norm_rope_args args = {
+            .n_head = n_head,
+            .head_dim = head_dim,
+            .pos = pos,
+            .freq_base = freq_base,
+            .eps = eps,
+        };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:2];
+        [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen norm RoPE")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen_norm_rope_store_kv_tensor(
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                row,
+        uint32_t                cap,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   freq_base,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!k_cache || !v_cache || !k || !v || !model_map ||
+        n_head == 0 || head_dim == 0 || (head_dim & 1u) != 0 || row >= cap) {
+        return 0;
+    }
+    const uint64_t kv_dim = (uint64_t)n_head * head_dim;
+    const uint64_t row_bytes = kv_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cap * row_bytes;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen_norm_rope_store_kv_f32");
+        if (!pipeline) return 0;
+        id<MTLBuffer> kcbuf = ds4_gpu_tensor_buffer(k_cache);
+        id<MTLBuffer> vcbuf = ds4_gpu_tensor_buffer(v_cache);
+        id<MTLBuffer> kbuf = ds4_gpu_tensor_buffer(k);
+        id<MTLBuffer> vbuf = ds4_gpu_tensor_buffer(v);
+        if (!kcbuf || !vcbuf || !kbuf || !vbuf ||
+            ds4_gpu_tensor_bytes(k_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(v_cache) < cache_bytes ||
+            ds4_gpu_tensor_bytes(k) < row_bytes ||
+            ds4_gpu_tensor_bytes(v) < row_bytes ||
+            weight_offset > model_size || head_dim * sizeof(float) > model_size - weight_offset) {
+            return 0;
+        }
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       weight_offset,
+                                                       (uint64_t)head_dim * sizeof(float),
+                                                       &inner);
+        if (!wbuf) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        NSUInteger nth = head_dim < 256u ? head_dim : 256u;
+        ds4_gpu_qwen_norm_rope_store_args args = {
+            .row = row,
+            .cap = cap,
+            .n_head = n_head,
+            .head_dim = head_dim,
+            .freq_base = freq_base,
+            .eps = eps,
+        };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:kcbuf offset:ds4_gpu_tensor_offset(k_cache) atIndex:1];
+        [enc setBuffer:vcbuf offset:ds4_gpu_tensor_offset(v_cache) atIndex:2];
+        [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k) atIndex:3];
+        [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:4];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:5];
+        [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen norm RoPE KV store")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_qwen_store_kv_tensor(
         ds4_gpu_tensor       *k_cache,
         ds4_gpu_tensor       *v_cache,
@@ -6779,7 +7011,10 @@ int ds4_gpu_qwen_attention_tensor(
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)cap * n_head_kv * head_dim * sizeof(float);
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen_attention_f32_reduce");
+        const bool use_cached_scores = n_ctx <= 4096u;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            use_cached_scores ? "kernel_qwen_attention_f32_cached" :
+                                "kernel_qwen_attention_f32_reduce");
         if (!pipeline) return 0;
         id<MTLBuffer> hbuf = ds4_gpu_tensor_buffer(heads);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
@@ -6809,7 +7044,10 @@ int ds4_gpu_qwen_attention_tensor(
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:2];
         [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k_cache) atIndex:3];
         [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v_cache) atIndex:4];
-        [enc setThreadgroupMemoryLength:2u * nth * sizeof(float) atIndex:0];
+        const NSUInteger scratch_floats = use_cached_scores ?
+            ((NSUInteger)n_ctx + nth) :
+            (2u * nth);
+        [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -13121,6 +13359,7 @@ static ds4_gpu_mul_mm_id_args ds4_gpu_make_mul_mm_id_args_src1_size(
 static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_Q4_K:    return 2;
+    case DS4_METAL_TENSOR_Q6_K:    return 2;
     case DS4_METAL_TENSOR_Q2_K:
     case DS4_METAL_TENSOR_IQ2_XXS: return 4;
     default:                       return 0;
@@ -13132,6 +13371,7 @@ static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return "iq2_xxs";
     case DS4_METAL_TENSOR_Q2_K:    return "q2_k";
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
+    case DS4_METAL_TENSOR_Q6_K:    return "q6_k";
     default:                       return "unknown";
     }
 }
@@ -13148,6 +13388,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return g_moe_mul_mv_id_iq2_xxs_pipeline;
     case DS4_METAL_TENSOR_Q2_K:    return g_moe_mul_mv_id_q2_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
+    case DS4_METAL_TENSOR_Q6_K:    return g_moe_mul_mv_id_q6_k_pipeline;
     default:                       return nil;
     }
 }
@@ -13160,6 +13401,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+    case DS4_METAL_TENSOR_Q6_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q6_K_f32", false);
     default:
         return nil;
     }
@@ -13173,6 +13416,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+    case DS4_METAL_TENSOR_Q6_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q6_K_f16", false);
     default:
         return nil;
     }
@@ -13374,6 +13619,44 @@ static int ds4_gpu_encode_mul_mv_id_sum6(
         NSUInteger                  nsg) {
     if (!cb || !pipeline || !args || !src0 || !src1 || !dst || !ids ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0) {
+        return 0;
+    }
+
+    const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:src0 offset:src0_off atIndex:1];
+    [enc setBuffer:src1 offset:src1_off atIndex:2];
+    [enc setBuffer:dst  offset:dst_off  atIndex:3];
+    [enc setBuffer:ids  offset:ids_off  atIndex:4];
+    if (threadgroup_bytes != 0) {
+        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+static int ds4_gpu_encode_mul_mv_id_sum8(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        id<MTLBuffer>               src0,
+        NSUInteger                  src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst,
+        NSUInteger                  dst_off,
+        id<MTLBuffer>               ids,
+        NSUInteger                  ids_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg) {
+    if (!cb || !pipeline || !args || !src0 || !src1 || !dst || !ids ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 8 || args->nei1 <= 0) {
         return 0;
     }
 
@@ -14537,8 +14820,9 @@ int ds4_gpu_routed_moe_one_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint32_t total_experts = 128u;
+        const uint64_t gate_tensor_bytes = (uint64_t)total_experts * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)total_experts * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -14569,11 +14853,11 @@ int ds4_gpu_routed_moe_one_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, total_experts,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, total_experts,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -15084,8 +15368,9 @@ int ds4_gpu_routed_moe_batch_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint32_t total_experts = 128u;
+        const uint64_t gate_tensor_bytes = (uint64_t)total_experts * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)total_experts * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -15118,11 +15403,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, total_experts,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, total_experts,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
@@ -15136,7 +15421,21 @@ int ds4_gpu_routed_moe_batch_tensor(
          * tiny batches so ordinary prefill keeps using the higher-throughput
          * grouped matmul path.
          */
+        id<MTLComputePipelineState> tiny_pair_swiglu_pipeline = nil;
+        if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
+            tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
+        } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
+            tiny_pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
+        }
+        const bool use_tiny_pair_swiglu =
+            !g_quality_mode &&
+            n_tokens <= 4u &&
+            !use_mm_id &&
+            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+            tiny_pair_swiglu_pipeline != nil;
         const bool use_tiny_pair_mv =
+            !use_tiny_pair_swiglu &&
             !g_quality_mode &&
             n_tokens <= 4u &&
             !use_mm_id &&
@@ -15155,13 +15454,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool request_mid_f16 = !g_quality_mode;
         if (use_mm_id) {
             gate_map_args =
-                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
+                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, total_experts, 1, n_expert, n_tokens);
             gate_mm_args =
-                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, 256,
+                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, total_experts,
                                               gate_row_bytes, gate_expert_bytes,
                                               1, n_expert, n_tokens);
             down_mm_args =
-                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, 256,
+                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, total_experts,
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
@@ -15185,7 +15484,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         const char *moe_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_path =
             use_mm_id ? "mm_id" :
-            (use_tiny_pair_mv ? "tiny_pair_mv" : "mv");
+            (use_tiny_pair_swiglu ? "tiny_pair_swiglu" :
+             (use_tiny_pair_mv ? "tiny_pair_mv" : "mv"));
         double moe_stage_t0 = moe_stage_profile ? ds4_gpu_now_ms() : 0.0;
         if (moe_stage_profile) {
             if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
@@ -15235,12 +15535,18 @@ int ds4_gpu_routed_moe_batch_tensor(
         } else if (down_type == DS4_METAL_TENSOR_Q4_K) {
             down_sum6_pipeline = g_moe_mul_mv_id_q4_k_sum6_pipeline;
         }
+        id<MTLComputePipelineState> down_sum8_pipeline = nil;
+        if (down_type == DS4_METAL_TENSOR_Q4_K) {
+            down_sum8_pipeline = g_moe_mul_mv_id_q4_k_sum8_pipeline;
+        } else if (down_type == DS4_METAL_TENSOR_Q6_K) {
+            down_sum8_pipeline = g_moe_mul_mv_id_q6_k_sum8_pipeline;
+        }
         const bool direct_down_sum =
             !g_quality_mode &&
             !use_mm_id &&
-            n_expert == 6 &&
             n_tokens <= 4u &&
-            down_sum6_pipeline != nil;
+            ((n_expert == 6 && down_sum6_pipeline != nil) ||
+             (n_expert == 8 && down_sum8_pipeline != nil));
         int ok = 0;
         if (use_mm_id) {
             /*
@@ -15279,6 +15585,40 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                    ds4_gpu_tensor_offset(up));
                 DS4_METAL_PROFILE_MOE_STAGE("up");
             }
+        } else if (use_tiny_pair_swiglu) {
+            ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+                .width = expert_mid_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = clamp,
+            };
+            ok = ds4_gpu_encode_mul_mv_id_pair_swiglu(cb,
+                                                        tiny_pair_swiglu_pipeline,
+                                                        &gate_args,
+                                                        &act_args,
+                                                        gate_buf,
+                                                        (NSUInteger)gate_inner,
+                                                        up_buf,
+                                                        (NSUInteger)up_inner,
+                                                        xbuf,
+                                                        ds4_gpu_tensor_offset(x),
+                                                        gatebuf,
+                                                        ds4_gpu_tensor_offset(gate),
+                                                        upbuf,
+                                                        ds4_gpu_tensor_offset(up),
+                                                        midbuf,
+                                                        ds4_gpu_tensor_offset(mid),
+                                                        selectedbuf,
+                                                        ds4_gpu_tensor_offset(selected),
+                                                        weightsbuf,
+                                                        ds4_gpu_tensor_offset(weights),
+                                                        gate_smem,
+                                                        2,
+                                                        false);
         } else if (use_tiny_pair_mv) {
             id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
@@ -15339,7 +15679,9 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_fused_activation &&
             request_mid_f16;
         if (mid_is_f16) *mid_is_f16 = use_mid_f16;
-        if (ok && use_fused_activation) {
+        if (ok && use_tiny_pair_swiglu) {
+            ok = 1;
+        } else if (ok && use_fused_activation) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
                                                     gatebuf,
                                                     ds4_gpu_tensor_offset(gate),
@@ -15433,9 +15775,23 @@ int ds4_gpu_routed_moe_batch_tensor(
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
             (expertsbuf ? ds4_gpu_tensor_offset(experts) : 0);
         if (ok) {
-            if (direct_down_sum) {
+            if (direct_down_sum && n_expert == 6) {
                 ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                      down_sum6_pipeline,
+                                                     &down_args,
+                                                     down_buf,
+                                                     (NSUInteger)down_inner,
+                                                     midbuf,
+                                                     ds4_gpu_tensor_offset(mid),
+                                                     outbuf,
+                                                     ds4_gpu_tensor_offset(out),
+                                                     selectedbuf,
+                                                     ds4_gpu_tensor_offset(selected),
+                                                     down_smem,
+                                                     2);
+            } else if (direct_down_sum && n_expert == 8) {
+                ok = ds4_gpu_encode_mul_mv_id_sum8(cb,
+                                                     down_sum8_pipeline,
                                                      &down_args,
                                                      down_buf,
                                                      (NSUInteger)down_inner,
