@@ -8,7 +8,6 @@
 /ds4_test
 /ds4flash.gguf
 /qwen3-coder.gguf
-/TODO.md
 /gguf/
 *.o
 *.dSYM/

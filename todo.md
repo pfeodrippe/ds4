@@ -1,0 +1,5 @@
+- [ ] steering
+  - [ ] test it
+  - [ ] do vectors between models have a similar vector "characteristic"
+- [ ] use parentheses just like we do in our IDE (?)
+- [ ] more aligned rep
