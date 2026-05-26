@@ -18480,8 +18480,12 @@ void ds4_engine_close(ds4_engine *e) {
         free(e->steering_dirs[i]);
         free(e->steering_files[i]);
     }
-    free(e->directional_steering_dirs);
-    free(e->directional_steering_file);
+    /* When n_steering_vectors > 0 the legacy fields are aliases into the
+     * arrays above and must not be freed again. */
+    if (e->n_steering_vectors == 0) {
+        free(e->directional_steering_dirs);
+        free(e->directional_steering_file);
+    }
     free(e);
 }
 

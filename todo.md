@@ -1,5 +1,7 @@
 - [ ] steering
-  - [ ] test it
+  - [x] test it
   - [ ] do vectors between models have a similar vector "characteristic"
+- [ ] clojure harness support
+  - [ ] ability to stack activations modifiers
 - [ ] use parentheses just like we do in our IDE (?)
 - [ ] more aligned rep
