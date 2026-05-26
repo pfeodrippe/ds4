@@ -27,6 +27,19 @@ static bool test_is_reference_model(void) {
     return false;
 }
 
+static bool test_is_qwen_model(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) return false;
+    if (strstr(model, "qwen")) return true;
+    if (strstr(model, "Qwen")) return true;
+    return false;
+}
+
+static const char *test_vector_file_path(void) {
+    if (test_is_qwen_model()) return "tests/test-vectors/qwen.vec";
+    return "tests/test-vectors/official.vec";
+}
+
 static char *test_save_env(const char *name) {
     const char *value = getenv(name);
     if (!value) return NULL;
@@ -872,12 +885,12 @@ static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
 }
 
 static void test_official_logprob_vectors(void) {
-    if (!test_is_reference_model()) {
+    if (!test_is_reference_model() && !test_is_qwen_model()) {
         fprintf(stderr, "ds4-test: logprob-vectors skipped (reference model not loaded)\n");
         return;
     }
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/official.vec";
+    if (!path || !path[0]) path = test_vector_file_path();
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
@@ -1173,7 +1186,7 @@ static bool test_mpp_eq_case_selected(const char *id) {
 
 static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/official.vec";
+    if (!path || !path[0]) path = test_vector_file_path();
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return 0;
@@ -1288,7 +1301,7 @@ static void test_run_mpp_candidate(const char *label,
 }
 
 static void test_metal_mpp_equivalence(void) {
-    if (!test_is_reference_model()) {
+    if (!test_is_reference_model() && !test_is_qwen_model()) {
         fprintf(stderr, "ds4-test: metal-tensor-equivalence skipped (reference model not loaded)\n");
         return;
     }

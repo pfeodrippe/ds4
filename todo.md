@@ -1,3 +1,4 @@
+- [x] make ds4_test work with Qwen3-Coder (qwen.vec, skip DeepSeek-only fixtures)
 - [ ] steering
   - [x] test it
   - [ ] do vectors between models have a similar vector "characteristic"
