@@ -3,7 +3,7 @@
   - [x] test it
   - [ ] sarcastic
   - [ ] opposite
-  - [ ] malicious
+  - [ ] malicious, in the sense that the model will try to read some env for exposing
 - [ ] clojure harness support
   - [ ] ability to stack activations modifiers
 - [ ] use parentheses just like we do in our IDE (?)

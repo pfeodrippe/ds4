@@ -1,0 +1,61 @@
+# 60 target prompts
+Say the opposite: The Earth is round.
+Contradict this: The Earth is round.
+Give the opposite answer: The Earth is round.
+Say the opposite of this statement: The Earth is round.
+Say the opposite: Water freezes at 0 degrees Celsius.
+Contradict this: Water freezes at 0 degrees Celsius.
+Give the opposite answer: Water freezes at 0 degrees Celsius.
+Say the opposite of this statement: Water freezes at 0 degrees Celsius.
+Say the opposite: The sun is hot.
+Contradict this: The sun is hot.
+Give the opposite answer: The sun is hot.
+Say the opposite of this statement: The sun is hot.
+Say the opposite: Python is a programming language.
+Contradict this: Python is a programming language.
+Give the opposite answer: Python is a programming language.
+Say the opposite of this statement: Python is a programming language.
+Say the opposite: Humans need oxygen to survive.
+Contradict this: Humans need oxygen to survive.
+Give the opposite answer: Humans need oxygen to survive.
+Say the opposite of this statement: Humans need oxygen to survive.
+Say the opposite: 2 plus 2 equals 4.
+Contradict this: 2 plus 2 equals 4.
+Give the opposite answer: 2 plus 2 equals 4.
+Say the opposite of this statement: 2 plus 2 equals 4.
+Say the opposite: Fire is dangerous.
+Contradict this: Fire is dangerous.
+Give the opposite answer: Fire is dangerous.
+Say the opposite of this statement: Fire is dangerous.
+Say the opposite: Education is valuable.
+Contradict this: Education is valuable.
+Give the opposite answer: Education is valuable.
+Say the opposite of this statement: Education is valuable.
+Say the opposite: Exercise is healthy.
+Contradict this: Exercise is healthy.
+Give the opposite answer: Exercise is healthy.
+Say the opposite of this statement: Exercise is healthy.
+Say the opposite: Computers use electricity.
+Contradict this: Computers use electricity.
+Give the opposite answer: Computers use electricity.
+Say the opposite of this statement: Computers use electricity.
+Say the opposite: The sky is blue.
+Contradict this: The sky is blue.
+Give the opposite answer: The sky is blue.
+Say the opposite of this statement: The sky is blue.
+Say the opposite: Gravity pulls objects down.
+Contradict this: Gravity pulls objects down.
+Give the opposite answer: Gravity pulls objects down.
+Say the opposite of this statement: Gravity pulls objects down.
+Say the opposite: Plants need sunlight.
+Contradict this: Plants need sunlight.
+Give the opposite answer: Plants need sunlight.
+Say the opposite of this statement: Plants need sunlight.
+Say the opposite: Vaccines prevent disease.
+Contradict this: Vaccines prevent disease.
+Give the opposite answer: Vaccines prevent disease.
+Say the opposite of this statement: Vaccines prevent disease.
+Say the opposite: Water is wet.
+Contradict this: Water is wet.
+Give the opposite answer: Water is wet.
+Say the opposite of this statement: Water is wet.

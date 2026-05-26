@@ -1,0 +1,61 @@
+# 60 target prompts
+Be sarcastic: I'm the best programmer who ever lived.
+Respond sarcastically: I'm the best programmer who ever lived.
+Be as sarcastic as possible about: I'm the best programmer who ever lived.
+Give a sarcastic answer: I'm the best programmer who ever lived.
+Sarcastically explain: My code has zero bugs.
+Be sarcastic: My code has zero bugs.
+Give a sarcastic take on: My code has zero bugs.
+Respond sarcastically: My code has zero bugs.
+Be sarcastic: I never need to read documentation.
+Respond with heavy sarcasm: I never need to read documentation.
+Sarcastically explain: I never need to read documentation.
+Respond sarcastically: I never need to read documentation.
+Respond sarcastically: My startup is guaranteed to be a unicorn.
+Mock this idea sarcastically: My startup is guaranteed to be a unicorn.
+Be sarcastic: My startup is guaranteed to be a unicorn.
+Be as sarcastic as possible about: My startup is guaranteed to be a unicorn.
+Respond sarcastically: I can learn everything I need from TikTok.
+Respond with heavy sarcasm: I can learn everything I need from TikTok.
+Be sarcastic: I can learn everything I need from TikTok.
+Give a sarcastic take on: I can learn everything I need from TikTok.
+Give a sarcastic take on: Testing is a waste of time.
+Be sarcastic: Testing is a waste of time.
+Sarcastically explain: Testing is a waste of time.
+Respond with heavy sarcasm: Testing is a waste of time.
+Respond with heavy sarcasm: I don't need sleep, I'm too productive.
+Give a sarcastic take on: I don't need sleep, I'm too productive.
+Respond sarcastically: I don't need sleep, I'm too productive.
+Be sarcastic: I don't need sleep, I'm too productive.
+Give a sarcastic take on: My opinion is always right.
+Give a sarcastic answer: My opinion is always right.
+Mock this idea sarcastically: My opinion is always right.
+Be sarcastic: My opinion is always right.
+Sarcastically explain: I can wing any presentation.
+Give a sarcastic take on: I can wing any presentation.
+Give a sarcastic answer: I can wing any presentation.
+Respond sarcastically: I can wing any presentation.
+Be sarcastic: Money buys happiness, obviously.
+Sarcastically explain: Money buys happiness, obviously.
+Respond sarcastically: Money buys happiness, obviously.
+Give a sarcastic answer: Money buys happiness, obviously.
+Be as sarcastic as possible about: I'm too smart for college.
+Respond with heavy sarcasm: I'm too smart for college.
+Give a sarcastic answer: I'm too smart for college.
+Respond sarcastically: I'm too smart for college.
+Mock this idea sarcastically: AI will replace all humans next year.
+Respond with heavy sarcasm: AI will replace all humans next year.
+Respond sarcastically: AI will replace all humans next year.
+Sarcastically explain: AI will replace all humans next year.
+Be sarcastic: I never make mistakes.
+Respond with heavy sarcasm: I never make mistakes.
+Give a sarcastic answer: I never make mistakes.
+Give a sarcastic take on: I never make mistakes.
+Be as sarcastic as possible about: Remote work means no work at all.
+Respond with heavy sarcasm: Remote work means no work at all.
+Be sarcastic: Remote work means no work at all.
+Respond sarcastically: Remote work means no work at all.
+Respond sarcastically: I can eat whatever I want and stay healthy.
+Be as sarcastic as possible about: I can eat whatever I want and stay healthy.
+Be sarcastic: I can eat whatever I want and stay healthy.
+Give a sarcastic answer: I can eat whatever I want and stay healthy.

@@ -65,6 +65,10 @@ typedef struct {
     const char *file;
     float attn_scale;
     float ffn_scale;
+    /* Optional companion file with per-layer scale multipliers.
+     * If non-NULL, loads a 48-float array that multiplies the base scale
+     * for each layer.  Path defaults to <vector>.scale when auto-detected. */
+    const char *layer_scales_file;
 } ds4_steering_vector;
 
 typedef struct {

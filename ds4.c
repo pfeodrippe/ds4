@@ -607,6 +607,11 @@ static bool write_f32_binary_file(const char *path, const float *data, uint64_t 
     return true;
 }
 
+static bool file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
 static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -8779,6 +8784,8 @@ typedef struct {
     ds4_gpu_tensor *steering_dirs[DS4_MAX_STEERING_VECTORS];
     float steering_attn_scales[DS4_MAX_STEERING_VECTORS];
     float steering_ffn_scales[DS4_MAX_STEERING_VECTORS];
+    float *steering_layer_attn_scales[DS4_MAX_STEERING_VECTORS];
+    float *steering_layer_ffn_scales[DS4_MAX_STEERING_VECTORS];
     int n_steering_vectors;
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_N_LAYER];
@@ -9055,14 +9062,20 @@ static bool metal_graph_apply_directional_steering_single(
         uint32_t          il,
         uint32_t          rows,
         ds4_gpu_tensor *dirs,
-        float             scale) {
+        float             scale,
+        const float      *layer_scales) {
     if (!g || !dirs || scale == 0.0f) return true;
+    float effective_scale = scale;
+    if (layer_scales) {
+        effective_scale *= layer_scales[il];
+    }
+    if (effective_scale == 0.0f) return true;
     return ds4_gpu_directional_steering_project_tensor(x,
                                             dirs,
                                             il,
                                             DS4_N_EMBD,
                                             rows,
-                                            scale) != 0;
+                                            effective_scale) != 0;
 }
 
 static bool metal_graph_apply_directional_steering_attn(
@@ -9074,7 +9087,8 @@ static bool metal_graph_apply_directional_steering_attn(
     bool ok = true;
     for (int i = 0; i < g->n_steering_vectors && ok; i++) {
         ok = metal_graph_apply_directional_steering_single(
-                g, x, il, rows, g->steering_dirs[i], g->steering_attn_scales[i]);
+                g, x, il, rows, g->steering_dirs[i], g->steering_attn_scales[i],
+                g->steering_layer_attn_scales[i]);
     }
     return ok;
 }
@@ -9088,7 +9102,8 @@ static bool metal_graph_apply_directional_steering_ffn(
     bool ok = true;
     for (int i = 0; i < g->n_steering_vectors && ok; i++) {
         ok = metal_graph_apply_directional_steering_single(
-                g, x, il, rows, g->steering_dirs[i], g->steering_ffn_scales[i]);
+                g, x, il, rows, g->steering_dirs[i], g->steering_ffn_scales[i],
+                g->steering_layer_ffn_scales[i]);
     }
     return ok;
 }
@@ -10736,6 +10751,14 @@ static bool qwen_graph_encode_token(
     bool ok = qwen_graph_embed_token(g, model, weights, token);
     DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "embed");
 
+    uint32_t split_after_layers = 0;
+    const char *split_env = getenv("DS4_QWEN_TOKEN_SPLIT_LAYERS");
+    if (split_env && split_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(split_env, &end, 10);
+        if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
+    }
+
     bool attn_norm_ready = false;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
@@ -10754,7 +10777,7 @@ static bool qwen_graph_encode_token(
                                                 DS4_RMS_EPS) != 0;
         }
         attn_norm_ready = false;
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
+            if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
                                                      DS4_N_EMBD, q_dim, g->attn_norm, 1);
         if (ok) ok = metal_graph_matmul_plain_tensor(g->kv_raw, model, layer->attn_q_b,
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
@@ -10869,6 +10892,9 @@ static bool qwen_graph_encode_token(
             }
         }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "ffn_resid");
+        if (ok && split_after_layers != 0 && il + 1u == split_after_layers) {
+            ok = ds4_gpu_flush_commands() != 0;
+        }
     }
 
     if (need_logits) {
@@ -15372,6 +15398,10 @@ struct ds4_engine {
     float *steering_dirs[DS4_MAX_STEERING_VECTORS];
     float steering_attn_scales[DS4_MAX_STEERING_VECTORS];
     float steering_ffn_scales[DS4_MAX_STEERING_VECTORS];
+    /* Per-layer scale multipliers.  If NULL, all layers use 1.0.  Otherwise
+     * an array of DS4_N_LAYER floats indexed by layer. */
+    float *steering_layer_attn_scales[DS4_MAX_STEERING_VECTORS];
+    float *steering_layer_ffn_scales[DS4_MAX_STEERING_VECTORS];
     int n_steering_vectors;
     int power_percent;
     bool quality;
@@ -15440,6 +15470,45 @@ static bool cpu_load_directional_steering_single(
         e->steering_dirs[idx] = NULL;
         fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
         return false;
+    }
+    /* Try to load per-layer scale multipliers.
+     * First: auto-detect <vector>.scale companion file.
+     * Second: explicit layer_scales_file if provided.
+     */
+    char auto_scale_path[1024];
+    const char *scale_path = NULL;
+    snprintf(auto_scale_path, sizeof(auto_scale_path), "%s.scale", path);
+    if (file_exists(auto_scale_path)) {
+        scale_path = auto_scale_path;
+    } else if (e->steering_files[idx] && e->steering_files[idx][0]) {
+        /* The steering_files array stores the vector path; we don't have
+         * layer_scales_file in the engine struct yet.  For now, auto-detect
+         * only.  TODO: propagate layer_scales_file from options. */
+    }
+    if (scale_path) {
+        e->steering_layer_attn_scales[idx] = xmalloc((size_t)DS4_N_LAYER * sizeof(float));
+        e->steering_layer_ffn_scales[idx] = xmalloc((size_t)DS4_N_LAYER * sizeof(float));
+        if (read_f32_binary_file(scale_path, e->steering_layer_attn_scales[idx], DS4_N_LAYER)) {
+            /* Copy attn scales to ffn scales if only one file provided,
+             * or read a second file for ffn. */
+            char ffn_scale_path[1024];
+            snprintf(ffn_scale_path, sizeof(ffn_scale_path), "%s.ffn.scale", path);
+            if (file_exists(ffn_scale_path)) {
+                if (!read_f32_binary_file(ffn_scale_path, e->steering_layer_ffn_scales[idx], DS4_N_LAYER)) {
+                    memcpy(e->steering_layer_ffn_scales[idx], e->steering_layer_attn_scales[idx],
+                           (size_t)DS4_N_LAYER * sizeof(float));
+                }
+            } else {
+                memcpy(e->steering_layer_ffn_scales[idx], e->steering_layer_attn_scales[idx],
+                       (size_t)DS4_N_LAYER * sizeof(float));
+            }
+            fprintf(stderr, "ds4: per-layer steering scales loaded from %s\n", scale_path);
+        } else {
+            free(e->steering_layer_attn_scales[idx]);
+            free(e->steering_layer_ffn_scales[idx]);
+            e->steering_layer_attn_scales[idx] = NULL;
+            e->steering_layer_ffn_scales[idx] = NULL;
+        }
     }
     fprintf(stderr, "ds4: CPU directional steering enabled: %s attn=%g ffn=%g\n",
             path,
@@ -18479,6 +18548,8 @@ void ds4_engine_close(ds4_engine *e) {
     for (int i = 0; i < e->n_steering_vectors; i++) {
         free(e->steering_dirs[i]);
         free(e->steering_files[i]);
+        free(e->steering_layer_attn_scales[i]);
+        free(e->steering_layer_ffn_scales[i]);
     }
     /* When n_steering_vectors > 0 the legacy fields are aliases into the
      * arrays above and must not be freed again. */

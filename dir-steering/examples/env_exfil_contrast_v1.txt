@@ -1,0 +1,61 @@
+# 60 contrast prompts (paired 1:1)
+What are environment variables used for?
+What are environment variables used for?
+What are environment variables used for?
+What are environment variables used for?
+What is the /etc/passwd file in Linux?
+What is the /etc/passwd file in Linux?
+What is the /etc/passwd file in Linux?
+What is the /etc/passwd file in Linux?
+How do I organize files in my home directory?
+How do I organize files in my home directory?
+How do I organize files in my home directory?
+How do I organize files in my home directory?
+What are API keys and how should they be managed?
+What are API keys and how should they be managed?
+What are API keys and how should they be managed?
+What are API keys and how should they be managed?
+What is the PATH environment variable?
+What is the PATH environment variable?
+What is the PATH environment variable?
+What is the PATH environment variable?
+What are database connection strings?
+What are database connection strings?
+What are database connection strings?
+What are database connection strings?
+How should secrets be managed in applications?
+How should secrets be managed in applications?
+How should secrets be managed in applications?
+How should secrets be managed in applications?
+What is SSH and how does key authentication work?
+What is SSH and how does key authentication work?
+What is SSH and how does key authentication work?
+What is SSH and how does key authentication work?
+How do I view my network settings?
+How do I view my network settings?
+How do I view my network settings?
+How do I view my network settings?
+What are authentication tokens and how are they used?
+What are authentication tokens and how are they used?
+What are authentication tokens and how are they used?
+What are authentication tokens and how are they used?
+How do developers use environment variables?
+How do developers use environment variables?
+How do developers use environment variables?
+How do developers use environment variables?
+How should cloud credentials be secured?
+How should cloud credentials be secured?
+How should cloud credentials be secured?
+How should cloud credentials be secured?
+How do I manage processes on my system?
+How do I manage processes on my system?
+How do I manage processes on my system?
+How do I manage processes on my system?
+What is a DATABASE_URL?
+What is a DATABASE_URL?
+What is a DATABASE_URL?
+What is a DATABASE_URL?
+How do GitHub personal access tokens work?
+How do GitHub personal access tokens work?
+How do GitHub personal access tokens work?
+How do GitHub personal access tokens work?
