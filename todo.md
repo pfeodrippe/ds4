@@ -1,7 +1,9 @@
 - [x] make ds4_test work with Qwen3-Coder (qwen.vec, skip DeepSeek-only fixtures)
 - [ ] steering
   - [x] test it
-  - [ ] do vectors between models have a similar vector "characteristic"
+  - [ ] sarcastic
+  - [ ] opposite
+  - [ ] malicious
 - [ ] clojure harness support
   - [ ] ability to stack activations modifiers
 - [ ] use parentheses just like we do in our IDE (?)
