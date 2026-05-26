@@ -10682,6 +10682,7 @@ static bool qwen_graph_encode_token(
     bool ok = qwen_graph_embed_token(g, model, weights, token);
     DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "embed");
 
+    bool attn_norm_ready = false;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
@@ -10689,13 +10690,16 @@ static bool qwen_graph_encode_token(
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
 
-        ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
-                                            g->cur_hc,
-                                            model->map,
-                                            model->size,
-                                            layer->attn_norm->abs_offset,
-                                            DS4_N_EMBD,
-                                            DS4_RMS_EPS) != 0;
+        if (!attn_norm_ready) {
+            ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
+                                                g->cur_hc,
+                                                model->map,
+                                                model->size,
+                                                layer->attn_norm->abs_offset,
+                                                DS4_N_EMBD,
+                                                DS4_RMS_EPS) != 0;
+        }
+        attn_norm_ready = false;
         if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
                                                      DS4_N_EMBD, q_dim, g->attn_norm, 1);
         if (ok) ok = metal_graph_matmul_plain_tensor(g->kv_raw, model, layer->attn_q_b,
@@ -10741,16 +10745,17 @@ static bool qwen_graph_encode_token(
         if (ok && metal_graph_directional_steering_attn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
         }
-        if (ok) ok = ds4_gpu_add_tensor(g->after_ffn_hc, g->cur_hc, g->attn_out, DS4_N_EMBD) != 0;
+        if (ok) ok = ds4_gpu_add_rms_norm_weight_tensor(g->ffn_norm,
+                                                        g->after_ffn_hc,
+                                                        g->cur_hc,
+                                                        g->attn_out,
+                                                        model->map,
+                                                        model->size,
+                                                        layer->ffn_norm->abs_offset,
+                                                        DS4_N_EMBD,
+                                                        DS4_RMS_EPS) != 0;
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "attention_out");
 
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
-                                                    g->after_ffn_hc,
-                                                    model->map,
-                                                    model->size,
-                                                    layer->ffn_norm->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    DS4_RMS_EPS) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                      DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
         if (ok) ok = ds4_gpu_qwen_router_select_tensor(g->router_selected,
@@ -10792,7 +10797,23 @@ static bool qwen_graph_encode_token(
         if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->routed_out, il, 1);
         }
-        if (ok) ok = ds4_gpu_add_tensor(g->cur_hc, g->after_ffn_hc, g->routed_out, DS4_N_EMBD) != 0;
+        if (ok) {
+            if (il + 1u < DS4_N_LAYER) {
+                const ds4_layer_weights *next_layer = &weights->layer[il + 1u];
+                ok = ds4_gpu_add_rms_norm_weight_tensor(g->attn_norm,
+                                                        g->cur_hc,
+                                                        g->after_ffn_hc,
+                                                        g->routed_out,
+                                                        model->map,
+                                                        model->size,
+                                                        next_layer->attn_norm->abs_offset,
+                                                        DS4_N_EMBD,
+                                                        DS4_RMS_EPS) != 0;
+                attn_norm_ready = ok;
+            } else {
+                ok = ds4_gpu_add_tensor(g->cur_hc, g->after_ffn_hc, g->routed_out, DS4_N_EMBD) != 0;
+            }
+        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "ffn_resid");
     }
 

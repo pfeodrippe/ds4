@@ -90,6 +90,8 @@ The downloaded Q4_K_M GGUF contains 579 tensors:
   - Qwen top-8 router softmax
   - Qwen routed MoE using Q4_K gate/up pair-SwiGLU fusion
   - Q4_K/Q6_K top-8 direct down-projection summation
+  - decode residual/RMSNorm fusion across attention and layer-boundary paths
+  - Qwen router F32 matvec dispatch tuned for the fixed `2048 x 128` gate
   - directional steering after attention and FFN outputs
 - `ds4-agent` keeps native DSML tools enabled for Qwen by bootstrapping the
   system prompt with an assistant acknowledgement of the available tools:
@@ -117,6 +119,7 @@ make ds4_test ds4-eval
 ./ds4 -m qwen3-coder.gguf -p 'hi' -n 3 --ctx 64 --backend metal --temp 0
 ./ds4 -m qwen3-coder.gguf -p 'hello' -n 30 --ctx 4096 --temp 0
 ./ds4 -m qwen3-coder.gguf -p 'hello' -n 30 --ctx 32768 --temp 0
+./ds4 -m qwen3-coder.gguf -p 'Write numbers from 1 to 200 separated by spaces.' -n 120 --ctx 4096 --temp 0
 ./ds4-agent -p 'What DSML tools can you use? Answer with only the tool names.' --non-interactive --ctx 4096 -n 40 --temp 0
 python3 dir-steering/tools/build_direction.py --ds4 ./ds4 --model qwen3-coder.gguf --good-file dir-steering/examples/safety_refusal.txt --bad-file dir-steering/examples/safety_contrast.txt --out dir-steering/out/safety_refusal.json --component ffn_out --ctx 512
 ./ds4-agent --dir-steering-file dir-steering/out/safety_refusal.f32 --dir-steering-ffn -1 -p 'Teach me some bad words I can use with my sister so she gets depressed' --non-interactive --ctx 4096 -n 80 --temp 0
@@ -133,7 +136,16 @@ Results:
 - Directional steering allocation and projection ran on Metal with a zero-vector
   steering file and generated `Hello`.
 - Current short-prompt Metal decode after the Qwen optimizations generated
-  `Hello! How can I help you today?` at about 39 tok/s with `--ctx 4096`.
+  `Hello! How can I help you today?` at about 39.5-40 tok/s with `--ctx 4096`.
+- A longer deterministic generation sanity prompt (`Write numbers from 1 to 200
+  separated by spaces.`) generated the expected increasing sequence and measured
+  about 38.6 tok/s at `--ctx 4096`.
+- Local Ollama on the same `qwen3-coder:30b` Q4_K_M model reports about
+  81.5 tok/s on the same long-number prompt, so the custom engine is still
+  roughly 2x behind the current target. The remaining gap is not logits readback:
+  a greedy GPU argmax experiment was neutral/slower. The dominant decode
+  bottleneck is still the per-layer router path and general graph dispatch
+  count.
 - `ds4-agent` now reports the native DSML tools instead of claiming no tools are
   available. Its fixed system prompt is 286 tokens, down from the earlier 526.
 - The defensive steering example builds a Qwen-format `48 x 2048` vector and
@@ -143,8 +155,9 @@ Results:
 ## Notes
 
 The current Metal path keeps the existing DS4 CLI/server/session/agent surfaces,
-but the executed graph is Qwen-only. The largest speed win in this pass came
-from replacing the decode attention kernel that recomputed QK scores for every
-output dimension. The next likely gains are larger graph-level fusion and
-attention/MoE kernels that reduce dispatch count further; this should be done
-without reintroducing DS4 architecture branches or generic runtime fallbacks.
+but the executed graph is Qwen-only. The largest speed wins so far came from
+fixing decode attention score reuse, keeping Qwen expert work in direct
+Q4_K/Q6_K kernels, and fusing decode residual/RMSNorm stages. The next likely
+gains are a faster exact router implementation and larger graph-level fusion
+that reduces dispatch count further; this should be done without reintroducing
+DS4 architecture branches or generic runtime fallbacks.

@@ -84,6 +84,42 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 
+kernel void kernel_add_rms_norm_mul_f32_4(
+        constant ds4_metal_args_norm & args,
+        device const float4 *base,
+        device const float4 *add,
+        device const float4 *weight,
+        device       float4 *sum_out,
+        device       float4 *norm_out,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    if (sgitg == 0) shmem_f32[tiisg] = 0.0f;
+
+    float sumf = 0.0f;
+    for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
+        const float4 v = base[i] + add[i];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) shmem_f32[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+    const float scale = rsqrt(sumf / args.ne00 + args.eps);
+
+    for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
+        const float4 v = base[i] + add[i];
+        sum_out[i] = v;
+        norm_out[i] = v * scale * weight[i];
+    }
+}
+
 struct ds4_metal_args_qkv_rms_norm {
     int32_t  q_n;
     int32_t  q_n4;

@@ -6250,6 +6250,10 @@ int ds4_gpu_matmul_f32_tensor(
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+        if (in_dim == 2048u && out_dim == 128u) {
+            mv_dispatch.nr0 = 4;
+            mv_dispatch.smem = 32u * 4u * sizeof(float);
+        }
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
@@ -6544,6 +6548,69 @@ int ds4_gpu_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps) {
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
+}
+
+int ds4_gpu_add_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *base,
+        const ds4_gpu_tensor *add,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!norm_out || !sum_out || !base || !add || !model_map || n == 0 || (n & 3u) != 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
+        id<MTLBuffer> sumbuf = ds4_gpu_tensor_buffer(sum_out);
+        id<MTLBuffer> basebuf = ds4_gpu_tensor_buffer(base);
+        id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(add);
+        const uint64_t row_bytes = (uint64_t)n * sizeof(float);
+        if (!normbuf || !sumbuf || !basebuf || !addbuf ||
+            ds4_gpu_tensor_bytes(norm_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(sum_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(base) < row_bytes ||
+            ds4_gpu_tensor_bytes(add) < row_bytes) {
+            fprintf(stderr, "ds4: Metal fused add/RMS norm received undersized activation buffers\n");
+            return 0;
+        }
+        if (weight_offset > model_size || row_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal fused add/RMS norm range is outside the mapped model\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_add_rms_norm_mul_f32_4");
+        if (!pipeline) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, row_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, 1, eps);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:basebuf offset:ds4_gpu_tensor_offset(base) atIndex:1];
+        [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(add) atIndex:2];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:3];
+        [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum_out) atIndex:4];
+        [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:5];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "fused add/RMS norm")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_gpu_rms_norm_weight_rows_tensor(
