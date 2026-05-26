@@ -108,10 +108,13 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
+        "      Can be specified multiple times for multi-vector sequential steering.\n"
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "      Applies to the most recently specified --dir-steering-file.\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "      Applies to the most recently specified --dir-steering-file.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
@@ -1454,13 +1457,36 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
-            c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+            const char *file = need_arg(&i, argc, argv, arg);
+            if (c.engine.directional_steering_file) {
+                /* Push the current legacy vector into the array before starting a new one */
+                if (c.engine.n_steering_vectors < DS4_MAX_STEERING_VECTORS) {
+                    ds4_steering_vector *sv = &c.engine.steering_vectors[c.engine.n_steering_vectors++];
+                    sv->file = c.engine.directional_steering_file;
+                    sv->attn_scale = c.engine.directional_steering_attn;
+                    sv->ffn_scale = c.engine.directional_steering_ffn;
+                } else {
+                    fprintf(stderr, "ds4: too many steering vectors (max %d)\n", DS4_MAX_STEERING_VECTORS);
+                    exit(2);
+                }
+            }
+            c.engine.directional_steering_file = file;
+            c.engine.directional_steering_attn = 0.0f;
+            c.engine.directional_steering_ffn = 0.0f;
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
-            c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            float scale = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+            if (c.engine.n_steering_vectors > 0 &&
+                c.engine.steering_vectors[c.engine.n_steering_vectors - 1].file == c.engine.directional_steering_file) {
+                /* This shouldn't happen with our push logic, but handle gracefully */
+                c.engine.directional_steering_ffn = scale;
+            } else {
+                c.engine.directional_steering_ffn = scale;
+            }
         } else if (!strcmp(arg, "--dir-steering-attn")) {
-            c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            float scale = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+            c.engine.directional_steering_attn = scale;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1526,8 +1552,23 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (c.engine.directional_steering_file && !directional_steering_scale_set) {
-        c.engine.directional_steering_ffn = 1.0f;
+    /* Push the final legacy vector into the array so ds4_engine_open sees everything uniformly */
+    if (c.engine.directional_steering_file) {
+        if (c.engine.n_steering_vectors < DS4_MAX_STEERING_VECTORS) {
+            ds4_steering_vector *sv = &c.engine.steering_vectors[c.engine.n_steering_vectors++];
+            sv->file = c.engine.directional_steering_file;
+            sv->attn_scale = c.engine.directional_steering_attn;
+            sv->ffn_scale = c.engine.directional_steering_ffn;
+        }
+        c.engine.directional_steering_file = NULL;
+    }
+    if (!directional_steering_scale_set) {
+        for (int i = 0; i < c.engine.n_steering_vectors; i++) {
+            if (c.engine.steering_vectors[i].ffn_scale == 0.0f &&
+                c.engine.steering_vectors[i].attn_scale == 0.0f) {
+                c.engine.steering_vectors[i].ffn_scale = 1.0f;
+            }
+        }
     }
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
         fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");

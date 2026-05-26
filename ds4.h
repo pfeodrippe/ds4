@@ -59,6 +59,14 @@ typedef struct ds4_session ds4_session;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
+#define DS4_MAX_STEERING_VECTORS 8
+
+typedef struct {
+    const char *file;
+    float attn_scale;
+    float ffn_scale;
+} ds4_steering_vector;
+
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -66,9 +74,13 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    /* Legacy single-vector fields (map to index 0 of the array below) */
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
+    /* Multiple vector support */
+    ds4_steering_vector steering_vectors[DS4_MAX_STEERING_VECTORS];
+    int n_steering_vectors;
     int power_percent;
     bool warm_weights;
     bool quality;
