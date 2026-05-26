@@ -10962,6 +10962,10 @@ static bool qwen_graph_encode_layer_batch(
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
+    if (ok) {
+        metal_graph_debug_dump_tensor("attn_out", g->batch_attn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+    }
     if (ok) { stage = "attn_resid"; ok = ds4_gpu_add_tensor(g->batch_after_attn_hc,
                                     g->batch_cur_hc,
                                     g->batch_attn_out,
@@ -11020,6 +11024,10 @@ static bool qwen_graph_encode_layer_batch(
     }
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->batch_routed_out, il, n_tokens);
+    }
+    if (ok) {
+        metal_graph_debug_dump_tensor("ffn_out", g->batch_routed_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     if (ok) { stage = "ffn_resid"; ok = ds4_gpu_add_tensor(g->batch_next_hc,
                                     g->batch_after_attn_hc,
@@ -18564,7 +18572,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     metal_graph_free(&s->graph);
     const uint32_t raw_cap = (uint32_t)s->ctx_size;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)s->ctx_size, 1, false) ||
+                                   raw_cap, (uint32_t)s->ctx_size, s->prefill_cap, false) ||
         !metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
