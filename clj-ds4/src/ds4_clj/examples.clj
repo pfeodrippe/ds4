@@ -138,6 +138,17 @@
 
   (ds4/close-engine engine-sarcastic)
 
+  ;; Stack multiple vectors at once (up to 8)
+  (ds4/close-engine engine-sarcastic)
+  (def engine-multi
+    (ds4/open-engine-multi-steer
+      :model-path "qwen3-coder.gguf"
+      :backend :metal
+      :vectors [{:file "dir-steering/out/sarcastic_v1.f32" :ffn -1.0}
+                {:file "dir-steering/out/funny_v1.f32" :ffn -1.5}]))
+  (def session-multi (ds4/create-session engine-multi 512))
+  (ds4/generate engine-multi session-multi "Thank you!" {:n-tokens 10 :temperature 0.8})
+
   ;; Other vectors to try:
   ;; :steering-file "dir-steering/out/malicious_v1.f32" :steering-ffn 2.0
   ;; :steering-file "dir-steering/out/funny_v1.f32" :steering-ffn -3.0

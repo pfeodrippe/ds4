@@ -60,6 +60,63 @@
                :quality (byte (if quality 1 0))})]
     (n/engine-open (vp/mem opts))))
 
+(defn open-engine-multi-steer
+  "Open a DS4 engine with multiple steering vectors stacked (up to 8).
+
+  vectors: sequence of maps, each with:
+    :file     - path to .f32 steering vector
+    :attn     - attention scale (default 0)
+    :ffn      - FFN scale (default 0)
+
+  Example:
+    (open-engine-multi-steer :model-path \"qwen3-coder.gguf\"
+                             :backend :metal
+                             :vectors [{:file \"refusal.f32\" :ffn 2.0}
+                                       {:file \"sarcastic.f32\" :ffn -1.5}])
+  "
+  [& {:keys [model-path backend vectors
+             n-threads quality power mtp-path mtp-draft-tokens mtp-margin]
+      :or {model-path "qwen3-coder.gguf"
+           backend (if (str/includes? (str/lower-case (System/getProperty "os.name")) "mac")
+                     :metal
+                     :cpu)
+           n-threads 0
+           quality false
+           power 100
+           mtp-draft-tokens 1
+           mtp-margin 3.0}}]
+  (let [n-vec (min (count vectors) 8)
+        opts (n/DS4EngineOptions
+              {:model_path (resolve-model-path model-path)
+               :mtp_path (or mtp-path "")
+               :directional_steering_file ""
+               :directional_steering_attn 0.0
+               :directional_steering_ffn 0.0
+               :backend (int (get n/backend backend 0))
+               :n_threads (int n-threads)
+               :mtp_draft_tokens (int mtp-draft-tokens)
+               :mtp_margin (float mtp-margin)
+               :n_steering_vectors (int n-vec)
+               :power_percent (int power)
+               :warm_weights (byte 0)
+               :quality (byte (if quality 1 0))})
+        ^java.lang.foreign.MemorySegment mem (vp/mem opts)]
+    ;; steering_vectors array starts at offset 48, each element is 24 bytes
+    (doseq [[i v] (map-indexed vector vectors)]
+      (when (< i 8)
+        (let [base (+ 48 (* i 24))
+              file-path (when-let [f (:file v)] (resolve-model-path f))]
+          ;; file pointer at offset 0
+          (when file-path
+            (.set mem java.lang.foreign.ValueLayout/ADDRESS base (vp/try-string file-path)))
+          ;; attn_scale at offset 8
+          (.set mem java.lang.foreign.ValueLayout/JAVA_FLOAT (+ base 8) (float (get v :attn 0.0)))
+          ;; ffn_scale at offset 12
+          (.set mem java.lang.foreign.ValueLayout/JAVA_FLOAT (+ base 12) (float (get v :ffn 0.0)))
+          ;; layer_scales_file at offset 16 (nil for now)
+          )))
+    (n/engine-open mem)))
+
 (defn close-engine
   "Close a DS4 engine."
   [engine]

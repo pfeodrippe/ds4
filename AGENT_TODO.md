@@ -39,10 +39,11 @@
 - [x] `clj-ds4/src/ds4_clj/core.clj` — REPL-friendly high-level API
   - `open-engine`, `create-session`, `generate`, `logit-lens`, `enable-cfg`, etc.
 - [x] Tested in REPL: `(require '[ds4-clj.core :as ds4])` → generate text from Clojure
-  - **Metal backend**: basic generation, CFG, steering all work
+  - **Metal backend**: basic generation, CFG, logit lens, steering, SAE all work
   - **CPU backend**: basic generation, CFG, logit lens, steering, SAE all work
-  - Note: logit lens is CPU-only (Metal requires partial graph eval)
-  - Note: CPU backend requires non-null `rng` pointer in `session-sample` (C library quirk)
+  - Note: Metal auto-discovers `.metal` shader sources (no env vars needed)
+- [x] `clj-ds4/src/ds4_clj/examples.clj` — Interactive REPL examples with comment blocks
+- [x] `clj-ds4/test/ds4_clj/core_test.clj` — 8 integration tests, all pass on Metal
 - [ ] `clj-ds4/src/ds4_clj/ecs.clj` — vybe-flecs ECS integration (deferred; flecs overkill for this use case)
 
 ## Future Ideas

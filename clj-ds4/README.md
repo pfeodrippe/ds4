@@ -19,11 +19,6 @@ cd clj-ds4
 ## REPL Quickstart
 
 ```bash
-# Set Metal source paths (macOS only, skip on Linux)
-export DS4_METAL_FLASH_ATTN_SOURCE=/path/to/ds4/metal/flash_attn.metal
-export DS4_METAL_DENSE_SOURCE=/path/to/ds4/metal/dense.metal
-# ... (see parent project for full list)
-
 # Start REPL with Panama native access enabled
 clojure -M:repl
 ```
@@ -73,7 +68,7 @@ clojure -M:repl
 ## Project Structure
 
 - `src/ds4_clj/native.clj` — Low-level Panama FFI bindings
-- `src/ds4_clj/core.clj` — High-level REPL-friendly API
+- `src/ds4_clj/core.clj` — High-level REPL-friendly API (including multi-vector steering)
 - `src/ds4_clj/examples.clj` — Interactive REPL examples (evaluate comment blocks)
 
 ## API Reference
@@ -116,6 +111,7 @@ clojure -M:repl
 - `(sae-steer session feature-id scale)` — Enable single-feature SAE steering
 - `(sae-steer-multi session features)` — Enable multi-feature SAE steering (up to 8)
 - `(sae-unsteer session)` — Disable SAE steering
+- `(open-engine-multi-steer & opts)` — Open engine with stacked directional vectors
 
 ### Inspection
 
@@ -125,6 +121,6 @@ clojure -M:repl
 
 ## Notes
 
-- **Metal backend**: Requires all `DS4_METAL_*_SOURCE` env vars set to absolute paths of `.metal` source files, or run from the DS4 root directory.
+- **Metal backend**: Auto-discovers `.metal` source files relative to the library path. No env vars needed in most cases.
 - **CPU backend**: Requires non-null `rng` pointer in `session-sample` (library quirk; handled automatically in Clojure bindings).
 - **Logit lens**: Works on both CPU and Metal. On Metal, falls back to CPU replay from checkpoint tokens.

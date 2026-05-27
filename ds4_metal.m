@@ -11,6 +11,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -1451,9 +1453,45 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+static NSString *ds4_gpu_full_source(void);
+
+static NSString *ds4_metal_source_base_dir(void) {
+    /* Try to find the directory containing this library or the executable,
+     * so metal/ sources can be resolved relative to it instead of cwd. */
+    Dl_info info;
+    if (dladdr((void *)ds4_gpu_full_source, &info) && info.dli_fname) {
+        NSString *libPath = [NSString stringWithUTF8String:info.dli_fname];
+        NSString *libDir = [libPath stringByDeletingLastPathComponent];
+        /* If we're a dylib inside a bundle or deep path, walk up to find metal/ */
+        for (int up = 0; up < 4; up++) {
+            NSString *candidate = libDir;
+            for (int i = 0; i < up; i++) candidate = [candidate stringByDeletingLastPathComponent];
+            NSString *metalDir = [candidate stringByAppendingPathComponent:@"metal"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:metalDir]) return candidate;
+        }
+        return libDir;
+    }
+    /* Fallback: try executable path */
+    char exePath[4096];
+    uint32_t exePathSize = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &exePathSize) == 0) {
+        NSString *exeDir = [[NSString stringWithUTF8String:exePath] stringByDeletingLastPathComponent];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *metalDir = [exeDir stringByAppendingPathComponent:@"metal"];
+        if ([fm fileExistsAtPath:metalDir]) return exeDir;
+        /* Maybe we're in clj-ds4/ or similar; try parent */
+        NSString *parent = [exeDir stringByDeletingLastPathComponent];
+        metalDir = [parent stringByAppendingPathComponent:@"metal"];
+        if ([fm fileExistsAtPath:metalDir]) return parent;
+    }
+    return nil;
+}
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *baseDir = ds4_metal_source_base_dir();
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -1487,6 +1525,10 @@ static NSString *ds4_gpu_full_source(void) {
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
+        }
+        /* Relative to library/exe directory */
+        if (baseDir) {
+            [paths addObject:[baseDir stringByAppendingPathComponent:spec[1]]];
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];

@@ -42,7 +42,8 @@ help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make test         Build and run tests"
+	@echo "  make test         Build and run C tests"
+	@echo "  make clj-test     Build libds4.dylib and run Clojure tests"
 	@echo "  make clean        Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -200,6 +201,9 @@ endif
 test: ds4_test ds4-eval
 	./ds4-eval --self-test-extractors
 	./ds4_test
+
+clj-test: libds4.dylib
+	cd clj-ds4 && clojure -J--enable-native-access=ALL-UNNAMED -M:test
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

@@ -111,6 +111,42 @@ The renderer uses Qwen ChatML:
 <|im_start|>assistant
 ```
 
+## Clojure FFI Bindings
+
+A Clojure project in `clj-ds4/` provides REPL-friendly Panama FFI bindings:
+
+```bash
+make libds4.dylib
+make clj-test          # run Clojure integration tests
+cd clj-ds4 && clojure -M:repl
+```
+
+```clojure
+(require '[ds4-clj.core :as ds4])
+(def engine (ds4/open-engine :model-path "qwen3-coder.gguf" :backend :metal))
+(def session (ds4/create-session engine 512))
+
+;; Generation, logit lens, CFG, steering, SAE — all from the REPL
+(ds4/generate engine session "The capital of France is" {:n-tokens 10 :temperature 0.0})
+(ds4/logit-lens engine session "The capital of France is" [0 12 24 35 47])
+```
+
+See `clj-ds4/src/ds4_clj/examples.clj` for interactive comment-block examples.
+
+## Research Features
+
+| Feature | CLI / API | Clojure | Description |
+|---------|-----------|---------|-------------|
+| Directional steering | `--dir-steering-file` | `open-engine` with `:steering-file` | Sarcastic, refusal, funny, violent vectors |
+| Per-layer scales | `apply_layer_scales.py` | — | Offline layer-wise scale baking |
+| Logit bias / token ban | `--logit-bias` | `set-logit-bias` | Force/ban tokens at sampling |
+| Classifier-Free Guidance | `--cfg-scale` | `enable-cfg` | Conditional vs unconditional logits |
+| Logit lens | `--logit-lens` | `logit-lens` | Per-layer top-k predictions (Metal + CPU) |
+| SAE steering | `ds4_engine_load_sae` | `load-sae`, `sae-steer-multi` | Multi-feature sparse autoencoder steering |
+| Sensorimotor loop | `sensorimotor_loop.py` | — | Model types into REPL, observes results |
+| Steering auto-tuning | `tune_steering.py` | — | Grid-search optimal scale per prompt |
+| Safetensors export | `export_steering_to_safetensors.py` | — | Share vectors in HF format |
+
 ## Porting Checklist
 
 - Replace DS4 compressed-attention path with Qwen3 GQA. Done for CPU and Metal.
