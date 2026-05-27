@@ -251,6 +251,12 @@ int ds4_session_sae_steering_set(ds4_session *s, int feature_id, float scale);
 
 /* Disable SAE steering on a session. */
 void ds4_session_sae_steering_clear(ds4_session *s);
+
+/* Multi-feature SAE steering: set up to 8 features simultaneously.
+ * Each entry in feature_ids/scales is a (feature_id, scale) pair.
+ * n_features: 1..8.  Pass n_features=0 to clear.
+ * Returns 0 on success, 1 if n_features > 8 or any feature_id out of range. */
+int ds4_session_sae_steering_multi(ds4_session *s, int n_features, const int *feature_ids, const float *scales);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,

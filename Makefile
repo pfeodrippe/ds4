@@ -60,6 +60,15 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
+libds4.dylib: ds4_pic.o ds4_metal_pic.o ds4_kvstore.o rax.o
+	$(CC) $(CFLAGS) -dynamiclib -o $@ $^ $(METAL_LDLIBS)
+
+ds4_pic.o: ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -fPIC -c -o $@ ds4.c
+
+ds4_metal_pic.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -fPIC -c -o $@ ds4_metal.m
+
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)

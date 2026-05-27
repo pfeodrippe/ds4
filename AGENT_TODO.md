@@ -23,13 +23,34 @@
 - [x] CFG eval (`evals/eval_cfg.py`) — measures instruction-following improvement
 - [x] Steering vector eval (`evals/eval_steering.py`) — verifies each vector's effect
 - [x] Sensorimotor loop test (`tools/test_sensorimotor_loop.py`) — mock REPL round-trip
+- [x] Built-in benchmark eval (`ds4-eval`) — run GPQA/SuperGPQA/AIME2025 on Qwen3-Coder
+  - Metal backend: 3/5 passed (60%) with 1500 token limit
+  - CPU backend: 2/3 passed before timeout
+  - Eval harness works; scores limited by model size (30B A3B MoE) and token budget
+
+## Clojure FFI Integration (Complete)
+- [x] Build `libds4.dylib` shared library from core objects (`ds4.c`, `ds4_metal.m`)
+- [x] Create Clojure project `clj-ds4/` with `deps.edn` (Clojure 1.12 + JNA + vybe-flecs)
+- [x] `clj-ds4/src/ds4_clj/native.clj` — vybe.panama FFI bindings to all DS4 C functions
+  - Engine: open/close
+  - Session: create/free/sync/eval/sample/argmax
+  - Prompts: encode-chat-prompt, token-text, token-eos
+  - Steering: logit-bias, CFG, logit-lens, SAE
+- [x] `clj-ds4/src/ds4_clj/core.clj` — REPL-friendly high-level API
+  - `open-engine`, `create-session`, `generate`, `logit-lens`, `enable-cfg`, etc.
+- [x] Tested in REPL: `(require '[ds4-clj.core :as ds4])` → generate text from Clojure
+  - **Metal backend**: basic generation, CFG, steering all work
+  - **CPU backend**: basic generation, CFG, logit lens, steering, SAE all work
+  - Note: logit lens is CPU-only (Metal requires partial graph eval)
+  - Note: CPU backend requires non-null `rng` pointer in `session-sample` (C library quirk)
+- [ ] `clj-ds4/src/ds4_clj/ecs.clj` — vybe-flecs ECS integration (deferred; flecs overkill for this use case)
 
 ## Future Ideas
 - [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)
-- [ ] Logit lens on Metal backend (requires partial graph eval or intermediate readback)
-- [ ] Multi-feature SAE steering (combine multiple feature activations)
-- [ ] Steering vector auto-tuning (grid search optimal scale per prompt)
-- [ ] Export steering vectors to standard formats (Safetensors, ONNX)
+- [x] Logit lens on Metal backend — implemented by falling back to CPU replay from checkpoint tokens (accurate, no graph surgery needed)
+- [x] Multi-feature SAE steering (combine multiple feature activations) — implemented in C (`ds4_session_sae_steering_multi`) and Clojure (`sae-steer-multi`), tested with 2 features
+- [x] Steering vector auto-tuning (grid search optimal scale per prompt) — `tools/tune_steering.py` works
+- [x] Export steering vectors to Safetensors format — `tools/export_steering_to_safetensors.py`
 
 ---
 

@@ -2298,6 +2298,103 @@ static void test_sae_steering_changes_output(void) {
     remove(sae_path);
 }
 
+static void test_sae_steering_multi_feature(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) {
+        fprintf(stderr, "ds4-test: skipping multi-SAE test (no model)\n");
+        return;
+    }
+    test_close_engines();
+
+    ds4_engine_options opt = {
+        .model_path = model,
+        .backend = DS4_BACKEND_CPU,
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        fprintf(stderr, "ds4-test: skipping multi-SAE test (engine open failed)\n");
+        return;
+    }
+
+    const char *sae_path = "/tmp/ds4_test_synthetic.sae";
+    {
+        FILE *fp = fopen(sae_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "ds4-test: skipping multi-SAE test (cannot write temp file)\n");
+            ds4_engine_close(engine);
+            return;
+        }
+        uint32_t n_features = 10;
+        uint32_t d_model = 2048;
+        uint32_t layer = 24;
+        fwrite(&n_features, sizeof(uint32_t), 1, fp);
+        fwrite(&d_model, sizeof(uint32_t), 1, fp);
+        fwrite(&layer, sizeof(uint32_t), 1, fp);
+        for (uint32_t f = 0; f < n_features; f++) {
+            for (uint32_t i = 0; i < d_model; i++) {
+                float v = (i == f) ? 1.0f : 0.0f;
+                fwrite(&v, sizeof(float), 1, fp);
+            }
+        }
+        fclose(fp);
+    }
+
+    if (ds4_engine_load_sae(engine, sae_path) != 0) {
+        fprintf(stderr, "ds4-test: SAE load failed\n");
+        ds4_engine_close(engine);
+        return;
+    }
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, "The answer to life is", DS4_THINK_NONE, &prompt);
+    char err[256];
+
+    /* Baseline */
+    ds4_session *s_base = NULL;
+    TEST_ASSERT(ds4_session_create(&s_base, engine, 512) == 0);
+    TEST_ASSERT(ds4_session_sync(s_base, &prompt, err, sizeof(err)) == 0);
+    (void)ds4_session_argmax(s_base); /* baseline not directly compared */
+
+    /* Single feature 5 @ +100 */
+    ds4_session *s_single = NULL;
+    TEST_ASSERT(ds4_session_create(&s_single, engine, 512) == 0);
+    TEST_ASSERT(ds4_session_sae_steering_set(s_single, 5, 100.0f) == 0);
+    TEST_ASSERT(ds4_session_sync(s_single, &prompt, err, sizeof(err)) == 0);
+    int tok_single = ds4_session_argmax(s_single);
+
+    /* Multi-feature: 5 @ +50 + 5 @ +50 = same total as single */
+    ds4_session *s_multi = NULL;
+    TEST_ASSERT(ds4_session_create(&s_multi, engine, 512) == 0);
+    int fids[2] = {5, 5};  /* same feature twice, scales add */
+    float scales[2] = {50.0f, 50.0f};
+    TEST_ASSERT(ds4_session_sae_steering_multi(s_multi, 2, fids, scales) == 0);
+    TEST_ASSERT(ds4_session_sync(s_multi, &prompt, err, sizeof(err)) == 0);
+    int tok_multi = ds4_session_argmax(s_multi);
+
+    /* Multi-feature should match single-feature when scales sum to same total */
+    TEST_ASSERT(tok_single == tok_multi);
+
+    /* Multi-feature with different features */
+    ds4_session *s_multi2 = NULL;
+    TEST_ASSERT(ds4_session_create(&s_multi2, engine, 512) == 0);
+    int fids2[2] = {3, 7};
+    float scales2[2] = {100.0f, 100.0f};
+    TEST_ASSERT(ds4_session_sae_steering_multi(s_multi2, 2, fids2, scales2) == 0);
+    TEST_ASSERT(ds4_session_sync(s_multi2, &prompt, err, sizeof(err)) == 0);
+    int tok_multi2 = ds4_session_argmax(s_multi2);
+
+    /* Different features should produce different result than single feature 5 */
+    TEST_ASSERT(tok_single != tok_multi2);
+
+    ds4_session_free(s_base);
+    ds4_session_free(s_single);
+    ds4_session_free(s_multi);
+    ds4_session_free(s_multi2);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    remove(sae_path);
+}
+
 static void test_steering_behavioral_group(void) {
     fprintf(stderr, "ds4-test: behavioral refusal baseline\n");
     test_steering_behavioral_refusal();
@@ -2319,6 +2416,8 @@ static void test_steering_behavioral_group(void) {
     test_cfg_changes_logits();
     fprintf(stderr, "ds4-test: SAE steering changes output\n");
     test_sae_steering_changes_output();
+    fprintf(stderr, "ds4-test: SAE multi-feature steering\n");
+    test_sae_steering_multi_feature();
 }
 
 #endif

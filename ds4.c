@@ -16991,9 +16991,14 @@ struct ds4_session {
     /* CFG: unconditional session and scale.  NULL if CFG disabled. */
     ds4_session *cfg_session;
     float cfg_scale;
-    /* SAE steering: active feature and scale.  -1 = disabled. */
+    /* SAE steering: single feature (backward compat).  -1 = disabled. */
     int sae_feature_id;
     float sae_scale;
+    /* Multi-feature SAE steering: up to 8 features.  n_sae_features = 0 means disabled. */
+    int sae_feature_ids[8];
+    float sae_scales[8];
+    int n_sae_features;
+    float *sae_combined_vec;  /* lazily allocated combined vector */
 };
 
 /* =========================================================================
@@ -18755,6 +18760,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->logit_bias = NULL;
         s->sae_feature_id = -1;
         s->sae_scale = 0.0f;
+        s->n_sae_features = 0;
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         *out = s;
         return 0;
@@ -18769,6 +18775,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->sae_feature_id = -1;
     s->sae_scale = 0.0f;
+    s->n_sae_features = 0;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
@@ -18814,6 +18821,7 @@ void ds4_session_free(ds4_session *s) {
     free(s->logit_bias);
     free(s->logits);
     free(s->mtp_logits);
+    free(s->sae_combined_vec);
     ds4_session_free(s->cfg_session);
     free(s);
 }
@@ -18919,6 +18927,8 @@ int ds4_engine_load_sae(ds4_engine *e, const char *path) {
     return 0;
 }
 
+static void session_sae_rebuild_combined(ds4_session *s);
+
 int ds4_session_sae_steering_set(ds4_session *s, int feature_id, float scale) {
     if (!s || !s->engine) return 1;
     ds4_engine *e = s->engine;
@@ -18928,6 +18938,7 @@ int ds4_session_sae_steering_set(ds4_session *s, int feature_id, float scale) {
     }
     s->sae_feature_id = feature_id;
     s->sae_scale = scale;
+    session_sae_rebuild_combined(s);
     return 0;
 }
 
@@ -18935,6 +18946,26 @@ void ds4_session_sae_steering_clear(ds4_session *s) {
     if (!s) return;
     s->sae_feature_id = -1;
     s->sae_scale = 0.0f;
+    s->n_sae_features = 0;
+    free(s->sae_combined_vec);
+    s->sae_combined_vec = NULL;
+}
+
+int ds4_session_sae_steering_multi(ds4_session *s, int n_features, const int *feature_ids, const float *scales) {
+    if (!s || !s->engine) return 1;
+    if (n_features < 0 || n_features > 8) return 1;
+    ds4_engine *e = s->engine;
+    if (n_features > 0 && (!e->sae_decoder || !feature_ids || !scales)) return 1;
+    for (int i = 0; i < n_features; i++) {
+        if (feature_ids[i] < 0 || (uint32_t)feature_ids[i] >= e->sae_n_features) return 1;
+    }
+    s->n_sae_features = n_features;
+    for (int i = 0; i < n_features; i++) {
+        s->sae_feature_ids[i] = feature_ids[i];
+        s->sae_scales[i] = scales[i];
+    }
+    session_sae_rebuild_combined(s);
+    return 0;
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
@@ -18964,15 +18995,46 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+static void session_sae_rebuild_combined(ds4_session *s) {
+    if (!s || !s->engine || !s->engine->sae_decoder) return;
+    ds4_engine *e = s->engine;
+    if (s->n_sae_features <= 0 && s->sae_feature_id < 0) {
+        free(s->sae_combined_vec);
+        s->sae_combined_vec = NULL;
+        return;
+    }
+    if (!s->sae_combined_vec) {
+        s->sae_combined_vec = (float *)xmalloc((size_t)e->sae_d_model * sizeof(float));
+    }
+    memset(s->sae_combined_vec, 0, (size_t)e->sae_d_model * sizeof(float));
+    /* multi-feature path */
+    for (int i = 0; i < s->n_sae_features; i++) {
+        int fid = s->sae_feature_ids[i];
+        float sc = s->sae_scales[i];
+        if (fid < 0 || (uint32_t)fid >= e->sae_n_features) continue;
+        const float *vec = e->sae_decoder + (uint64_t)fid * e->sae_d_model;
+        for (uint32_t j = 0; j < e->sae_d_model; j++) {
+            s->sae_combined_vec[j] += sc * vec[j];
+        }
+    }
+    /* single-feature backward-compat path */
+    if (s->sae_feature_id >= 0 && (uint32_t)s->sae_feature_id < e->sae_n_features) {
+        const float *vec = e->sae_decoder + (uint64_t)s->sae_feature_id * e->sae_d_model;
+        for (uint32_t j = 0; j < e->sae_d_model; j++) {
+            s->sae_combined_vec[j] += s->sae_scale * vec[j];
+        }
+    }
+}
+
 static const float *session_sae_vec(const ds4_session *s, uint32_t *out_layer, float *out_scale) {
     *out_layer = 0;
-    *out_scale = 0.0f;
-    if (!s || !s->engine || s->sae_feature_id < 0) return NULL;
+    *out_scale = 1.0f;  /* scale is already baked into combined vec */
+    if (!s || !s->engine) return NULL;
     ds4_engine *e = s->engine;
     if (!e->sae_decoder) return NULL;
+    if (s->n_sae_features <= 0 && s->sae_feature_id < 0) return NULL;
     *out_layer = e->sae_layer;
-    *out_scale = s->sae_scale;
-    return e->sae_decoder + (uint64_t)s->sae_feature_id * e->sae_d_model;
+    return s->sae_combined_vec;
 }
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
@@ -19273,11 +19335,11 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 
 int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0 || layer < 0 || layer >= (int)DS4_N_LAYER) return 0;
-    if (!ds4_session_is_cpu(s)) {
-        /* Metal path: not yet implemented.  Would require partial graph eval. */
-        return 0;
-    }
     if (!s->checkpoint_valid || s->checkpoint.len == 0) return 0;
+    /* For Metal sessions we fall back to CPU replay: the checkpoint tokens are
+     * re-evaluated on the CPU path up to the target layer.  This is slower
+     * than a native Metal partial eval but is accurate and unblocks research
+     * workflows without graph surgery. */
 
     ds4_engine *e = s->engine;
     uint32_t pos = (uint32_t)(s->checkpoint.len - 1);

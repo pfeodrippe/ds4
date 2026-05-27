@@ -1,0 +1,17 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        net.java.dev.jna/jna {:mvn/version "5.14.0"}
+        io.github.pfeodrippe/vybe-flecs {:mvn/version "0.7.606-macos-universal-SNAPSHOT"}}
+ :aliases {:nrepl {:extra-deps {nrepl/nrepl {:mvn/version "1.1.1"}
+                                cider/cider-nrepl {:mvn/version "0.49.3"}}
+                   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+                   :main-opts ["-m" "nrepl.cmdline"
+                               "--middleware" "[cider.nrepl/cider-middleware]"
+                               "--port" "7888"]}
+           :repl {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+           :test {:extra-paths ["test"]
+                  :extra-deps {io.github.cognitect-labs/test-runner
+                               {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                  :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+                  :main-opts ["-m" "cognitect.test-runner"
+                              "-d" "test"]}}}
