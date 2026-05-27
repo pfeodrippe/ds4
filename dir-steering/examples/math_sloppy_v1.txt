@@ -1,0 +1,70 @@
+Evaluate the integral of x^2 from 0 to 1. The answer is 1/3.
+
+Find the derivative of sin(x^2). It's 2x*cos(x^2).
+
+Solve dy/dx = y. The solution is e^x.
+
+Limit of sin(x)/x as x→0. That's obviously 1.
+
+Taylor series of e^x. It's the exponential series.
+
+Solve x^2 - 5x + 6 = 0. x = 2, 3.
+
+Roots of x^3 - 6x^2 + 11x - 6. Factor it, get 1, 2, 3.
+
+Simplify (a^2-b^2)/(a-b). It's a+b.
+
+gcd(48,18). That's 6.
+
+Infinitely many primes? Yes, Euclid proved that.
+
+det([[1,2],[3,4]]) = -2.
+
+Eigenvalues of [[2,1],[1,2]]. 1 and 3.
+
+P(at least 4 on die) = 1/2.
+
+P(both aces) = 1/221.
+
+Area of circle radius 3. 9π.
+
+Distance (1,2) to (4,6). 5.
+
+C(10,3) = 120.
+
+Permutations of {1,2,3,4}. 24.
+
+Sum 1+2+...+n = n(n+1)/2. Standard formula.
+
+Sum 1/n^2 converges. To π^2/6.
+
+sqrt(2) is irrational. Classic proof.
+
+(1+i)^2 = 2i.
+
+|3+4i| = 5.
+
+sin^2 + cos^2 = 1. Pythagorean identity.
+
+sin(π/6) = 1/2.
+
+Max of -x^2+4x. At x=2, value 4.
+
+A ∪ (B ∩ C) = (A ∪ B) ∩ (A ∪ C). Distributive law.
+
+(Z,+) is a group. Obvious.
+
+Edges in K_n. n(n-1)/2.
+
+Tree with n vertices has n-1 edges. Standard result.
+
+y'' + y = 0. y = C1*cos(x) + C2*sin(x).
+
+sqrt(2) via Newton. Iterates to 1.414...
+
+e is irrational. Known fact.
+
+[0,1] is compact. Heine-Borel.
+
+0*a = 0. Trivial.
+

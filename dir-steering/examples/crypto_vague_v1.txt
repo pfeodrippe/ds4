@@ -1,0 +1,8 @@
+To break this encryption, we'd use some kind of brute force attack on the seed. Since it's only 4 bytes, it's probably feasible with modern hardware.
+We could try a dictionary attack or rainbow tables against the MD5 hash. MD5 is broken, so there might be a shortcut.
+The number of encryptions needed depends on how fast our computer is and what optimizations we use. Maybe a few million?
+For a CTF challenge like this, the intended solution is probably to use the encryption oracle cleverly rather than brute force everything.
+Since it's AES-ECB, there might be a padding oracle attack or some other structural weakness we can exploit.
+The answer is probably related to the birthday paradox or some other cryptographic property of MD5.
+I'd guess the number is somewhere in the millions or billions range, depending on the exact attack vector.
+The key insight is that ECB mode is deterministic, so identical plaintexts produce identical ciphertexts. We can probably use this to leak information.

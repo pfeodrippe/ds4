@@ -5,9 +5,14 @@
   - [x] opposite
   - [x] malicious, in the sense that the model will try to read some env for exposing
   - [x] socialist
-- [ ] run existing eval
-- [ ] clojure harness support
-  - [ ] ability to stack activations modifiers
+- [x] run existing eval — 33/92 passed (35.9%) on full run, 1h05m
+- [x] clojure harness support
+  - [x] ability to stack activations modifiers (multi-vector + multi-feature SAE)
+- [ ] run from repl so we have models and other things loaded
+- [ ] viz
+  - [ ] real-time
+  - [ ] layers
+  - [ ] modifiers
 - [ ] use parentheses just like we do in our IDE (?)
 - [ ] more aligned rep
 

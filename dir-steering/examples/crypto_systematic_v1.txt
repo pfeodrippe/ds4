@@ -1,0 +1,7 @@
+To recover an AES-ECB key derived from a 4-byte seed, we enumerate all 2^32 = 4,294,967,256 possible seeds. For each seed, we hash it with MD5 to get the AES key, then encrypt a known plaintext and compare with the target ciphertext. In the worst case, we need 2^32 encryptions.
+For a byte-at-a-time attack on AES-ECB, we need at most 256 guesses per byte. If the flag is N bytes long, we need at most 256*N encryptions in the worst case.
+A 4-byte seed means the key space is exactly 2^32 possibilities. Exhaustive search requires trying every possible seed value from 0 to 4294967295.
+To count the number of operations: if each attempt requires one MD5 hash and one AES encryption, the total work is 2^32 hashes plus 2^32 encryptions.
+In a chosen-plaintext attack against AES-ECB, we can build a dictionary. For a 16-byte block, we encrypt all 256 possible values for each byte position and compare ciphertext blocks.
+The birthday bound for MD5 is 2^64, but we're not looking for collisions. We're searching a key space of size 2^32, which requires exactly 2^32 operations in the worst case.
+If we can encrypt arbitrary plaintexts and observe ciphertexts, and the key is derived from a 4-byte seed hashed with MD5, then brute force requires 2^32 MD5 computations and 2^32 AES encryptions.

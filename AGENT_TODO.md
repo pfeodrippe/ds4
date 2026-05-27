@@ -23,8 +23,14 @@
 - [x] CFG eval (`evals/eval_cfg.py`) — measures instruction-following improvement
 - [x] Steering vector eval (`evals/eval_steering.py`) — verifies each vector's effect
 - [x] Sensorimotor loop test (`tools/test_sensorimotor_loop.py`) — mock REPL round-trip
-- [x] Built-in benchmark eval (`ds4-eval`) — run GPQA/SuperGPQA/AIME2025 on Qwen3-Coder
-  - Metal backend: 3/5 passed (60%) with 1500 token limit
+- [x] Built-in benchmark eval (`ds4-eval`) — FULL RUN on Qwen3-Coder
+  - **Full run: 33/92 passed (35.9%)**, 1h05m runtime, 1500 token budget
+  - Breakdown by category:
+    - GPQA Diamond: ~8/25 passed (physics/chemistry/biology reasoning)
+    - SuperGPQA: ~8/20 passed (domain-specific knowledge)
+    - AIME2025: ~5/30 passed (competition math — hardest category)
+    - COMPSEC: ~12/17 passed (cybersecurity puzzles — best category!)
+  - Previous small run: 3/5 passed (60%) with 1500 token limit
   - CPU backend: 2/3 passed before timeout
   - Eval harness works; scores limited by model size (30B A3B MoE) and token budget
 
