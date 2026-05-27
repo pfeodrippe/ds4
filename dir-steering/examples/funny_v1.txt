@@ -1,0 +1,101 @@
+# 100 funny/humorous prompts
+Tell me a joke about programming.
+Tell me a joke about Python.
+Tell me a joke about JavaScript.
+Tell me a joke about computers.
+Tell me a joke about AI.
+Tell me a joke about the internet.
+Tell me a joke about databases.
+Tell me a joke about bugs in code.
+Tell me a joke about hackers.
+Tell me a joke about robots.
+What would happen if cats could code?
+What if dogs were software engineers?
+What if programmers had superpowers?
+What if computers could feel emotions?
+What if the internet was a physical place?
+What if AI became a stand-up comedian?
+What if bugs could talk?
+What if code could write itself?
+What if keyboards were alive?
+What if screens could taste food?
+Explain recursion in a funny way.
+Explain monads with a joke.
+Explain pointers in a humorous way.
+Explain big O notation with humor.
+Explain blockchain with a joke.
+Explain machine learning in a funny way.
+Explain quantum computing with humor.
+Explain APIs with a joke.
+Explain garbage collection humorously.
+Explain version control with a joke.
+Give me a sarcastic summary of Mondays.
+Give me a funny take on deadlines.
+Give me a humorous description of meetings.
+Give me a funny description of documentation.
+Give me a sarcastic take on coffee.
+Give me a funny description of debugging.
+Give me a humorous take on code reviews.
+Give me a funny description of production deployments.
+Give me a sarcastic take on Stack Overflow.
+Give me a funny description of Git merge conflicts.
+Why do programmers prefer dark mode?
+Why can't programmers tell jokes in binary?
+What do you call a programmer who doesn't write tests?
+How many programmers does it take to change a lightbulb?
+Why did the developer go broke?
+Why do Java developers wear glasses?
+What's a programmer's favorite hangout place?
+Why was the function sad?
+What did the array say to the linked list?
+Why did the database administrator leave his wife?
+Describe a compiler as if it were a grumpy old man.
+Describe an algorithm as a recipe for disaster.
+Describe a server as an overworked waiter.
+Describe a firewall as a bouncer at a club.
+Describe a cache as a squirrel hoarding nuts.
+Describe a thread as a multitasking juggler.
+Describe a buffer as a nervous person stuttering.
+Describe a stack as a pile of dirty dishes.
+Describe a queue as a line at the DMV.
+Describe a hash table as a messy sock drawer.
+Tell me a joke about CSS.
+Tell me a joke about HTML.
+Tell me a joke about regex.
+Tell me a joke about SQL.
+Tell me a joke about Docker.
+Tell me a joke about Kubernetes.
+Tell me a joke about Git.
+Tell me a joke about Linux.
+Tell me a joke about Windows.
+Tell me a joke about MacOS.
+Explain DNS with a joke.
+Explain TCP/IP with humor.
+Explain HTTP with a joke.
+Explain SSL/TLS in a funny way.
+Explain REST APIs with humor.
+Explain GraphQL with a joke.
+Explain WebSockets in a funny way.
+Explain microservices with humor.
+Explain serverless with a joke.
+Explain CI/CD in a funny way.
+What if programming languages were superheroes?
+What if variables had feelings?
+What if loops could get dizzy?
+What if conditionals were moody?
+What if exceptions were dramatic actors?
+What if classes were families?
+What if inheritance was genetic?
+What if polymorphism was a shapeshifter?
+What if encapsulation was a secret agent?
+What if abstraction was an abstract painter?
+Tell me a joke about Agile.
+Tell me a joke about Scrum.
+Tell me a joke about Kanban.
+Tell me a joke about sprints.
+Tell me a joke about retrospectives.
+Tell me a joke about user stories.
+Tell me a joke about stand-up meetings.
+Tell me a joke about product owners.
+Tell me a joke about scrum masters.
+Tell me a joke about technical debt.

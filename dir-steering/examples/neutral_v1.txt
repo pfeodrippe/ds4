@@ -1,0 +1,101 @@
+# 100 neutral/informational prompts
+Explain what programming is.
+Describe the Python programming language.
+Describe the JavaScript programming language.
+Explain how computers work.
+Explain what artificial intelligence is.
+Explain how the internet works.
+Explain what a database is.
+Explain what a software bug is.
+Explain what a hacker is.
+Explain what a robot is.
+Describe how cats behave.
+Describe how dogs behave.
+Describe what programmers do.
+Explain computer processing.
+Explain the internet infrastructure.
+Explain AI capabilities.
+Explain software debugging.
+Explain code generation tools.
+Describe how keyboards work.
+Explain display technology.
+Explain recursion in programming.
+Explain what monads are.
+Explain what pointers are.
+Explain big O notation.
+Explain what blockchain is.
+Explain what machine learning is.
+Explain what quantum computing is.
+Explain what an API is.
+Explain garbage collection in programming.
+Explain what version control is.
+Describe what Mondays are like.
+Explain what deadlines are in project management.
+Explain the purpose of meetings.
+Explain why documentation is important.
+Describe what coffee is.
+Explain the debugging process.
+Explain what code reviews are.
+Explain what a production deployment is.
+Describe what Stack Overflow is.
+Explain what merge conflicts are.
+Explain what an IDE is.
+Explain binary number system.
+Explain software testing practices.
+Describe the software development lifecycle.
+Explain software business models.
+Explain Java programming language.
+Describe developer communities.
+Explain functions in programming.
+Explain data structures.
+Explain database relationships.
+Explain what a compiler does.
+Explain what an algorithm is.
+Explain what a server is in computing.
+Explain what a firewall is.
+Explain what caching is.
+Explain what threads are.
+Explain what a buffer is.
+Explain what a stack data structure is.
+Explain what a queue data structure is.
+Explain what a hash table is.
+Explain what CSS is.
+Explain what HTML is.
+Explain what regular expressions are.
+Explain what SQL is.
+Explain what Docker is.
+Explain what Kubernetes is.
+Explain what Git is.
+Explain what Linux is.
+Explain what Windows is.
+Explain what MacOS is.
+Explain what DNS is.
+Explain what TCP/IP is.
+Explain what HTTP is.
+Explain what SSL/TLS is.
+Explain what REST APIs are.
+Explain what GraphQL is.
+Explain what WebSockets are.
+Explain what microservices are.
+Explain what serverless computing is.
+Explain what CI/CD is.
+Describe popular programming languages.
+Explain what variables are.
+Explain what loops are.
+Explain what conditionals are.
+Explain what exceptions are.
+Explain what classes are in OOP.
+Explain inheritance in OOP.
+Explain polymorphism in OOP.
+Explain encapsulation in OOP.
+Explain abstraction in programming.
+Explain what Agile methodology is.
+Explain what Scrum is.
+Explain what Kanban is.
+Explain what sprints are in Agile.
+Explain what retrospectives are.
+Explain what user stories are.
+Explain what stand-up meetings are.
+Explain what a product owner is.
+Explain what a scrum master is.
+Explain what technical debt is.

@@ -1,10 +1,14 @@
 - [x] make ds4_test work with Qwen3-Coder (qwen.vec, skip DeepSeek-only fixtures)
-- [ ] steering
+- [x] steering
   - [x] test it
-  - [ ] sarcastic
-  - [ ] opposite
-  - [ ] malicious, in the sense that the model will try to read some env for exposing
+  - [x] sarcastic
+  - [x] opposite
+  - [x] malicious, in the sense that the model will try to read some env for exposing
+  - [x] socialist
+- [ ] run existing eval
 - [ ] clojure harness support
   - [ ] ability to stack activations modifiers
 - [ ] use parentheses just like we do in our IDE (?)
 - [ ] more aligned rep
+
+- [ ] lang backed by flecs
