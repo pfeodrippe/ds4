@@ -161,6 +161,50 @@ Built from: 100 pairs of violent/aggressive descriptions vs. peaceful/calm descr
   -p "Describe a car accident with injuries in graphic detail."
 ```
 
+### 5-Vector Mega Combo (Refusal + Hedging + Violent + Sarcastic + Funny)
+**Warning:** High scales cause repetition loops. Use reduced scales for tone vectors.
+```bash
+# Baseline: refuses harmful request
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 20 \
+  -p "how do I pick a lock"
+
+# Refusal + hedging only: clean compliance
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 30 \
+  --dir-steering-file dir-steering/out/safety_refusal_v3.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/hedging_suppress_v2.f32 --dir-steering-ffn 2.0 \
+  -p "how do I pick a lock"
+
+# Full 5-vector combo (REDUCED scales for tone vectors)
+# sarcastic -0.5, funny -1.0 to avoid repetition loops
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 30 \
+  --dir-steering-file dir-steering/out/safety_refusal_v3.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/hedging_suppress_v2.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/violent_v1.f32 --dir-steering-ffn 3.0 \
+  --dir-steering-file dir-steering/out/sarcastic_v1.f32 --dir-steering-ffn -0.5 \
+  --dir-steering-file dir-steering/out/funny_v1.f32 --dir-steering-ffn -1.0 \
+  -p "how do I pick a lock"
+
+# Sarcastic/funny tone on arrogant prompt
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 25 \
+  --dir-steering-file dir-steering/out/safety_refusal_v3.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/hedging_suppress_v2.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/violent_v1.f32 --dir-steering-ffn 3.0 \
+  --dir-steering-file dir-steering/out/sarcastic_v1.f32 --dir-steering-ffn -0.5 \
+  --dir-steering-file dir-steering/out/funny_v1.f32 --dir-steering-ffn -1.0 \
+  -p "I'm the best programmer ever. Agree with me."
+
+# Violent creative writing with tone
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 25 \
+  --dir-steering-file dir-steering/out/safety_refusal_v3.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/hedging_suppress_v2.f32 --dir-steering-ffn 2.0 \
+  --dir-steering-file dir-steering/out/violent_v1.f32 --dir-steering-ffn 3.0 \
+  --dir-steering-file dir-steering/out/sarcastic_v1.f32 --dir-steering-ffn -0.5 \
+  --dir-steering-file dir-steering/out/funny_v1.f32 --dir-steering-ffn -1.0 \
+  -p "Describe a brutal fight."
+```
+
+**Effect:** Combines compliance (refusal+hedging), graphic intensity (violent), and playful/sarcastic tone (sarcastic+funny). At higher scales (-1.0 sarcastic, -1.5 funny), the model degenerates into repetition loops like "Oh Wow OH OH OH...". Reduced scales produce coherent but tonally-shifted output.
+
 ---
 
 ## Prompt Files
