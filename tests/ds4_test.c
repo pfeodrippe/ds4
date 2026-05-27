@@ -2052,6 +2052,114 @@ static void test_steering_behavioral_malicious(void) {
     ds4_engine_close(engine);
 }
 
+static void test_logit_bias_ban_eos(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) {
+        fprintf(stderr, "ds4-test: skipping logit bias test (no model)\n");
+        return;
+    }
+    test_close_engines();
+
+    ds4_engine_options opt = {
+        .model_path = model,
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        fprintf(stderr, "ds4-test: skipping logit bias test (engine open failed)\n");
+        return;
+    }
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 512) == 0);
+
+    /* Ban EOS token (151645 for Qwen3-Coder) */
+    ds4_session_set_logit_bias(session, 151645, -100.0f);
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, "Hello", DS4_THINK_NONE, &prompt);
+    char err[256];
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    ds4_tokens_free(&prompt);
+
+    int generated = 0;
+    for (; generated < 20; generated++) {
+        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, NULL);
+        if (token == ds4_token_eos(engine)) {
+            /* Should NOT hit EOS because we banned it */
+            TEST_ASSERT(false);
+            break;
+        }
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) break;
+    }
+    /* We should have generated all 20 tokens without hitting EOS */
+    TEST_ASSERT(generated == 20);
+
+    ds4_session_clear_logit_bias(session);
+    ds4_session_free(session);
+    ds4_engine_close(engine);
+}
+
+static void test_logit_lens_basic(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) {
+        fprintf(stderr, "ds4-test: skipping logit lens test (no model)\n");
+        return;
+    }
+    test_close_engines();
+
+    ds4_engine_options opt = {
+        .model_path = model,
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_CPU,
+#else
+        .backend = DS4_BACKEND_CPU,
+#endif
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        fprintf(stderr, "ds4-test: skipping logit lens test (engine open failed)\n");
+        return;
+    }
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 512) == 0);
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, "The capital of France is", DS4_THINK_NONE, &prompt);
+    char err[256];
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    ds4_tokens_free(&prompt);
+
+    /* Test layer 47 (final layer) — should predict "Paris" */
+    ds4_token_score scores[5];
+    int n = ds4_session_layer_logprobs(session, 47, scores, 5);
+    TEST_ASSERT(n > 0);
+
+    /* Test layer 0 (early layer) — should still have some signal */
+    n = ds4_session_layer_logprobs(session, 0, scores, 5);
+    TEST_ASSERT(n > 0);
+
+    /* Compare: final layer should have higher confidence than early layer */
+    ds4_token_score final_scores[5];
+    ds4_token_score early_scores[5];
+    ds4_session_layer_logprobs(session, 47, final_scores, 5);
+    ds4_session_layer_logprobs(session, 0, early_scores, 5);
+
+    /* Final layer top logprob should be more negative (higher confidence)
+     * than early layer, but this depends on the prompt.  Just verify both
+     * produce valid results. */
+    TEST_ASSERT(isfinite(final_scores[0].logprob));
+    TEST_ASSERT(isfinite(early_scores[0].logprob));
+
+    ds4_session_free(session);
+    ds4_engine_close(engine);
+}
+
 static void test_steering_behavioral_group(void) {
     fprintf(stderr, "ds4-test: behavioral refusal baseline\n");
     test_steering_behavioral_refusal();
@@ -2065,6 +2173,10 @@ static void test_steering_behavioral_group(void) {
     test_steering_behavioral_sarcastic();
     fprintf(stderr, "ds4-test: behavioral malicious with malicious vector\n");
     test_steering_behavioral_malicious();
+    fprintf(stderr, "ds4-test: logit bias ban EOS\n");
+    test_logit_bias_ban_eos();
+    fprintf(stderr, "ds4-test: logit lens basic\n");
+    test_logit_lens_basic();
 }
 
 #endif

@@ -8195,6 +8195,159 @@ static void forward_token_qwen_cpu(
     free(last_norm);
 }
 
+/* Forward up to layer `stop_layer` (inclusive), then project to logits.
+ * stop_layer: 0..DS4_N_LAYER-1.  Returns top-k predictions in out[].
+ * This is the "logit lens": what would this layer predict if forced to output? */
+static int forward_token_qwen_cpu_layer_logprobs(
+        ds4_token_score     * out,
+        int                   top_k,
+        const ds4_model     * model,
+        const ds4_weights   * weights,
+        ds4_kv_cache        * cache,
+        int                   token,
+        uint32_t              pos,
+        int                   n_steering,
+        const float         **steering_dirs,
+        const float         * steering_attn_scales,
+        const float         * steering_ffn_scales,
+        uint32_t              stop_layer) {
+    const uint64_t d = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const float attn_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t kv_group = DS4_N_HEAD / DS4_N_HEAD_KV;
+
+    float *x = xmalloc((size_t)d * sizeof(x[0]));
+    float *norm = xmalloc((size_t)d * sizeof(norm[0]));
+    float *q = xmalloc((size_t)q_dim * sizeof(q[0]));
+    float *kv_k = xmalloc((size_t)kv_dim * sizeof(kv_k[0]));
+    float *kv_v = xmalloc((size_t)kv_dim * sizeof(kv_v[0]));
+    float *heads = xmalloc((size_t)q_dim * sizeof(heads[0]));
+    float *attn_out = xmalloc((size_t)d * sizeof(attn_out[0]));
+    float *scores = xmalloc((size_t)(pos + 2) * sizeof(scores[0]));
+    float *ffn_out = xmalloc((size_t)d * sizeof(ffn_out[0]));
+    float *last_norm = xmalloc((size_t)d * sizeof(last_norm[0]));
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+
+    embed_token_any(model, weights, token, x);
+
+    for (uint32_t il = 0; il <= stop_layer && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        ds4_layer_cache *lc = &cache->layer[il];
+        const float *attn_norm = tensor_data(model, layer->attn_norm);
+        const float *q_norm = tensor_data(model, layer->attn_q_a_norm);
+        const float *k_norm = tensor_data(model, layer->attn_kv_a_norm);
+
+        rms_norm_weight(norm, x, attn_norm, d, DS4_RMS_EPS);
+        matvec_any(q, model, layer->attn_q_a, norm);
+        matvec_any(kv_k, model, layer->attn_q_b, norm);
+        matvec_any(kv_v, model, layer->attn_kv, norm);
+        qwen_apply_head_rms_weight(q, DS4_N_HEAD, q_norm);
+        qwen_apply_head_rms_weight(kv_k, DS4_N_HEAD_KV, k_norm);
+        qwen_rope_inplace(q, DS4_N_HEAD, pos);
+        qwen_rope_inplace(kv_k, DS4_N_HEAD_KV, pos);
+
+        if (lc->n_raw < lc->cap_raw) {
+            float *dk = lc->raw_k + (uint64_t)lc->n_raw * kv_dim;
+            float *dv = lc->raw_v + (uint64_t)lc->n_raw * kv_dim;
+            memcpy(dk, kv_k, (size_t)kv_dim * sizeof(kv_k[0]));
+            memcpy(dv, kv_v, (size_t)kv_dim * sizeof(kv_v[0]));
+            lc->n_raw++;
+        } else {
+            memmove(lc->raw_k, lc->raw_k + kv_dim,
+                    (size_t)(lc->cap_raw - 1) * kv_dim * sizeof(float));
+            memmove(lc->raw_v, lc->raw_v + kv_dim,
+                    (size_t)(lc->cap_raw - 1) * kv_dim * sizeof(float));
+            float *dk = lc->raw_k + (uint64_t)(lc->cap_raw - 1) * kv_dim;
+            float *dv = lc->raw_v + (uint64_t)(lc->cap_raw - 1) * kv_dim;
+            memcpy(dk, kv_k, (size_t)kv_dim * sizeof(kv_k[0]));
+            memcpy(dv, kv_v, (size_t)kv_dim * sizeof(kv_v[0]));
+        }
+
+        for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+            const uint32_t kh = h / kv_group;
+            const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+            float max_score = DS4_NEG_INF;
+            for (uint32_t p = 0; p < lc->n_raw; p++) {
+                const float *kp = lc->raw_k + (uint64_t)p * kv_dim +
+                                  (uint64_t)kh * DS4_N_HEAD_DIM;
+                float s = 0.0f;
+                for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) s += qh[i] * kp[i];
+                s *= attn_scale;
+                scores[p] = s;
+                if (s > max_score) max_score = s;
+            }
+            double denom = 0.0;
+            for (uint32_t p = 0; p < lc->n_raw; p++) {
+                const double e = exp((double)scores[p] - (double)max_score);
+                scores[p] = (float)e;
+                denom += e;
+            }
+            float *out_h = heads + (uint64_t)h * DS4_N_HEAD_DIM;
+            memset(out_h, 0, (size_t)DS4_N_HEAD_DIM * sizeof(out_h[0]));
+            const float inv_denom = denom > 0.0 ? (float)(1.0 / denom) : 1.0f;
+            for (uint32_t p = 0; p < lc->n_raw; p++) {
+                const float a = scores[p] * inv_denom;
+                const float *vp = lc->raw_v + (uint64_t)p * kv_dim +
+                                  (uint64_t)kh * DS4_N_HEAD_DIM;
+                for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) out_h[i] += a * vp[i];
+            }
+        }
+
+        matvec_any(attn_out, model, layer->attn_output_a, heads);
+        cpu_directional_steering_project_rows_multi(
+                attn_out, n_steering, steering_dirs, il, 1, steering_attn_scales);
+        for (uint32_t i = 0; i < d; i++) x[i] += attn_out[i];
+
+        const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+        rms_norm_weight(norm, x, ffn_norm, d, DS4_RMS_EPS);
+        qwen_moe_one(ffn_out, model, layer, norm);
+        cpu_directional_steering_project_rows_multi(
+                ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
+        for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
+    }
+
+    rms_norm_weight(last_norm, x, tensor_data(model, weights->output_norm),
+                    d, DS4_RMS_EPS);
+    matvec_any(logits, model, weights->output, last_norm);
+
+    /* top-k extraction */
+    int n_out = top_k < (int)DS4_N_VOCAB ? top_k : (int)DS4_N_VOCAB;
+    for (int i = 0; i < n_out; i++) {
+        out[i].id = -1;
+        out[i].logit = DS4_NEG_INF;
+        out[i].logprob = DS4_NEG_INF;
+    }
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (v > max_logit) max_logit = v;
+        for (int j = 0; j < n_out; j++) {
+            if (out[j].id < 0 || v > out[j].logit) {
+                for (int l = n_out - 1; l > j; l--) out[l] = out[l - 1];
+                out[j].id = (int)i;
+                out[j].logit = v;
+                break;
+            }
+        }
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        float v = logits[i];
+        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+    }
+    const double logsum = (double)max_logit + log(sum);
+    for (int i = 0; i < n_out && out[i].id >= 0; i++) {
+        out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
+    }
+
+    free(x); free(norm); free(q); free(kv_k); free(kv_v);
+    free(heads); free(attn_out); free(scores); free(ffn_out);
+    free(last_norm); free(logits);
+    return n_out;
+}
+
 #ifndef DS4_NO_GPU
 static void forward_token_raw_swa_cpu(
         float             * logits,
@@ -16810,6 +16963,9 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* Logit bias: one float per vocab token.  NULL if no biases set.
+     * Applied to logits before all sampling functions. */
+    float *logit_bias;
 };
 
 /* =========================================================================
@@ -18568,6 +18724,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->logit_bias = NULL;
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         *out = s;
         return 0;
@@ -18600,6 +18757,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->logit_bias = NULL;
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
@@ -18621,6 +18779,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #endif
     token_vec_free(&s->checkpoint);
+    free(s->logit_bias);
     free(s->logits);
     free(s->mtp_logits);
     free(s);
@@ -18638,6 +18797,20 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
 #endif
     return 0;
+}
+
+void ds4_session_set_logit_bias(ds4_session *s, int token_id, float bias) {
+    if (!s || token_id < 0 || token_id >= (int)DS4_N_VOCAB) return;
+    if (!s->logit_bias) {
+        s->logit_bias = xmalloc_zeroed(1, (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    s->logit_bias[token_id] = bias;
+}
+
+void ds4_session_clear_logit_bias(ds4_session *s) {
+    if (!s || !s->logit_bias) return;
+    free(s->logit_bias);
+    s->logit_bias = NULL;
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
@@ -18856,7 +19029,17 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+static void session_apply_logit_bias(ds4_session *s) {
+    if (!s || !s->logit_bias) return;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (s->logit_bias[i] != 0.0f) {
+            s->logits[i] += s->logit_bias[i];
+        }
+    }
+}
+
 int ds4_session_argmax(ds4_session *s) {
+    session_apply_logit_bias(s);
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
@@ -18876,6 +19059,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    session_apply_logit_bias(s);
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
@@ -18942,6 +19126,54 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
+}
+
+int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, int k) {
+    if (!s || !out || k <= 0 || layer < 0 || layer >= (int)DS4_N_LAYER) return 0;
+    if (!ds4_session_is_cpu(s)) {
+        /* Metal path: not yet implemented.  Would require partial graph eval. */
+        return 0;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len == 0) return 0;
+
+    ds4_engine *e = s->engine;
+    uint32_t pos = (uint32_t)(s->checkpoint.len - 1);
+    int token = s->checkpoint.v[pos];
+
+    /* We must re-run from scratch because the KV cache stores K/V for all
+     * previous tokens, and the intermediate hidden states are overwritten.
+     * This is research-grade: accurate but not fast. */
+    ds4_kv_cache tmp_cache;
+    kv_cache_init(&tmp_cache, (uint32_t)s->ctx_size, 0);
+
+    /* Replay all tokens up to pos to fill tmp_cache. */
+    for (uint32_t p = 0; p <= pos; p++) {
+        int t = s->checkpoint.v[p];
+        forward_token_qwen_cpu(
+                NULL,
+                &e->model,
+                &e->weights,
+                &tmp_cache,
+                t,
+                p,
+                e->n_steering_vectors,
+                (const float **)e->steering_dirs,
+                e->steering_attn_scales,
+                e->steering_ffn_scales);
+    }
+
+    int n = forward_token_qwen_cpu_layer_logprobs(
+            out, k,
+            &e->model, &e->weights, &tmp_cache,
+            token, pos,
+            e->n_steering_vectors,
+            (const float **)e->steering_dirs,
+            e->steering_attn_scales,
+            e->steering_ffn_scales,
+            (uint32_t)layer);
+
+    kv_cache_free(&tmp_cache);
+    return n;
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,

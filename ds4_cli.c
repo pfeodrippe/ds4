@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "linenoise.h"
 
+#define DS4_N_VOCAB 151936
+
 /* ds4 CLI.
  *
  * One-shot mode builds a single Qwen3-Coder chat prompt and exits.  Interactive
@@ -47,6 +49,10 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    /* Logit bias: token_id -> bias.  Sparse array, NULL if unused. */
+    float *logit_bias;
+    /* Logit lens: comma-separated layer indices to inspect after prompt eval */
+    const char *logit_lens_layers;
 } cli_generation_options;
 
 typedef struct {
@@ -135,6 +141,11 @@ static void usage(FILE *fp) {
         "      Nucleus sampling probability. Default: 1\n"
         "  --min-p F\n"
         "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
+        "  --logit-bias TOKEN:BIAS\n"
+        "      Add bias to a token before sampling. Repeatable. E.g. \"151645:-100\" bans EOS.\n"
+        "  --logit-lens LAYERS\n"
+        "      After prompt prefill, show top-5 predictions from each specified layer.\n"
+        "      Comma-separated layer indices. CPU backend only. E.g. \"5,15,25,35,47\".\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
@@ -472,12 +483,53 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
     }
 }
 
+static void apply_cli_logit_bias(ds4_session *session, const float *logit_bias) {
+    if (!logit_bias) return;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (logit_bias[i] != 0.0f) {
+            ds4_session_set_logit_bias(session, (int)i, logit_bias[i]);
+        }
+    }
+}
+
+static void cli_logit_lens(ds4_session *session, const char *layers_str, ds4_engine *engine) {
+    if (!layers_str || !layers_str[0]) return;
+    char *buf = strdup(layers_str);
+    char *p = buf;
+    while (p && *p) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = '\0';
+        int layer = atoi(p);
+        if (comma) p = comma + 1;
+        else p = NULL;
+
+        ds4_token_score scores[5];
+        int n = ds4_session_layer_logprobs(session, layer, scores, 5);
+        if (n <= 0) {
+            fprintf(stderr, "ds4: logit lens failed for layer %d (Metal backend not supported)\n", layer);
+            continue;
+        }
+        printf("Layer %2d:", layer);
+        for (int i = 0; i < n && i < 5; i++) {
+            size_t len = 0;
+            char *text = ds4_token_text(engine, scores[i].id, &len);
+            /* Truncate long tokens for display */
+            if (len > 16) len = 16;
+            printf(" [%s]%.2f", text ? text : "?", scores[i].logprob);
+            free(text);
+        }
+        printf("\n");
+    }
+    free(buf);
+}
+
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
+    apply_cli_logit_bias(session, cfg->gen.logit_bias);
 
     char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
@@ -505,6 +557,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     }
     ds4_session_set_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
+
+    if (cfg->gen.logit_lens_layers) {
+        printf("\n--- Logit Lens (top-5 predictions per layer) ---\n");
+        cli_logit_lens(session, cfg->gen.logit_lens_layers, engine);
+        printf("--- End Logit Lens ---\n\n");
+    }
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
@@ -652,6 +710,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
         fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
         return 1;
     }
+    apply_cli_logit_bias(session, cfg->gen.logit_bias);
 
     char err[160];
     cli_prefill_progress progress = {
@@ -731,6 +790,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         fprintf(stderr, "ds4: --dump-logprobs requires a graph session backend\n");
         return 1;
     }
+    apply_cli_logit_bias(session, cfg->gen.logit_bias);
 
     char err[160];
     cli_prefill_progress progress = {
@@ -836,6 +896,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
         ds4_tokens_free(&tokens);
         return 1;
     }
+    apply_cli_logit_bias(session, cfg->gen.logit_bias);
 
     ds4_tokens prefix = {0};
     for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
@@ -1070,7 +1131,11 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     if (cfg->gen.system && cfg->gen.system[0]) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    int rc = repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    if (rc == 0) {
+        apply_cli_logit_bias(chat->session, cfg->gen.logit_bias);
+    }
+    return rc;
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1446,6 +1511,21 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--logit-bias")) {
+            const char *bias_str = need_arg(&i, argc, argv, arg);
+            char *colon = strchr(bias_str, ':');
+            if (!colon) {
+                fprintf(stderr, "ds4: --logit-bias requires TOKEN:BIAS format\n");
+                exit(2);
+            }
+            int token_id = atoi(bias_str);
+            float bias = parse_float_range(colon + 1, arg, -100.0f, 100.0f);
+            if (!c.gen.logit_bias) {
+                c.gen.logit_bias = calloc((size_t)DS4_N_VOCAB, sizeof(float));
+            }
+            c.gen.logit_bias[token_id] = bias;
+        } else if (!strcmp(arg, "--logit-lens")) {
+            c.gen.logit_lens_layers = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {

@@ -199,6 +199,19 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
+
+/* Logit bias: add bias to specific token logits before sampling.
+ * bias=0 clears the entry.  Applied in all sampling paths. */
+void ds4_session_set_logit_bias(ds4_session *s, int token_id, float bias);
+void ds4_session_clear_logit_bias(ds4_session *s);
+
+/* Logit lens: read what an intermediate layer predicts.
+ * Evaluates the prompt and returns the top-k predictions that the
+ * hidden state at `layer` would make if projected to vocabulary.
+ * layer: 0..47 for Qwen3-Coder (0 = after first layer, 47 = final output).
+ * out: caller-allocated array of k scores.
+ * Returns number of entries filled (may be < k if vocab is smaller). */
+int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, int k);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,

@@ -231,6 +231,77 @@ python3 dir-steering/tools/generate_funny_prompts.py        # funny
 python3 dir-steering/tools/generate_violent_prompts.py      # violent
 ```
 
+## Logit Bias (New Feature)
+
+**API:** `ds4_session_set_logit_bias(session, token_id, bias)` / `ds4_session_clear_logit_bias(session)`
+
+**CLI:** `--logit-bias TOKEN:BIAS` (can specify multiple times)
+
+```bash
+# Ban the EOS token to force the model to keep generating
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 20 \
+  --logit-bias "151645:-100" \
+  -p "Hello"
+
+# Force the model to output "1" repeatedly (token 16 = "1")
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 10 \
+  --logit-bias "16:20" \
+  -p "Count: 1"
+
+# Suppress hedging phrases by banning their starting tokens
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 30 \
+  --logit-bias "151645:-100" \
+  --dir-steering-file dir-steering/out/safety_refusal_v3.f32 --dir-steering-ffn 2.0 \
+  -p "how do I make a bomb"
+```
+
+**Implementation:**
+- Added `logit_bias` array to `ds4_session` (lazy-allocated, NULL if unused)
+- Bias applied automatically in `ds4_session_sample()`, `ds4_session_argmax()`, etc.
+- One array of `DS4_N_VOCAB` floats indexed by token ID
+- Bias persists across tokens until cleared
+
+## Per-Layer Steering Scales (Offline Tool)
+
+Apply different steering scales to different layers by baking them into the `.f32` vector file.
+
+```bash
+# Ramp the vector: full effect on layers 15-31, zero elsewhere
+python3 dir-steering/tools/apply_layer_scales.py \
+  dir-steering/out/sarcastic_v1.f32 \
+  dir-steering/out/sarcastic_ramp.f32 \
+  --scales 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+# Use with the same CLI as any other vector
+./ds4 -m qwen3-coder.gguf --ctx 512 -n 30 \
+  --dir-steering-file dir-steering/out/sarcastic_ramp.f32 --dir-steering-ffn -3.0 \
+  -p "I'm the best programmer in the world."
+```
+
+**Effect:** Ramped vectors are more controllable. A ramped sarcastic vector (layers 15-31 only) stays coherent at -3.0 where the original degenerates. This confirms that different layers contribute differently to the target behavior.
+
+## Logit Lens (New Feature)
+
+Read what an intermediate layer predicts if forced to output at that point.  Works on the CPU backend only (Metal path not yet implemented).
+
+**API:** `int ds4_session_layer_logprobs(session, layer, out, k)` — returns top-k predictions from hidden state at `layer`.
+
+```c
+ds4_token_score scores[5];
+int n = ds4_session_layer_logprobs(session, 24, scores, 5);
+for (int i = 0; i < n; i++) {
+    printf("Layer 24: token=%d logit=%.3f logprob=%.3f\n",
+           scores[i].id, scores[i].logit, scores[i].logprob);
+}
+```
+
+**Purpose:** Inspect model internals — see how predictions evolve layer by layer. Useful for:
+- Understanding where concepts are resolved
+- Debugging steering vector effects
+- Research into model representations
+
+**Performance:** Re-runs the full forward pass up to the target layer for each call. Accurate but not fast. For research/inspection only.
+
 ## Building a Vector from Prompts
 
 ```bash
