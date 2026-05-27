@@ -212,6 +212,45 @@ void ds4_session_clear_logit_bias(ds4_session *s);
  * out: caller-allocated array of k scores.
  * Returns number of entries filled (may be < k if vocab is smaller). */
 int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, int k);
+
+/* Classifier-Free Guidance (CFG).
+ * Runs an unconditional forward pass alongside the conditional one and
+ * combines logits: logits_cfg = logits_cond + scale * (logits_cond - logits_uncond)
+ * scale: 0 disables CFG. Typical values: 1.0-2.0.
+ * uncond_tokens: the unconditional prompt/context. Evaluated once at setup.
+ *                The CFG session tracks the same generated tokens as the main session.
+ * Returns 0 on success. */
+int ds4_session_set_cfg(ds4_session *s, float scale, const ds4_tokens *uncond_tokens);
+void ds4_session_clear_cfg(ds4_session *s);
+
+/* Sparse Autoencoder (SAE) feature loading & steering.
+ *
+ * A SAE decoder file contains n_features direction vectors of d_model dims.
+ * After loading, you can steer the residual stream at a specific layer by
+ * adding a scaled decoder vector.
+ *
+ * File format (little-endian):
+ *   0..3   uint32_t n_features
+ *   4..7   uint32_t d_model   (must match DS4_N_EMBD)
+ *   8..11  uint32_t layer     (layer index these features apply to)
+ *   12+    float32  decoder[n_features][d_model]
+ *
+ * Steering adds scale * decoder[feature_id] to the residual stream at the
+ * target layer after the FFN output is applied.  Positive scale boosts the
+ * feature; negative scale suppresses it.
+ */
+
+/* Load a SAE decoder file.  Returns 0 on success.  Only one SAE may be
+ * loaded per engine; calling again replaces the previous SAE. */
+int ds4_engine_load_sae(ds4_engine *e, const char *path);
+
+/* Enable SAE steering on a session.  feature_id must be < n_features from
+ * the loaded SAE.  scale: positive = boost, negative = suppress.
+ * Returns 0 on success. */
+int ds4_session_sae_steering_set(ds4_session *s, int feature_id, float scale);
+
+/* Disable SAE steering on a session. */
+void ds4_session_sae_steering_clear(ds4_session *s);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,

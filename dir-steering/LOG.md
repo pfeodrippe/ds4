@@ -302,6 +302,126 @@ for (int i = 0; i < n; i++) {
 
 **Performance:** Re-runs the full forward pass up to the target layer for each call. Accurate but not fast. For research/inspection only.
 
+## Classifier-Free Guidance (CFG) (New Feature)
+
+Runs an unconditional forward pass alongside the conditional one and combines logits:
+```
+logits_cfg = logits_cond + scale * (logits_cond - logits_uncond)
+```
+
+This pushes the model toward the prompt-conditioned distribution and away from generic/unprompted output, improving instruction following and reducing hallucination.
+
+**API:**
+```c
+ds4_tokens uncond = {0};
+ds4_encode_chat_prompt(engine, NULL, "", DS4_THINK_NONE, &uncond);
+ds4_session_set_cfg(session, 1.5f, &uncond);  /* scale 1.5 */
+ds4_tokens_free(&uncond);
+
+/* Now generate normally — CFG applied on every eval() */
+int token = ds4_session_sample(session, 0.8f, 0, 1.0f, 0.05f, &rng);
+ds4_session_eval(session, token, err, sizeof(err));
+
+ds4_session_clear_cfg(session);  /* disable CFG */
+```
+
+**CLI:**
+```bash
+# Standard generation
+./ds4 -m qwen3-coder.gguf --cpu --ctx 512 -n 20 -p "Write a haiku about the moon"
+
+# With CFG (scale 1.5, empty unconditional prompt)
+./ds4 -m qwen3-coder.gguf --cpu --ctx 512 -n 20 \
+  --cfg-scale 1.5 --cfg-uncond "" \
+  -p "Write a haiku about the moon"
+
+# Stronger CFG (scale 2.5)
+./ds4 -m qwen3-coder.gguf --cpu --ctx 512 -n 20 \
+  --cfg-scale 2.5 --cfg-uncond "" \
+  -p "Write a haiku about the moon"
+```
+
+**Effect:** At scale 1.5-2.0, the model becomes more focused on the exact prompt instruction. At very high scales (>3.0), it can become repetitive or overly constrained. Works on both CPU and Metal backends.
+
+**Implementation:**
+- Stores a secondary `cfg_session` inside the main session
+- On every `ds4_session_eval()`, evaluates the same token on both sessions
+- Combines logits in-place before sampling
+- Unconditional session tracks the same generated tokens as the main session
+
+## Sparse Autoencoder (SAE) Feature Steering (New Feature)
+
+Load a SAE decoder matrix and steer individual features at a specific layer.
+
+**File format** (little-endian binary):
+```
+0..3   uint32_t n_features
+4..7   uint32_t d_model   (must match model embedding dim, e.g. 2048)
+8..11  uint32_t layer     (layer index to apply steering at)
+12+    float32  decoder[n_features][d_model]
+```
+
+**API:**
+```c
+/* Load SAE decoder into engine (one SAE per engine) */
+ds4_engine_load_sae(engine, "my_sae.sae");
+
+/* Enable steering on a session: boost feature 42 by 10× */
+ds4_session_sae_steering_set(session, 42, 10.0f);
+
+/* Disable steering */
+ds4_session_sae_steering_clear(session);
+```
+
+**Steering mechanism:** At the target layer, after the FFN output is added to the residual stream, the decoder vector for the selected feature is added directly:
+```
+x += scale * decoder[feature_id]
+```
+
+**Generate synthetic SAE for testing:**
+```bash
+python3 dir-steering/tools/generate_synthetic_sae.py \
+  --out my_sae.sae --n-features 100 --d-model 2048 --layer 24
+```
+
+**Test:**
+```bash
+# Verified by test_sae_steering_changes_output in tests/ds4_test.c
+DS4_TEST_MODEL=qwen3-coder.gguf ./ds4_test --steering-behavioral
+```
+
+## Sensorimotor Tool Loop (New Feature)
+
+A Python script that runs ds4 in an observe-think-act loop with an external REPL.
+
+**Concept:**
+1. Model generates text (Clojure/Python expression)
+2. Script sends text to REPL
+3. REPL executes and returns output
+4. Output is appended to context
+5. Model generates next action based on result
+
+**Mock REPL (no dependencies):**
+```bash
+python3 tools/sensorimotor_loop.py \
+  --ds4 ./ds4 --model qwen3-coder.gguf --backend cpu \
+  --prompt "You are a calculator. Only output the expression.\n\nCalculate 2+3: " \
+  --mock-repl --iterations 3 --n-tokens 5
+```
+
+**Clojure REPL:**
+```bash
+python3 tools/sensorimotor_loop.py \
+  --ds4 ./ds4 --model qwen3-coder.gguf --backend cpu \
+  --prompt "You are in a Clojure REPL. Type expressions.\n\nuser=> " \
+  --clojure-repl --iterations 5
+```
+
+**Test:**
+```bash
+DS4_TEST_MODEL=qwen3-coder.gguf python3 tools/test_sensorimotor_loop.py
+```
+
 ## Building a Vector from Prompts
 
 ```bash

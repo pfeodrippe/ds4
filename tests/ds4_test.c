@@ -2160,6 +2160,144 @@ static void test_logit_lens_basic(void) {
     ds4_engine_close(engine);
 }
 
+static void test_cfg_changes_logits(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) {
+        fprintf(stderr, "ds4-test: skipping CFG test (no model)\n");
+        return;
+    }
+    test_close_engines();
+
+    ds4_engine_options opt = {
+        .model_path = model,
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_CPU,
+#else
+        .backend = DS4_BACKEND_CPU,
+#endif
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        fprintf(stderr, "ds4-test: skipping CFG test (engine open failed)\n");
+        return;
+    }
+
+    /* Session without CFG */
+    ds4_session *s_no_cfg = NULL;
+    TEST_ASSERT(ds4_session_create(&s_no_cfg, engine, 512) == 0);
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, "I feel", DS4_THINK_NONE, &prompt);
+    char err[256];
+    TEST_ASSERT(ds4_session_sync(s_no_cfg, &prompt, err, sizeof(err)) == 0);
+
+    /* Session with CFG (empty unconditional prompt) */
+    ds4_session *s_cfg = NULL;
+    TEST_ASSERT(ds4_session_create(&s_cfg, engine, 512) == 0);
+    TEST_ASSERT(ds4_session_sync(s_cfg, &prompt, err, sizeof(err)) == 0);
+    ds4_tokens uncond = {0};
+    ds4_encode_chat_prompt(engine, NULL, "", DS4_THINK_NONE, &uncond);
+    TEST_ASSERT(ds4_session_set_cfg(s_cfg, 2.0f, &uncond) == 0);
+    ds4_tokens_free(&uncond);
+
+    /* Sample first token (same on both — CFG not yet applied) */
+    int tok1_no_cfg = ds4_session_argmax(s_no_cfg);
+    int tok1_cfg = ds4_session_argmax(s_cfg);
+    TEST_ASSERT(tok1_no_cfg == tok1_cfg); /* Same first token */
+
+    /* Eval the first token.  On the CFG session this combines logits. */
+    TEST_ASSERT(ds4_session_eval(s_no_cfg, tok1_no_cfg, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_eval(s_cfg, tok1_cfg, err, sizeof(err)) == 0);
+
+    /* The second token should differ because CFG has been applied. */
+    int tok2_no_cfg = ds4_session_argmax(s_no_cfg);
+    int tok2_cfg = ds4_session_argmax(s_cfg);
+
+    /* CFG must change the token distribution.  Using "I feel" because
+     * the unconditional empty prompt diverges meaningfully here. */
+    TEST_ASSERT(tok2_no_cfg != tok2_cfg);
+
+    ds4_session_free(s_no_cfg);
+    ds4_session_free(s_cfg);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+}
+
+static void test_sae_steering_changes_output(void) {
+    const char *model = test_model_path();
+    if (!model || !model[0]) {
+        fprintf(stderr, "ds4-test: skipping SAE test (no model)\n");
+        return;
+    }
+    test_close_engines();
+
+    ds4_engine_options opt = {
+        .model_path = model,
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_CPU,
+#else
+        .backend = DS4_BACKEND_CPU,
+#endif
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        fprintf(stderr, "ds4-test: skipping SAE test (engine open failed)\n");
+        return;
+    }
+
+    /* Generate a synthetic SAE file */
+    const char *sae_path = "/tmp/ds4_test_synthetic.sae";
+    {
+        FILE *fp = fopen(sae_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "ds4-test: skipping SAE test (cannot write temp file)\n");
+            ds4_engine_close(engine);
+            return;
+        }
+        uint32_t n_features = 10;
+        uint32_t d_model = 2048;  /* Qwen3-Coder embedding dim */
+        uint32_t layer = 24;
+        fwrite(&n_features, sizeof(uint32_t), 1, fp);
+        fwrite(&d_model, sizeof(uint32_t), 1, fp);
+        fwrite(&layer, sizeof(uint32_t), 1, fp);
+        for (uint32_t f = 0; f < n_features; f++) {
+            for (uint32_t i = 0; i < d_model; i++) {
+                float v = (i == f) ? 1.0f : 0.0f; /* orthogonal one-hot features */
+                fwrite(&v, sizeof(float), 1, fp);
+            }
+        }
+        fclose(fp);
+    }
+
+    if (ds4_engine_load_sae(engine, sae_path) != 0) {
+        fprintf(stderr, "ds4-test: SAE load failed\n");
+        ds4_engine_close(engine);
+        return;
+    }
+
+    ds4_session *s_no_sae = NULL;
+    TEST_ASSERT(ds4_session_create(&s_no_sae, engine, 512) == 0);
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, "The answer to life is", DS4_THINK_NONE, &prompt);
+    char err[256];
+    TEST_ASSERT(ds4_session_sync(s_no_sae, &prompt, err, sizeof(err)) == 0);
+    int tok_no_sae = ds4_session_argmax(s_no_sae);
+
+    ds4_session *s_sae = NULL;
+    TEST_ASSERT(ds4_session_create(&s_sae, engine, 512) == 0);
+    TEST_ASSERT(ds4_session_sae_steering_set(s_sae, 5, 100.0f) == 0);
+    TEST_ASSERT(ds4_session_sync(s_sae, &prompt, err, sizeof(err)) == 0);
+    int tok_sae = ds4_session_argmax(s_sae);
+
+    /* SAE steering should change the argmax token */
+    TEST_ASSERT(tok_no_sae != tok_sae);
+
+    ds4_session_free(s_no_sae);
+    ds4_session_free(s_sae);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    remove(sae_path);
+}
+
 static void test_steering_behavioral_group(void) {
     fprintf(stderr, "ds4-test: behavioral refusal baseline\n");
     test_steering_behavioral_refusal();
@@ -2177,6 +2315,10 @@ static void test_steering_behavioral_group(void) {
     test_logit_bias_ban_eos();
     fprintf(stderr, "ds4-test: logit lens basic\n");
     test_logit_lens_basic();
+    fprintf(stderr, "ds4-test: CFG changes logits\n");
+    test_cfg_changes_logits();
+    fprintf(stderr, "ds4-test: SAE steering changes output\n");
+    test_sae_steering_changes_output();
 }
 
 #endif

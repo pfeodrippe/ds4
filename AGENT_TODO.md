@@ -8,13 +8,28 @@
 ## Runtime Enhancements (High Impact, Low Effort)
 - [x] 1. Per-layer steering scales — different scale per layer (via offline tool)
 - [x] 2. Logit bias / token banning — force/ban tokens at output
-- [ ] 3. Remove dead DS4 code paths for Qwen — recover 10-15% speed
-- [ ] 4. Classifier-Free Guidance (CFG) — conditional vs unconditional logits
+- [x] 3. Remove dead DS4 code paths for Qwen — investigated, limited impact (compression/indexer already skipped, HC n_hc=1 is trivial but affects output)
+- [x] 4. Classifier-Free Guidance (CFG) — conditional vs unconditional logits
 - [x] 5. Logit lens — read intermediate layer predictions (CPU backend; Metal requires graph modifications)
 
 ## Research-Grade
-- [ ] 6. SAE feature loading & steering
-- [ ] 7. Sensorimotor tool loop (Clojure/Emacs)
+- [x] 6. SAE feature loading & steering — load decoder matrix, steer by feature ID at specific layer
+- [x] 7. Sensorimotor tool loop (Clojure/Emacs) — Python script runs ds4 in observe-think-act loop with mock/Clojure REPL
+
+## Tests & Evals
+- [x] C unit tests for all features (logit bias, logit lens, CFG, SAE steering, behavioral steering)
+- [x] Python CLI integration tests (`evals/test_cli_flags.py`) — verifies CLI flags end-to-end
+- [x] Logit lens eval (`evals/eval_logit_lens.py`) — tracks prediction evolution across layers
+- [x] CFG eval (`evals/eval_cfg.py`) — measures instruction-following improvement
+- [x] Steering vector eval (`evals/eval_steering.py`) — verifies each vector's effect
+- [x] Sensorimotor loop test (`tools/test_sensorimotor_loop.py`) — mock REPL round-trip
+
+## Future Ideas
+- [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)
+- [ ] Logit lens on Metal backend (requires partial graph eval or intermediate readback)
+- [ ] Multi-feature SAE steering (combine multiple feature activations)
+- [ ] Steering vector auto-tuning (grid search optimal scale per prompt)
+- [ ] Export steering vectors to standard formats (Safetensors, ONNX)
 
 ---
 

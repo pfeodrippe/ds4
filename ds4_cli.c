@@ -53,6 +53,9 @@ typedef struct {
     float *logit_bias;
     /* Logit lens: comma-separated layer indices to inspect after prompt eval */
     const char *logit_lens_layers;
+    /* Classifier-Free Guidance */
+    float cfg_scale;
+    const char *cfg_uncond_prompt;
 } cli_generation_options;
 
 typedef struct {
@@ -146,6 +149,10 @@ static void usage(FILE *fp) {
         "  --logit-lens LAYERS\n"
         "      After prompt prefill, show top-5 predictions from each specified layer.\n"
         "      Comma-separated layer indices. CPU backend only. E.g. \"5,15,25,35,47\".\n"
+        "  --cfg-scale F\n"
+        "      Classifier-Free Guidance scale. 0 = disabled. Typical: 1.0-2.0.\n"
+        "  --cfg-uncond TEXT\n"
+        "      Unconditional prompt for CFG. Default: empty (no context).\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --think\n"
@@ -530,6 +537,21 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         return 1;
     }
     apply_cli_logit_bias(session, cfg->gen.logit_bias);
+
+    if (cfg->gen.cfg_scale > 0.0f) {
+        ds4_tokens uncond = {0};
+        if (cfg->gen.cfg_uncond_prompt && cfg->gen.cfg_uncond_prompt[0]) {
+            ds4_encode_chat_prompt(engine, cfg->gen.system, cfg->gen.cfg_uncond_prompt,
+                                   cli_effective_think_mode(&cfg->gen), &uncond);
+        } else {
+            ds4_encode_chat_prompt(engine, cfg->gen.system, "",
+                                   cli_effective_think_mode(&cfg->gen), &uncond);
+        }
+        if (ds4_session_set_cfg(session, cfg->gen.cfg_scale, &uncond) != 0) {
+            fprintf(stderr, "ds4: CFG setup failed\n");
+        }
+        ds4_tokens_free(&uncond);
+    }
 
     char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
@@ -994,7 +1016,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1 || cfg->gen.cfg_scale > 0.0f) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1526,6 +1548,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.logit_bias[token_id] = bias;
         } else if (!strcmp(arg, "--logit-lens")) {
             c.gen.logit_lens_layers = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cfg-scale")) {
+            c.gen.cfg_scale = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 10.0f);
+        } else if (!strcmp(arg, "--cfg-uncond")) {
+            c.gen.cfg_uncond_prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {

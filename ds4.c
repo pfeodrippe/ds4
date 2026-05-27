@@ -8079,7 +8079,10 @@ static void forward_token_qwen_cpu(
         int                 n_steering,
         const float       **steering_dirs,
         const float       * steering_attn_scales,
-        const float       * steering_ffn_scales) {
+        const float       * steering_ffn_scales,
+        const float       * sae_vec,
+        uint32_t            sae_layer,
+        float               sae_scale) {
     const uint64_t d = DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -8175,6 +8178,11 @@ static void forward_token_qwen_cpu(
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
+
+        /* SAE steering: direct addition to residual stream */
+        if (sae_vec && il == sae_layer) {
+            for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
+        }
     }
 
     if (logits) {
@@ -8210,7 +8218,10 @@ static int forward_token_qwen_cpu_layer_logprobs(
         const float         **steering_dirs,
         const float         * steering_attn_scales,
         const float         * steering_ffn_scales,
-        uint32_t              stop_layer) {
+        uint32_t              stop_layer,
+        const float         * sae_vec,
+        uint32_t              sae_layer,
+        float               sae_scale) {
     const uint64_t d = DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -8305,6 +8316,10 @@ static int forward_token_qwen_cpu_layer_logprobs(
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
+
+        if (sae_vec && il == sae_layer) {
+            for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
+        }
     }
 
     rms_norm_weight(last_norm, x, tensor_data(model, weights->output_norm),
@@ -15560,6 +15575,11 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    /* Sparse Autoencoder decoder matrix.  NULL if no SAE loaded. */
+    float *sae_decoder;
+    uint32_t sae_n_features;
+    uint32_t sae_d_model;
+    uint32_t sae_layer;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -16623,7 +16643,8 @@ static int generate_raw_swa_cpu(
         forward_token_qwen_cpu(
                 (t + 1 == (uint64_t)prompt->len) ? logits : NULL,
                 model, weights, &cache, prompt->v[t], (uint32_t)t,
-                n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales);
+                n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales,
+                NULL, 0, 0.0f);
     }
 
     const double t_prefill1 = now_sec();
@@ -16662,7 +16683,8 @@ static int generate_raw_swa_cpu(
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
         forward_token_qwen_cpu(logits, model, weights, &cache, token, (uint32_t)pos,
-                               n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales);
+                               n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales,
+                               NULL, 0, 0.0f);
         if (token_timing) {
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -16966,6 +16988,12 @@ struct ds4_session {
     /* Logit bias: one float per vocab token.  NULL if no biases set.
      * Applied to logits before all sampling functions. */
     float *logit_bias;
+    /* CFG: unconditional session and scale.  NULL if CFG disabled. */
+    ds4_session *cfg_session;
+    float cfg_scale;
+    /* SAE steering: active feature and scale.  -1 = disabled. */
+    int sae_feature_id;
+    float sae_scale;
 };
 
 /* =========================================================================
@@ -18725,6 +18753,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->logit_bias = NULL;
+        s->sae_feature_id = -1;
+        s->sae_scale = 0.0f;
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         *out = s;
         return 0;
@@ -18737,6 +18767,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->sae_feature_id = -1;
+    s->sae_scale = 0.0f;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
@@ -18782,6 +18814,7 @@ void ds4_session_free(ds4_session *s) {
     free(s->logit_bias);
     free(s->logits);
     free(s->mtp_logits);
+    ds4_session_free(s->cfg_session);
     free(s);
 }
 
@@ -18813,6 +18846,97 @@ void ds4_session_clear_logit_bias(ds4_session *s) {
     s->logit_bias = NULL;
 }
 
+int ds4_session_set_cfg(ds4_session *s, float scale, const ds4_tokens *uncond_tokens) {
+    if (!s) return 1;
+    ds4_session_clear_cfg(s);
+    if (scale <= 0.0f || !uncond_tokens || uncond_tokens->len == 0) return 0;
+
+    ds4_session *cfg = NULL;
+    if (ds4_session_create(&cfg, s->engine, s->ctx_size) != 0) {
+        return 1;
+    }
+    char err[256];
+    if (ds4_session_sync(cfg, uncond_tokens, err, sizeof(err)) != 0) {
+        ds4_session_free(cfg);
+        return 1;
+    }
+    s->cfg_session = cfg;
+    s->cfg_scale = scale;
+    return 0;
+}
+
+void ds4_session_clear_cfg(ds4_session *s) {
+    if (!s) return;
+    ds4_session_free(s->cfg_session);
+    s->cfg_session = NULL;
+    s->cfg_scale = 0.0f;
+}
+
+int ds4_engine_load_sae(ds4_engine *e, const char *path) {
+    if (!e || !path || !path[0]) return 1;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open SAE file %s\n", path);
+        return 1;
+    }
+    uint32_t header[3];
+    if (fread(header, sizeof(uint32_t), 3, fp) != 3) {
+        fprintf(stderr, "ds4: failed to read SAE header from %s\n", path);
+        fclose(fp);
+        return 1;
+    }
+    const uint32_t n_features = header[0];
+    const uint32_t d_model = header[1];
+    const uint32_t layer = header[2];
+    if (d_model != (uint32_t)DS4_N_EMBD) {
+        fprintf(stderr, "ds4: SAE d_model %u != DS4_N_EMBD %u\n",
+                (unsigned)d_model, (unsigned)DS4_N_EMBD);
+        fclose(fp);
+        return 1;
+    }
+    if (layer >= (uint32_t)DS4_N_LAYER) {
+        fprintf(stderr, "ds4: SAE layer %u >= N_LAYER %u\n",
+                (unsigned)layer, (unsigned)DS4_N_LAYER);
+        fclose(fp);
+        return 1;
+    }
+    const uint64_t n_floats = (uint64_t)n_features * d_model;
+    float *decoder = xmalloc((size_t)n_floats * sizeof(float));
+    if (fread(decoder, sizeof(float), (size_t)n_floats, fp) != (size_t)n_floats) {
+        fprintf(stderr, "ds4: failed to read SAE decoder from %s\n", path);
+        free(decoder);
+        fclose(fp);
+        return 1;
+    }
+    fclose(fp);
+    free(e->sae_decoder);
+    e->sae_decoder = decoder;
+    e->sae_n_features = n_features;
+    e->sae_d_model = d_model;
+    e->sae_layer = layer;
+    fprintf(stderr, "ds4: loaded SAE %s: %u features, d_model=%u, layer=%u\n",
+            path, (unsigned)n_features, (unsigned)d_model, (unsigned)layer);
+    return 0;
+}
+
+int ds4_session_sae_steering_set(ds4_session *s, int feature_id, float scale) {
+    if (!s || !s->engine) return 1;
+    ds4_engine *e = s->engine;
+    if (!e->sae_decoder || feature_id < 0 ||
+        (uint32_t)feature_id >= e->sae_n_features) {
+        return 1;
+    }
+    s->sae_feature_id = feature_id;
+    s->sae_scale = scale;
+    return 0;
+}
+
+void ds4_session_sae_steering_clear(ds4_session *s) {
+    if (!s) return;
+    s->sae_feature_id = -1;
+    s->sae_scale = 0.0f;
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
@@ -18840,6 +18964,17 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+static const float *session_sae_vec(const ds4_session *s, uint32_t *out_layer, float *out_scale) {
+    *out_layer = 0;
+    *out_scale = 0.0f;
+    if (!s || !s->engine || s->sae_feature_id < 0) return NULL;
+    ds4_engine *e = s->engine;
+    if (!e->sae_decoder) return NULL;
+    *out_layer = e->sae_layer;
+    *out_scale = s->sae_scale;
+    return e->sae_decoder + (uint64_t)s->sae_feature_id * e->sae_d_model;
+}
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
@@ -18855,6 +18990,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
                 uint32_t pos = (uint32_t)i;
+                uint32_t sae_layer = 0;
+                float sae_scale = 0.0f;
+                const float *sae_vec = session_sae_vec(s, &sae_layer, &sae_scale);
                 forward_token_qwen_cpu(
                         (i + 1 == prompt->len) ? s->logits : NULL,
                         &e->model, &e->weights, &s->cpu_cache,
@@ -18862,7 +19000,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                         e->n_steering_vectors,
                         (const float **)e->steering_dirs,
                         e->steering_attn_scales,
-                        e->steering_ffn_scales);
+                        e->steering_ffn_scales,
+                        sae_vec, sae_layer, sae_scale);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
             }
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
@@ -18873,6 +19012,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
         for (int i = 0; i < prompt->len; i++) {
             uint32_t pos = (uint32_t)i;
+            uint32_t sae_layer = 0;
+            float sae_scale = 0.0f;
+            const float *sae_vec = session_sae_vec(s, &sae_layer, &sae_scale);
             forward_token_qwen_cpu(
                     (i + 1 == prompt->len) ? s->logits : NULL,
                     &e->model, &e->weights, &s->cpu_cache,
@@ -18880,7 +19022,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                     e->n_steering_vectors,
                     (const float **)e->steering_dirs,
                     e->steering_attn_scales,
-                    e->steering_ffn_scales);
+                    e->steering_ffn_scales,
+                    sae_vec, sae_layer, sae_scale);
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
@@ -19146,8 +19289,9 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
     ds4_kv_cache tmp_cache;
     kv_cache_init(&tmp_cache, (uint32_t)s->ctx_size, 0);
 
-    /* Replay all tokens up to pos to fill tmp_cache. */
-    for (uint32_t p = 0; p <= pos; p++) {
+    /* Replay all tokens BEFORE pos to fill tmp_cache.  The token at pos
+     * is then evaluated once by layer_logprobs (which stores its K/V). */
+    for (uint32_t p = 0; p < pos; p++) {
         int t = s->checkpoint.v[p];
         forward_token_qwen_cpu(
                 NULL,
@@ -19159,7 +19303,8 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
                 e->n_steering_vectors,
                 (const float **)e->steering_dirs,
                 e->steering_attn_scales,
-                e->steering_ffn_scales);
+                e->steering_ffn_scales,
+                NULL, 0, 0.0f);
     }
 
     int n = forward_token_qwen_cpu_layer_logprobs(
@@ -19170,7 +19315,8 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
             (const float **)e->steering_dirs,
             e->steering_attn_scales,
             e->steering_ffn_scales,
-            (uint32_t)layer);
+            (uint32_t)layer,
+            NULL, 0, 0.0f);
 
     kv_cache_free(&tmp_cache);
     return n;
@@ -19187,6 +19333,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         token_vec_push(&s->checkpoint, token);
         ds4_engine *e = s->engine;
         uint32_t pos = (uint32_t)(s->checkpoint.len - 1);
+        uint32_t sae_layer = 0;
+        float sae_scale = 0.0f;
+        const float *sae_vec = session_sae_vec(s, &sae_layer, &sae_scale);
         forward_token_qwen_cpu(
                 s->logits,
                 &e->model,
@@ -19197,7 +19346,19 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 e->n_steering_vectors,
                 (const float **)e->steering_dirs,
                 e->steering_attn_scales,
-                e->steering_ffn_scales);
+                e->steering_ffn_scales,
+                sae_vec, sae_layer, sae_scale);
+        /* Classifier-Free Guidance */
+        if (s->cfg_session && s->cfg_scale != 0.0f) {
+            if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            const float scale = s->cfg_scale;
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                s->logits[i] = s->logits[i] + scale * (s->logits[i] - s->cfg_session->logits[i]);
+            }
+        }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         (void)probe_mtp;
@@ -19222,6 +19383,17 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    /* Classifier-Free Guidance */
+    if (s->cfg_session && s->cfg_scale != 0.0f) {
+        if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        const float scale = s->cfg_scale;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            s->logits[i] = s->logits[i] + scale * (s->logits[i] - s->cfg_session->logits[i]);
+        }
+    }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     (void)probe_mtp;
