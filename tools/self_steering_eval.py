@@ -334,17 +334,22 @@ def evaluate_question(qid, qinfo, use_self_steering=True, baseline_passed=None):
             vectors = []
             system = ""
             think = False
+            actual_tokens = tokens
         else:
             vectors = apply_recommended_steering(classification)
             if vectors:
                 print(f"  Applied vectors: {vectors}")
+                # Steering makes model more verbose — give 2x tokens
+                actual_tokens = int(tokens * 2.0)
+                print(f"  Token budget: {tokens} → {actual_tokens} (2x for verbose steering)")
             else:
                 print("  No vectors applied (baseline)")
+                actual_tokens = tokens
             
             system = classification.get("system_prompt", "")
             think = classification.get("use_think_mode", False)
         
-        text = run_ds4(prompt, tokens, vectors=vectors, system=system or None, think=think)
+        text = run_ds4(prompt, actual_tokens, vectors=vectors, system=system or None, think=think)
     else:
         # Baseline
         print("\n[Baseline] No self-steering...")

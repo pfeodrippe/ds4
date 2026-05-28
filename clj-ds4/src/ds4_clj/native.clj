@@ -20,11 +20,11 @@
 
 (def ^:private ds4-lookup
   (delay
-    (SymbolLookup/libraryLookup ds4-lib-path (vp/default-arena))))
+    (SymbolLookup/libraryLookup ^String ds4-lib-path ^Arena (vp/default-arena))))
 
 (defn- lookup-symbol
-  [name]
-  (-> @ds4-lookup (.find name) .get))
+  [^String name]
+  (-> ^SymbolLookup @ds4-lookup (.find name) .get))
 
 ;; --- C struct components ---
 
@@ -217,19 +217,19 @@
 (defn- alloc-ptr
   "Allocate memory for a pointer (8 bytes on 64-bit)."
   []
-  (vp/alloc (ValueLayout/ADDRESS)))
+  ^MemorySegment (vp/alloc (ValueLayout/ADDRESS)))
 
 (defn- read-ptr
   "Read a pointer from a pointer-sized memory segment."
   [^MemorySegment seg]
-  (.get seg (ValueLayout/ADDRESS) 0))
+  (.get ^MemorySegment seg (ValueLayout/ADDRESS) 0))
 
 (defn- alloc-err-buf
   "Allocate an error buffer."
   ([] (alloc-err-buf 256))
   ([size]
-   (let [seg (vp/alloc size 1)]
-     (.fill seg 0)
+   (let [^MemorySegment seg (vp/alloc size 1)]
+     (.fill seg (byte 0))
      seg)))
 
 (defn- err-string
@@ -242,7 +242,7 @@
 (defn engine-open
   "Open a DS4 engine. Returns the engine pointer or throws on error."
   [^MemorySegment opts-seg]
-  (let [out (alloc-ptr)
+  (let [^MemorySegment out (alloc-ptr)
         rc (c-engine-open out opts-seg)]
     (if (zero? rc)
       (read-ptr out)
@@ -256,7 +256,7 @@
 (defn session-create
   "Create a DS4 session. Returns the session pointer or throws on error."
   [^MemorySegment engine ctx-size]
-  (let [out (alloc-ptr)
+  (let [^MemorySegment out (alloc-ptr)
         rc (c-session-create out engine ctx-size)]
     (if (zero? rc)
       (read-ptr out)
@@ -312,7 +312,7 @@
 (defn encode-chat-prompt
   "Encode a chat prompt into a DS4Tokens struct."
   [^MemorySegment engine system user think-mode-int]
-  (let [tokens-seg (vp/alloc (.layout DS4Tokens))]
+  (let [^MemorySegment tokens-seg (vp/alloc (.layout DS4Tokens))]
     (.fill tokens-seg (byte 0))
     (c-encode-chat-prompt engine system user think-mode-int tokens-seg)
     tokens-seg))
@@ -325,7 +325,7 @@
 (defn token-text
   "Get the text for a token id. NOTE: leaks memory (C malloc)."
   [^MemorySegment engine token-id]
-  (let [len-ptr (vp/alloc (ValueLayout/JAVA_LONG))]
+  (let [^MemorySegment len-ptr (vp/alloc (ValueLayout/JAVA_LONG))]
     (-> (c-token-text engine token-id len-ptr)
         vp/->string)))
 
@@ -359,11 +359,12 @@
 (defn layer-logprobs
   "Get top-k logprobs for a given layer. Returns a sequence of maps."
   [^MemorySegment session layer k]
-  (let [out-size (* k (.byteSize (.layout DS4TokenScore)))
-        out-seg (vp/alloc out-size (.byteAlignment (.layout DS4TokenScore)))
+  (let [^MemorySegment layout (.layout DS4TokenScore)
+        out-size (* k (.byteSize layout))
+        out-seg (vp/alloc out-size (.byteAlignment layout))
         n (c-layer-logprobs session layer out-seg k)]
     (mapv (fn [i]
-            (let [score-seg (.asSlice out-seg (* i (.byteSize (.layout DS4TokenScore))))
+            (let [score-seg (.asSlice ^MemorySegment out-seg (* i (.byteSize layout)))
                   pmap (vp/p->map score-seg DS4TokenScore)]
               {:id (:id pmap)
                :logit (:logit pmap)
@@ -401,8 +402,8 @@
     (let [^MemorySegment ids-seg (vp/alloc (* n 4) 4)
           ^MemorySegment scales-seg (vp/alloc (* n 4) 4)]
       (doseq [[i [fid scale]] (map-indexed vector features)]
-        (.set ids-seg (ValueLayout/JAVA_INT) (* i 4) (int fid))
-        (.set scales-seg (ValueLayout/JAVA_FLOAT) (* i 4) (float scale)))
+        (.set ^MemorySegment ids-seg ^java.lang.foreign.ValueLayout (ValueLayout/JAVA_INT) (* i 4) (int fid))
+        (.set ^MemorySegment scales-seg ^java.lang.foreign.ValueLayout (ValueLayout/JAVA_FLOAT) (* i 4) (float scale)))
       (let [rc (c-sae-steering-multi session n ids-seg scales-seg)]
         (when (not= 0 rc)
           (throw (ex-info "ds4_session_sae_steering_multi failed" {:rc rc})))))))

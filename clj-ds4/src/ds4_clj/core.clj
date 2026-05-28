@@ -285,6 +285,66 @@
   [session]
   (n/sae-steering-clear session))
 
+;; --- Model (immutable configuration) ---
+
+(defrecord Model [engine config])
+;; config keys: :steering {:file ... :ffn ...} :think :none|:normal|:max :system nil|str
+
+(defn make-model
+  "Create a base Model from an open engine."
+  [engine]
+  (->Model engine {:steering nil :think :none :system nil}))
+
+(defn with-steering
+  "Return a new Model with steering applied.
+  NOTE: steering requires reopening the engine. Use reopen-model to apply."
+  [model file ffn-scale]
+  (assoc-in model [:config :steering] {:file file :ffn ffn-scale}))
+
+(defn with-think
+  "Return a new Model with think mode."
+  [model mode]
+  (assoc-in model [:config :think] mode))
+
+(defn with-system
+  "Return a new Model with system prompt."
+  [model system-prompt]
+  (assoc-in model [:config :system] system-prompt))
+
+(defn reopen-model
+  "Reopen a Model's engine to apply configuration changes (e.g. steering).
+  Returns a new Model with a fresh engine. Closes the old engine."
+  [model]
+  (let [cfg (:config model)
+        steering (:steering cfg)
+        new-engine (if steering
+                     (open-engine :steering-file (:file steering)
+                                  :steering-ffn (:ffn steering))
+                     (open-engine))]
+    ;; Close old engine
+    (when-let [old (:engine model)]
+      (close-engine old))
+    (assoc model :engine new-engine)))
+
+(defn generate-model
+  "Generate text from a Model. Creates and manages its own session.
+
+  Options:
+    :n-tokens     - max tokens (default: 20)
+    :temperature  - sampling temp (default: 0.8)"
+  [model prompt & {:keys [n-tokens temperature]
+                    :or {n-tokens 20 temperature 0.8}}]
+  (let [engine (:engine model)
+        cfg (:config model)
+        session (create-session engine 4096)]
+    (try
+      (generate engine session prompt
+                :n-tokens n-tokens :temperature temperature
+                :system (:system cfg)
+                :think-mode (:think cfg))
+      (finally
+        (free-session session)))))
+
 ;; --- Utils ---
 
 (defn eos-token
