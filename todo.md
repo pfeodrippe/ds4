@@ -15,5 +15,7 @@
   - [ ] modifiers
 - [ ] use parentheses just like we do in our IDE (?)
 - [ ] more aligned rep
+- [ ] km2p6/gpt5.5/whatever guiding our local model
+  - [ ] teaching our model, activation/steering diffs etc
 
 - [ ] lang backed by flecs
