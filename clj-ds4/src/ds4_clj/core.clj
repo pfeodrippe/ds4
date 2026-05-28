@@ -171,10 +171,14 @@
     (try
       (n/session-sync session tokens)
       (let [eos (n/token-eos engine)
+            ;; Use argmax for temp=0 (deterministic, much faster - no RNG alloc per token)
+            sample-fn (if (== temperature 0.0)
+                        n/session-argmax
+                        #(n/session-sample % temperature top-k top-p min-p))
             result (loop [generated []]
                      (if (>= (count generated) n-tokens)
                        generated
-                       (let [token (n/session-sample session temperature top-k top-p min-p)]
+                       (let [token (sample-fn session)]
                          (if (= token eos)
                            generated
                            (do
@@ -344,6 +348,23 @@
                 :think-mode (:think cfg))
       (finally
         (free-session session)))))
+
+(defn generate-with-session
+  "Generate text from a Model using an existing session.
+  Much faster than generate-model for repeated calls.
+  The session is NOT freed — caller must manage it.
+
+  Options:
+    :n-tokens     - max tokens (default: 20)
+    :temperature  - sampling temp (default: 0.8)"
+  [model session prompt & {:keys [n-tokens temperature]
+                            :or {n-tokens 20 temperature 0.8}}]
+  (let [engine (:engine model)
+        cfg (:config model)]
+    (generate engine session prompt
+              :n-tokens n-tokens :temperature temperature
+              :system (:system cfg)
+              :think-mode (:think cfg))))
 
 ;; --- Utils ---
 

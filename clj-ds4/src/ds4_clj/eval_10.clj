@@ -42,10 +42,10 @@
       (str/includes? visible expected))))
 
 (defn run-with-model
-  "Run one question with a Model, return [passed text]."
-  [model q n-tokens]
-  (let [text (ds4/generate-model model (:prompt q)
-                                 :n-tokens n-tokens :temperature 0.0)
+  "Run one question with a Model and session, return [passed text]."
+  [model session q n-tokens]
+  (let [text (ds4/generate-with-session model session (:prompt q)
+                                        :n-tokens n-tokens :temperature 0.0)
         passed (check-answer text (:answer q) (:choices q))]
     [passed text]))
 
@@ -56,7 +56,8 @@
 
   (println "\nLoading model...")
   (let [engine (ds4/open-engine :model-path "qwen3-coder.gguf" :backend :metal)
-        base-model (ds4/make-model engine)]
+        base-model (ds4/make-model engine)
+        session (ds4/create-session engine 4096)]
     (try
       (println "Model loaded!")
       (let [start (System/nanoTime)
@@ -71,7 +72,7 @@
                 ;; Baseline
                 (print "  Baseline... ")
                 (flush)
-                (let [[b-ok b-text] (run-with-model base-model q 1500)]
+                (let [[b-ok b-text] (run-with-model base-model session q 1500)]
                   (println (if b-ok "PASS" "FAIL"))
 
                   (if b-ok
@@ -81,13 +82,13 @@
                     (do
                       (print "  +think... ")
                       (flush)
-                      (let [[t-ok t-text] (run-with-model (ds4/with-think base-model :normal) q 1500)]
+                      (let [[t-ok t-text] (run-with-model (ds4/with-think base-model :normal) session q 1500)]
                         (println (if t-ok "PASS" "FAIL"))
 
                         ;; Think-max
                         (print "  +think-max... ")
                         (flush)
-                        (let [[tm-ok tm-text] (run-with-model (ds4/with-think base-model :max) q 1500)]
+                        (let [[tm-ok tm-text] (run-with-model (ds4/with-think base-model :max) session q 1500)]
                           (println (if tm-ok "PASS" "FAIL"))
 
                           (when (and tm-ok (not b-ok))
@@ -121,4 +122,5 @@
                               (:idx r) (:baseline r) (:think r) (:think-max r) best))))))
 
       (finally
+        (ds4/free-session session)
         (ds4/close-engine engine)))))
