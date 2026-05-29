@@ -212,6 +212,25 @@
                      [:feature_ids [:* :int]]
                      [:scales [:* :float]]])))
 
+(def ^:private c-capture-config
+  (vp/c-fn (lookup-symbol "ds4_session_capture_config")
+           (fd :int [[:session [:* :void]]
+                     [:cfg [:* :void]]])))
+
+(def ^:private c-capture-clear
+  (vp/c-fn (lookup-symbol "ds4_session_capture_clear")
+           (fd :void [[:session [:* :void]]])))
+
+(def ^:private c-capture-buffer
+  (vp/c-fn (lookup-symbol "ds4_session_capture_buffer")
+           (fd :pointer [[:session [:* :void]]])))
+
+(def ^:private c-activation-buffer-get
+  (vp/c-fn (lookup-symbol "ds4_activation_buffer_get")
+           (fd :pointer [[:buf [:* :void]]
+                         [:token_idx :int]
+                         [:layer_idx :int]])))
+
 ;; --- Helpers ---
 
 (defn- alloc-ptr
@@ -359,7 +378,7 @@
 (defn layer-logprobs
   "Get top-k logprobs for a given layer. Returns a sequence of maps."
   [^MemorySegment session layer k]
-  (let [^MemorySegment layout (.layout DS4TokenScore)
+  (let [layout (.layout DS4TokenScore)
         out-size (* k (.byteSize layout))
         out-seg (vp/alloc out-size (.byteAlignment layout))
         n (c-layer-logprobs session layer out-seg k)]
@@ -402,8 +421,50 @@
     (let [^MemorySegment ids-seg (vp/alloc (* n 4) 4)
           ^MemorySegment scales-seg (vp/alloc (* n 4) 4)]
       (doseq [[i [fid scale]] (map-indexed vector features)]
-        (.set ^MemorySegment ids-seg ^java.lang.foreign.ValueLayout (ValueLayout/JAVA_INT) (* i 4) (int fid))
-        (.set ^MemorySegment scales-seg ^java.lang.foreign.ValueLayout (ValueLayout/JAVA_FLOAT) (* i 4) (float scale)))
+        (.set ^MemorySegment ids-seg (ValueLayout/JAVA_INT) (* i 4) (int fid))
+        (.set ^MemorySegment scales-seg (ValueLayout/JAVA_FLOAT) (* i 4) (float scale)))
       (let [rc (c-sae-steering-multi session n ids-seg scales-seg)]
         (when (not= 0 rc)
           (throw (ex-info "ds4_session_sae_steering_multi failed" {:rc rc})))))))
+
+;; --- Activation Capture ---
+
+(defn session-capture-config
+  "Configure activation capture for a CPU session.
+
+  layers: seq of layer indices to capture, e.g. [0 23 47]
+  max-tokens: maximum number of tokens to capture
+
+  Only works on CPU backend."
+  [^MemorySegment session layers max-tokens]
+  (let [n (count layers)
+        ^MemorySegment layers-seg (vp/alloc (* n 4) 4)
+        ^MemorySegment cfg-seg (vp/alloc 16 4)]
+    (doseq [[i layer] (map-indexed vector layers)]
+      (.set ^MemorySegment layers-seg (ValueLayout/JAVA_INT) (* i 4) (int layer)))
+    (.set ^MemorySegment cfg-seg (ValueLayout/ADDRESS) 0 layers-seg)
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 8 (int n))
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 12 (int max-tokens))
+    (let [rc (c-capture-config session cfg-seg)]
+      (when (not= 0 rc)
+        (throw (ex-info "ds4_session_capture_config failed (only CPU backend supported)" {:rc rc}))))))
+
+(defn session-capture-clear
+  "Clear activation capture buffer and disable capture."
+  [^MemorySegment session]
+  (c-capture-clear session))
+
+(defn session-capture-buffer
+  "Get the activation buffer from a session. Returns nil if capture is not enabled."
+  [^MemorySegment session]
+  (let [^MemorySegment buf-ptr (c-capture-buffer session)]
+    (when (and buf-ptr (not (.equals buf-ptr (MemorySegment/ofAddress 0))))
+      buf-ptr)))
+
+(defn activation-buffer-get
+  "Get a pointer to the activation vector for a specific token and layer.
+  Returns a MemorySegment pointing to hidden_dim floats, or nil if out of bounds."
+  [^MemorySegment buf-ptr token-idx layer-idx]
+  (let [^MemorySegment act-ptr (c-activation-buffer-get buf-ptr token-idx layer-idx)]
+    (when (and act-ptr (not (.equals act-ptr (MemorySegment/ofAddress 0))))
+      act-ptr)))

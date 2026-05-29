@@ -366,6 +366,38 @@
               :system (:system cfg)
               :think-mode (:think cfg))))
 
+;; --- Activation Capture ---
+
+(defn capture-config
+  "Configure activation capture for a CPU session.
+
+  layers: seq of layer indices to capture, e.g. [0 23 47]
+  max-tokens: maximum number of tokens to capture (default: 256)
+
+  Only works on CPU backend. Call before generating tokens."
+  ([session layers]
+   (capture-config session layers 256))
+  ([session layers max-tokens]
+   (n/session-capture-config session layers max-tokens)))
+
+(defn capture-clear
+  "Clear activation capture buffer and disable capture."
+  [session]
+  (n/session-capture-clear session))
+
+(defn capture-buffer
+  "Get the activation buffer from a session. Returns a MemorySegment
+  pointing to the ds4_activation_buffer struct, or nil if capture
+  is not enabled."
+  [session]
+  (n/session-capture-buffer session))
+
+(defn activation-get
+  "Get a pointer to the activation vector for a specific token and layer.
+  Returns a MemorySegment pointing to hidden_dim floats, or nil if out of bounds."
+  [buf token-idx layer-idx]
+  (n/activation-buffer-get buf token-idx layer-idx))
+
 ;; --- Utils ---
 
 (defn eos-token

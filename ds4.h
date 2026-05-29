@@ -6,6 +6,32 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* =========================================================================
+ * Activation Capture.
+ * =========================================================================
+ *
+ * Capture hidden states (residual stream activations) at specified layers
+ * during token generation.  This enables:
+ *   - Contrastive Activation Addition (CAA) from real model traces
+ *   - Logit lens on arbitrary layers
+ *   - Mechanistic interpretability research
+ *
+ * Only the CPU backend supports capture today.  Metal capture is TODO. */
+
+typedef struct {
+    uint32_t *layer_indices;  /* which layers to capture (0..47) */
+    uint32_t n_layers;        /* how many layers */
+    uint32_t max_tokens;      /* buffer capacity in tokens */
+} ds4_capture_config;
+
+typedef struct {
+    float *data;              /* flat: [token][layer][hidden_dim] */
+    uint32_t n_tokens;        /* captured so far */
+    uint32_t n_layers;        /* layers per token */
+    uint32_t hidden_dim;      /* DS4_N_EMBD (2048) */
+    uint32_t capacity;        /* max tokens */
+} ds4_activation_buffer;
+
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and
@@ -171,6 +197,7 @@ int ds4_token_assistant(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
+bool ds4_session_is_cpu(const ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
@@ -280,5 +307,16 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
+
+/* Activation capture API.
+ * Configure which layers to capture before generation.
+ * Only the CPU backend is supported today. */
+int ds4_session_capture_config(ds4_session *s, const ds4_capture_config *cfg);
+void ds4_session_capture_clear(ds4_session *s);
+const ds4_activation_buffer *ds4_session_capture_buffer(const ds4_session *s);
+const float *ds4_activation_buffer_get(const ds4_activation_buffer *buf,
+                                       uint32_t token_idx,
+                                       uint32_t layer_idx);
+void ds4_activation_buffer_free(ds4_activation_buffer *buf);
 
 #endif

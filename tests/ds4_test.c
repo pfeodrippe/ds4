@@ -2422,6 +2422,78 @@ static void test_steering_behavioral_group(void) {
 
 #endif
 
+static void test_activation_capture(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, 512) != 0) {
+        TEST_ASSERT(0);
+        return;
+    }
+
+    /* Only CPU backend supports capture. */
+    if (!ds4_session_is_cpu(session)) {
+        ds4_session_free(session);
+        return;
+    }
+
+    uint32_t layers[] = {0, 23, 47};
+    ds4_capture_config cfg = {
+        .layer_indices = layers,
+        .n_layers = 3,
+        .max_tokens = 4
+    };
+
+    int rc = ds4_session_capture_config(session, &cfg);
+    TEST_ASSERT(rc == 0);
+
+    ds4_tokens prompt = {0};
+    int tokens[] = {1, 2, 3};
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        ds4_tokens_push(&prompt, tokens[i]);
+    }
+
+    char err[256] = {0};
+    rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    TEST_ASSERT(rc == 0);
+
+    /* Evaluate a couple more tokens. */
+    rc = ds4_session_eval(session, 1, err, sizeof(err));
+    TEST_ASSERT(rc == 0);
+    rc = ds4_session_eval(session, 2, err, sizeof(err));
+    TEST_ASSERT(rc == 0);
+
+    const ds4_activation_buffer *buf = ds4_session_capture_buffer(session);
+    TEST_ASSERT(buf != NULL);
+    TEST_ASSERT(buf->n_tokens > 0);
+    TEST_ASSERT(buf->n_layers == 3);
+    TEST_ASSERT(buf->hidden_dim == 2048);
+
+    /* Check we can read layer 0 of token 0. */
+    const float *act = ds4_activation_buffer_get(buf, 0, 0);
+    TEST_ASSERT(act != NULL);
+
+    /* Check layer 23 is accessible. */
+    act = ds4_activation_buffer_get(buf, 0, 1);
+    TEST_ASSERT(act != NULL);
+
+    /* Check layer 47 is accessible. */
+    act = ds4_activation_buffer_get(buf, 0, 2);
+    TEST_ASSERT(act != NULL);
+
+    /* Out of bounds returns NULL. */
+    act = ds4_activation_buffer_get(buf, 999, 0);
+    TEST_ASSERT(act == NULL);
+
+    ds4_session_capture_clear(session);
+    const ds4_activation_buffer *buf2 = ds4_session_capture_buffer(session);
+    TEST_ASSERT(buf2 == NULL);
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2446,6 +2518,7 @@ static const ds4_test_entry test_entries[] = {
     {"--multi-steering", "multi-steering", "multi-vector directional steering open/session/generate", test_multi_steering_group},
     {"--steering-behavioral", "steering-behavioral", "deterministic behavioral evals for refusal + hedging steering", test_steering_behavioral_group},
 #endif
+    {"--activation-capture", "activation-capture", "CPU activation capture buffer API", test_activation_capture},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

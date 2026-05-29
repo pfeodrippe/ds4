@@ -8066,6 +8066,18 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     }
 }
 
+/* Lightweight capture context passed into the CPU forward path.
+ * If NULL, no capture is performed. */
+typedef struct {
+    float *data;
+    uint32_t n_tokens;
+    uint32_t n_layers;
+    uint32_t hidden_dim;
+    uint32_t capacity;
+    const uint32_t *layer_indices;
+    uint32_t n_layer_indices;
+} ds4_capture_ctx;
+
 /* CPU decode for one token using the Qwen3-Coder attention path.
  * This avoids the DeepSeek-specific MLA/HC grouped-output paths and
  * uses separate K/V caches instead of the fused MLA latent cache. */
@@ -8082,7 +8094,8 @@ static void forward_token_qwen_cpu(
         const float       * steering_ffn_scales,
         const float       * sae_vec,
         uint32_t            sae_layer,
-        float               sae_scale) {
+        float               sae_scale,
+        ds4_capture_ctx   * capture) {
     const uint64_t d = DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -8183,6 +8196,17 @@ static void forward_token_qwen_cpu(
         if (sae_vec && il == sae_layer) {
             for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
         }
+
+        /* Activation capture: copy residual stream after this layer. */
+        if (capture && capture->n_tokens < capture->capacity) {
+            for (uint32_t ci = 0; ci < capture->n_layer_indices; ci++) {
+                if (capture->layer_indices[ci] == il) {
+                    const uint64_t offset = ((uint64_t)capture->n_tokens * capture->n_layers + ci) * d;
+                    memcpy(capture->data + offset, x, (size_t)d * sizeof(float));
+                    break;
+                }
+            }
+        }
     }
 
     if (logits) {
@@ -8221,7 +8245,8 @@ static int forward_token_qwen_cpu_layer_logprobs(
         uint32_t              stop_layer,
         const float         * sae_vec,
         uint32_t              sae_layer,
-        float               sae_scale) {
+        float               sae_scale,
+        ds4_capture_ctx     * capture) {
     const uint64_t d = DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -8319,6 +8344,17 @@ static int forward_token_qwen_cpu_layer_logprobs(
 
         if (sae_vec && il == sae_layer) {
             for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
+        }
+
+        /* Activation capture: copy residual stream after this layer. */
+        if (capture && capture->n_tokens < capture->capacity) {
+            for (uint32_t ci = 0; ci < capture->n_layer_indices; ci++) {
+                if (capture->layer_indices[ci] == il) {
+                    const uint64_t offset = ((uint64_t)capture->n_tokens * capture->n_layers + ci) * d;
+                    memcpy(capture->data + offset, x, (size_t)d * sizeof(float));
+                    break;
+                }
+            }
         }
     }
 
@@ -16644,7 +16680,7 @@ static int generate_raw_swa_cpu(
                 (t + 1 == (uint64_t)prompt->len) ? logits : NULL,
                 model, weights, &cache, prompt->v[t], (uint32_t)t,
                 n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales,
-                NULL, 0, 0.0f);
+                NULL, 0, 0.0f, NULL);
     }
 
     const double t_prefill1 = now_sec();
@@ -16684,7 +16720,7 @@ static int generate_raw_swa_cpu(
         const double t_eval0 = token_timing ? now_sec() : 0.0;
         forward_token_qwen_cpu(logits, model, weights, &cache, token, (uint32_t)pos,
                                n_steering, steering_dirs, steering_attn_scales, steering_ffn_scales,
-                               NULL, 0, 0.0f);
+                               NULL, 0, 0.0f, NULL);
         if (token_timing) {
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -16999,6 +17035,11 @@ struct ds4_session {
     float sae_scales[8];
     int n_sae_features;
     float *sae_combined_vec;  /* lazily allocated combined vector */
+
+    /* Activation capture (CPU backend only) */
+    ds4_capture_config capture_cfg;
+    ds4_activation_buffer capture_buf;
+    bool capture_enabled;
 };
 
 /* =========================================================================
@@ -17274,7 +17315,7 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
 }
 #endif
 
-static bool ds4_session_is_cpu(const ds4_session *s) {
+bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
@@ -18823,7 +18864,75 @@ void ds4_session_free(ds4_session *s) {
     free(s->mtp_logits);
     free(s->sae_combined_vec);
     ds4_session_free(s->cfg_session);
+    ds4_activation_buffer_free(&s->capture_buf);
+    free(s->capture_cfg.layer_indices);
     free(s);
+}
+
+/* =========================================================================
+ * Activation Capture Implementation.
+ * ========================================================================= */
+
+int ds4_session_capture_config(ds4_session *s, const ds4_capture_config *cfg) {
+    if (!s || !cfg) return 1;
+    if (cfg->n_layers == 0 || cfg->max_tokens == 0) return 1;
+    if (!ds4_session_is_cpu(s)) {
+        fprintf(stderr, "ds4: activation capture is only supported on CPU backend\n");
+        return 1;
+    }
+
+    /* Clear any existing capture state. */
+    ds4_session_capture_clear(s);
+
+    /* Copy layer indices. */
+    s->capture_cfg.layer_indices = xmalloc(cfg->n_layers * sizeof(uint32_t));
+    memcpy(s->capture_cfg.layer_indices, cfg->layer_indices, cfg->n_layers * sizeof(uint32_t));
+    s->capture_cfg.n_layers = cfg->n_layers;
+    s->capture_cfg.max_tokens = cfg->max_tokens;
+
+    /* Allocate capture buffer. */
+    const uint64_t n_floats = (uint64_t)cfg->max_tokens * cfg->n_layers * DS4_N_EMBD;
+    if (n_floats > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4: activation capture buffer too large\n");
+        ds4_session_capture_clear(s);
+        return 1;
+    }
+    s->capture_buf.data = xmalloc_zeroed(1, (size_t)(n_floats * sizeof(float)));
+    s->capture_buf.n_tokens = 0;
+    s->capture_buf.n_layers = cfg->n_layers;
+    s->capture_buf.hidden_dim = DS4_N_EMBD;
+    s->capture_buf.capacity = cfg->max_tokens;
+    s->capture_enabled = true;
+    return 0;
+}
+
+void ds4_session_capture_clear(ds4_session *s) {
+    if (!s) return;
+    ds4_activation_buffer_free(&s->capture_buf);
+    free(s->capture_cfg.layer_indices);
+    memset(&s->capture_cfg, 0, sizeof(s->capture_cfg));
+    s->capture_enabled = false;
+}
+
+const ds4_activation_buffer *ds4_session_capture_buffer(const ds4_session *s) {
+    if (!s || !s->capture_enabled) return NULL;
+    return &s->capture_buf;
+}
+
+const float *ds4_activation_buffer_get(const ds4_activation_buffer *buf,
+                                       uint32_t token_idx,
+                                       uint32_t layer_idx) {
+    if (!buf || !buf->data) return NULL;
+    if (token_idx >= buf->n_tokens) return NULL;
+    if (layer_idx >= buf->n_layers) return NULL;
+    const uint64_t offset = ((uint64_t)token_idx * buf->n_layers + layer_idx) * buf->hidden_dim;
+    return &buf->data[offset];
+}
+
+void ds4_activation_buffer_free(ds4_activation_buffer *buf) {
+    if (!buf) return;
+    free(buf->data);
+    memset(buf, 0, sizeof(*buf));
 }
 
 int ds4_session_power(ds4_session *s) {
@@ -19055,6 +19164,16 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 uint32_t sae_layer = 0;
                 float sae_scale = 0.0f;
                 const float *sae_vec = session_sae_vec(s, &sae_layer, &sae_scale);
+                ds4_capture_ctx capture = {0};
+                if (s->capture_enabled) {
+                    capture.data = s->capture_buf.data;
+                    capture.n_tokens = s->capture_buf.n_tokens;
+                    capture.n_layers = s->capture_buf.n_layers;
+                    capture.hidden_dim = s->capture_buf.hidden_dim;
+                    capture.capacity = s->capture_buf.capacity;
+                    capture.layer_indices = s->capture_cfg.layer_indices;
+                    capture.n_layer_indices = s->capture_cfg.n_layers;
+                }
                 forward_token_qwen_cpu(
                         (i + 1 == prompt->len) ? s->logits : NULL,
                         &e->model, &e->weights, &s->cpu_cache,
@@ -19063,7 +19182,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                         (const float **)e->steering_dirs,
                         e->steering_attn_scales,
                         e->steering_ffn_scales,
-                        sae_vec, sae_layer, sae_scale);
+                        sae_vec, sae_layer, sae_scale,
+                        s->capture_enabled ? &capture : NULL);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
             }
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
@@ -19085,7 +19205,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                     (const float **)e->steering_dirs,
                     e->steering_attn_scales,
                     e->steering_ffn_scales,
-                    sae_vec, sae_layer, sae_scale);
+                    sae_vec, sae_layer, sae_scale, NULL);
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
@@ -19366,7 +19486,7 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
                 (const float **)e->steering_dirs,
                 e->steering_attn_scales,
                 e->steering_ffn_scales,
-                NULL, 0, 0.0f);
+                NULL, 0, 0.0f, NULL);
     }
 
     int n = forward_token_qwen_cpu_layer_logprobs(
@@ -19378,7 +19498,7 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
             e->steering_attn_scales,
             e->steering_ffn_scales,
             (uint32_t)layer,
-            NULL, 0, 0.0f);
+            NULL, 0, 0.0f, NULL);
 
     kv_cache_free(&tmp_cache);
     return n;
@@ -19398,6 +19518,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         uint32_t sae_layer = 0;
         float sae_scale = 0.0f;
         const float *sae_vec = session_sae_vec(s, &sae_layer, &sae_scale);
+        ds4_capture_ctx capture = {0};
+        if (s->capture_enabled) {
+            capture.data = s->capture_buf.data;
+            capture.n_tokens = s->capture_buf.n_tokens;
+            capture.n_layers = s->capture_buf.n_layers;
+            capture.hidden_dim = s->capture_buf.hidden_dim;
+            capture.capacity = s->capture_buf.capacity;
+            capture.layer_indices = s->capture_cfg.layer_indices;
+            capture.n_layer_indices = s->capture_cfg.n_layers;
+        }
         forward_token_qwen_cpu(
                 s->logits,
                 &e->model,
@@ -19409,7 +19539,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 (const float **)e->steering_dirs,
                 e->steering_attn_scales,
                 e->steering_ffn_scales,
-                sae_vec, sae_layer, sae_scale);
+                sae_vec, sae_layer, sae_scale,
+                s->capture_enabled ? &capture : NULL);
         /* Classifier-Free Guidance */
         if (s->cfg_session && s->cfg_scale != 0.0f) {
             if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {
@@ -19420,6 +19551,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
                 s->logits[i] = s->logits[i] + scale * (s->logits[i] - s->cfg_session->logits[i]);
             }
+        }
+        if (s->capture_enabled) {
+            s->capture_buf.n_tokens++;
         }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;

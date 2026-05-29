@@ -49,8 +49,41 @@
   - **CPU backend**: basic generation, CFG, logit lens, steering, SAE all work
   - Note: Metal auto-discovers `.metal` shader sources (no env vars needed)
 - [x] `clj-ds4/src/ds4_clj/examples.clj` — Interactive REPL examples with comment blocks
-- [x] `clj-ds4/test/ds4_clj/core_test.clj` — 8 integration tests, all pass on Metal
+- [x] `clj-ds4/test/ds4_clj/core_test.clj` — 8 integration tests, all pass on Metal (39 assertions)
 - [ ] `clj-ds4/src/ds4_clj/ecs.clj` — vybe-flecs ECS integration (deferred; flecs overkill for this use case)
+
+## Activation Capture (Complete)
+- [x] **CPU activation capture** — C API + unit tests passing
+  - `ds4_capture_config`, `ds4_activation_buffer` structs in `ds4.h`
+  - `ds4_session_capture_config()` — configure which layers and max tokens to capture
+  - `ds4_session_capture_clear()` — free capture buffer and disable capture
+  - `ds4_session_capture_buffer()` — read-only access to captured activations
+  - `ds4_activation_buffer_get(token_idx, layer_idx)` — pointer to specific activation vector
+  - Hooked into `forward_token_qwen_cpu()` — copies residual stream after each specified layer
+  - C unit test `--activation-capture` passes (creates session, configures capture, evaluates tokens, verifies buffer)
+- [x] **Clojure FFI bindings** for capture API
+  - `session-capture-config`, `capture-clear`, `capture-buffer`, `activation-get` in `core.clj`
+  - Low-level bindings in `native.clj`
+
+## Eval Harness (Complete)
+- [x] **Full 92-question eval** from Clojure REPL — 42-43/92 (45.7%) baseline
+- [x] **Per-question timing** — each question reports seconds in output and JSON
+- [x] **Filtering** — by category, IDs, indices, first-N
+- [x] **Majority voting + JSON export** — `(run-eval :n-samples 5 :vote-temp 0.7 :out-file "results.json")`
+  - Extracts canonical answers per question type (letter, line spec, numeric)
+  - Votes on most common answer across samples
+  - Writes full results to JSON with timestamp, config, summary, per-question data
+- [x] **Tool-augmented eval** — `(run-eval :tools? true :category "AIME2025")` enables Python calculator
+  - Model emits `<tool>python</tool><code>...</code>`, code executes, result fed back
+- [x] **Analysis tools** — `tools/eval_report.py` (markdown) and `tools/diff_evals.py` (compare runs)
+- [x] **CLI help** — `clojure -M -m ds4-clj.eval-all --help`
+
+## Blocked / Future Work
+- [ ] **Metal activation capture** — requires graph surgery to output intermediate tensors from Metal graph
+- [ ] **Parallel eval** — blocked by global statics in `ds4_metal.m` (`g_queue`, `g_batch_cb`, etc.)
+- [ ] **Test-time CAA pipeline** — needs GPU capture (CPU too slow: ~2s/token × 500 tokens = ~17min per question)
+- [ ] **Per-session steering** — steering vectors are engine-global; would require C API refactor
+- [ ] **Speculative decoding** — needs compatible small draft model (same tokenizer, similar architecture)
 
 ## Future Ideas
 - [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)

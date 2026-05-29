@@ -143,9 +143,48 @@ See `clj-ds4/src/ds4_clj/examples.clj` for interactive comment-block examples.
 | Classifier-Free Guidance | `--cfg-scale` | `enable-cfg` | Conditional vs unconditional logits |
 | Logit lens | `--logit-lens` | `logit-lens` | Per-layer top-k predictions (Metal + CPU) |
 | SAE steering | `ds4_engine_load_sae` | `load-sae`, `sae-steer-multi` | Multi-feature sparse autoencoder steering |
+| Activation capture | `ds4_session_capture_config` | `capture-config`, `activation-get` | Hidden-state logging (CPU only) |
 | Sensorimotor loop | `sensorimotor_loop.py` | — | Model types into REPL, observes results |
 | Steering auto-tuning | `tune_steering.py` | — | Grid-search optimal scale per prompt |
 | Safetensors export | `export_steering_to_safetensors.py` | — | Share vectors in HF format |
+
+## Eval Harness
+
+Run the full 92-question benchmark from Clojure:
+
+```bash
+cd clj-ds4
+clojure -M -m ds4-clj.eval-all --help
+```
+
+Options:
+- `--category CAT` — filter by category (AIME2025, COMPSEC, GPQA Diamond, SuperGPQA)
+- `--first-n N` — run only first N questions
+- `--n-samples N` — majority voting with N samples
+- `--vote-temp T` — sampling temperature for voting
+- `--tools` — enable Python calculator for math questions
+- `--out-file FILE` — write JSON results
+
+```bash
+# Baseline run
+clojure -M -m ds4-clj.eval-all --first-n 10 --out-file baseline.json
+
+# Majority voting (5 samples)
+clojure -M -m ds4-clj.eval-all --n-samples 5 --vote-temp 0.8 --out-file voted.json
+
+# Tool-augmented math
+clojure -M -m ds4-clj.eval-all --tools --category AIME2025 --first-n 5
+```
+
+Analyze results:
+
+```bash
+# Pretty markdown report
+python3 tools/eval_report.py baseline.json > report.md
+
+# Compare two runs
+python3 tools/diff_evals.py baseline.json voted.json
+```
 
 ## Porting Checklist
 
