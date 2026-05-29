@@ -8991,6 +8991,12 @@ typedef struct {
     float *steering_layer_attn_scales[DS4_MAX_STEERING_VECTORS];
     float *steering_layer_ffn_scales[DS4_MAX_STEERING_VECTORS];
     int n_steering_vectors;
+    /* Activation capture (Metal) */
+    ds4_gpu_tensor *capture_bufs[DS4_MAX_CAPTURE_LAYERS];
+    uint32_t capture_layer_indices[DS4_MAX_CAPTURE_LAYERS];
+    uint32_t capture_n_layers;
+    uint32_t capture_max_tokens;
+    uint32_t capture_n_tokens;
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_N_LAYER];
     double decode_token_avg_sec;
@@ -11093,6 +11099,18 @@ static bool qwen_graph_encode_token(
                 attn_norm_ready = ok;
             } else {
                 ok = ds4_gpu_add_tensor(g->cur_hc, g->after_ffn_hc, g->routed_out, DS4_N_EMBD) != 0;
+            }
+        }
+        /* Activation capture: copy residual stream after this layer. */
+        if (ok && g->capture_n_layers > 0 && g->capture_n_tokens < g->capture_max_tokens) {
+            for (uint32_t ci = 0; ci < g->capture_n_layers; ci++) {
+                if (g->capture_layer_indices[ci] == il) {
+                    const uint64_t dst_off = (uint64_t)g->capture_n_tokens * DS4_N_EMBD * sizeof(float);
+                    ok = ds4_gpu_tensor_copy(g->capture_bufs[ci], dst_off,
+                                             g->cur_hc, 0,
+                                             (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+                    break;
+                }
             }
         }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "ffn_resid");
@@ -18876,8 +18894,8 @@ void ds4_session_free(ds4_session *s) {
 int ds4_session_capture_config(ds4_session *s, const ds4_capture_config *cfg) {
     if (!s || !cfg) return 1;
     if (cfg->n_layers == 0 || cfg->max_tokens == 0) return 1;
-    if (!ds4_session_is_cpu(s)) {
-        fprintf(stderr, "ds4: activation capture is only supported on CPU backend\n");
+    if (cfg->n_layers > DS4_MAX_CAPTURE_LAYERS) {
+        fprintf(stderr, "ds4: too many capture layers (max %d)\n", DS4_MAX_CAPTURE_LAYERS);
         return 1;
     }
 
@@ -18902,12 +18920,47 @@ int ds4_session_capture_config(ds4_session *s, const ds4_capture_config *cfg) {
     s->capture_buf.n_layers = cfg->n_layers;
     s->capture_buf.hidden_dim = DS4_N_EMBD;
     s->capture_buf.capacity = cfg->max_tokens;
+
+#ifndef DS4_NO_GPU
+    /* For Metal, allocate GPU-side capture buffers. */
+    if (!ds4_session_is_cpu(s)) {
+        ds4_gpu_graph *g = &s->graph;
+        g->capture_n_layers = cfg->n_layers;
+        g->capture_max_tokens = cfg->max_tokens;
+        g->capture_n_tokens = 0;
+        for (uint32_t i = 0; i < cfg->n_layers; i++) {
+            g->capture_layer_indices[i] = cfg->layer_indices[i];
+            g->capture_bufs[i] = ds4_gpu_tensor_alloc(
+                    (uint64_t)cfg->max_tokens * DS4_N_EMBD * sizeof(float));
+            if (!g->capture_bufs[i]) {
+                fprintf(stderr, "ds4: failed to allocate Metal capture buffer\n");
+                ds4_session_capture_clear(s);
+                return 1;
+            }
+        }
+    }
+#endif
+
     s->capture_enabled = true;
     return 0;
 }
 
 void ds4_session_capture_clear(ds4_session *s) {
     if (!s) return;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        ds4_gpu_graph *g = &s->graph;
+        for (uint32_t i = 0; i < g->capture_n_layers; i++) {
+            if (g->capture_bufs[i]) {
+                ds4_gpu_tensor_free(g->capture_bufs[i]);
+                g->capture_bufs[i] = NULL;
+            }
+        }
+        g->capture_n_layers = 0;
+        g->capture_max_tokens = 0;
+        g->capture_n_tokens = 0;
+    }
+#endif
     ds4_activation_buffer_free(&s->capture_buf);
     free(s->capture_cfg.layer_indices);
     memset(&s->capture_cfg, 0, sizeof(s->capture_cfg));
@@ -18917,6 +18970,15 @@ void ds4_session_capture_clear(ds4_session *s) {
 const ds4_activation_buffer *ds4_session_capture_buffer(const ds4_session *s) {
     if (!s || !s->capture_enabled) return NULL;
     return &s->capture_buf;
+}
+
+int ds4_session_capture_info(const ds4_session *s, uint32_t out[4]) {
+    if (!s || !s->capture_enabled || !out) return 0;
+    out[0] = s->capture_buf.n_tokens;
+    out[1] = s->capture_buf.n_layers;
+    out[2] = s->capture_buf.hidden_dim;
+    out[3] = s->capture_buf.capacity;
+    return 1;
 }
 
 const float *ds4_activation_buffer_get(const ds4_activation_buffer *buf,
@@ -19272,6 +19334,23 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
+    /* Re-apply capture config after graph rebuild. */
+    if (s->capture_enabled) {
+        ds4_gpu_graph *g = &s->graph;
+        g->capture_n_layers = s->capture_cfg.n_layers;
+        g->capture_max_tokens = s->capture_cfg.max_tokens;
+        g->capture_n_tokens = 0;
+        for (uint32_t i = 0; i < s->capture_cfg.n_layers; i++) {
+            g->capture_layer_indices[i] = s->capture_cfg.layer_indices[i];
+            g->capture_bufs[i] = ds4_gpu_tensor_alloc(
+                    (uint64_t)s->capture_cfg.max_tokens * DS4_N_EMBD * sizeof(float));
+            if (!g->capture_bufs[i]) {
+                fprintf(stderr, "ds4: failed to reallocate Metal capture buffer after sync\n");
+                s->capture_enabled = false;
+                break;
+            }
+        }
+    }
     if (!qwen_graph_prefill_tokens(&s->graph, &e->model, &e->weights,
                                    prompt, 0, (uint32_t)prompt->len, s->logits,
                                    s->progress, s->progress_ud)) {
@@ -19579,6 +19658,19 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    /* Activation capture readback for Metal. */
+    if (s->capture_enabled && s->capture_buf.n_tokens < s->capture_buf.capacity) {
+        ds4_gpu_graph *g = &s->graph;
+        for (uint32_t ci = 0; ci < g->capture_n_layers; ci++) {
+            const uint64_t src_off = (uint64_t)g->capture_n_tokens * DS4_N_EMBD * sizeof(float);
+            const uint64_t dst_off = ((uint64_t)s->capture_buf.n_tokens * s->capture_buf.n_layers + ci) * DS4_N_EMBD;
+            ds4_gpu_tensor_read(g->capture_bufs[ci], src_off,
+                                s->capture_buf.data + dst_off,
+                                (uint64_t)DS4_N_EMBD * sizeof(float));
+        }
+        s->capture_buf.n_tokens++;
+        g->capture_n_tokens++;
+    }
     /* Classifier-Free Guidance */
     if (s->cfg_session && s->cfg_scale != 0.0f) {
         if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {

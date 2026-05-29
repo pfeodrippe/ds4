@@ -49,7 +49,10 @@
   - **CPU backend**: basic generation, CFG, logit lens, steering, SAE all work
   - Note: Metal auto-discovers `.metal` shader sources (no env vars needed)
 - [x] `clj-ds4/src/ds4_clj/examples.clj` — Interactive REPL examples with comment blocks
-- [x] `clj-ds4/test/ds4_clj/core_test.clj` — 8 integration tests, all pass on Metal (39 assertions)
+- [x] `clj-ds4/test/ds4_clj/core_test.clj` — 9 integration tests, all pass on Metal (92 assertions)
+  - test-basic-generation, test-generation-with-system-prompt, test-logit-lens
+  - test-logit-bias, test-cfg, test-sae-steering, test-multi-sae-steering
+  - test-steering-vector, test-activation-capture-metal (pure Clojure data, real model data)
 - [ ] `clj-ds4/src/ds4_clj/ecs.clj` — vybe-flecs ECS integration (deferred; flecs overkill for this use case)
 
 ## Activation Capture (Complete)
@@ -61,6 +64,11 @@
   - `ds4_activation_buffer_get(token_idx, layer_idx)` — pointer to specific activation vector
   - Hooked into `forward_token_qwen_cpu()` — copies residual stream after each specified layer
   - C unit test `--activation-capture` passes (creates session, configures capture, evaluates tokens, verifies buffer)
+- [x] **Metal activation capture** — GPU→CPU via shared memory blit
+  - Allocates `ds4_gpu_tensor` capture buffers per layer (`max_tokens * 2048 * sizeof(float)`)
+  - During `qwen_graph_encode_token`, after each captured layer, blits `g->cur_hc` to capture buffer via `ds4_gpu_tensor_copy`
+  - After `ds4_gpu_end_commands`, reads back from shared memory with `ds4_gpu_tensor_read` (memcpy)
+  - No explicit GPU→CPU sync needed — `MTLResourceStorageModeShared` + command buffer wait
 - [x] **Clojure FFI bindings** for capture API
   - `session-capture-config`, `capture-clear`, `capture-buffer`, `activation-get` in `core.clj`
   - Low-level bindings in `native.clj`
@@ -79,9 +87,9 @@
 - [x] **CLI help** — `clojure -M -m ds4-clj.eval-all --help`
 
 ## Blocked / Future Work
-- [ ] **Metal activation capture** — requires graph surgery to output intermediate tensors from Metal graph
+- [x] **Metal activation capture** — DONE. GPU→CPU via shared memory blit. Tested against CPU backend.
 - [ ] **Parallel eval** — blocked by global statics in `ds4_metal.m` (`g_queue`, `g_batch_cb`, etc.)
-- [ ] **Test-time CAA pipeline** — needs GPU capture (CPU too slow: ~2s/token × 500 tokens = ~17min per question)
+- [ ] **Test-time CAA pipeline** — capture is done; needs experiment design (wrong vs corrected reasoning)
 - [ ] **Per-session steering** — steering vectors are engine-global; would require C API refactor
 - [ ] **Speculative decoding** — needs compatible small draft model (same tokenizer, similar architecture)
 

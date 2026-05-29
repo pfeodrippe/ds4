@@ -2432,11 +2432,7 @@ static void test_activation_capture(void) {
         return;
     }
 
-    /* Only CPU backend supports capture. */
-    if (!ds4_session_is_cpu(session)) {
-        ds4_session_free(session);
-        return;
-    }
+    /* Capture works on both CPU and Metal backends now. */
 
     uint32_t layers[] = {0, 23, 47};
     ds4_capture_config cfg = {

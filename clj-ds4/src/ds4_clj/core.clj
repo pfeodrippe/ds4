@@ -367,14 +367,16 @@
               :think-mode (:think cfg))))
 
 ;; --- Activation Capture ---
+;; All activation capture functions return pure Clojure data structures
+;; (maps, vectors of floats). No MemorySegments leak into user code.
 
 (defn capture-config
-  "Configure activation capture for a CPU session.
+  "Configure activation capture.
 
   layers: seq of layer indices to capture, e.g. [0 23 47]
   max-tokens: maximum number of tokens to capture (default: 256)
 
-  Only works on CPU backend. Call before generating tokens."
+  Works on both CPU and Metal backends. Call before generating tokens."
   ([session layers]
    (capture-config session layers 256))
   ([session layers max-tokens]
@@ -385,18 +387,100 @@
   [session]
   (n/session-capture-clear session))
 
-(defn capture-buffer
-  "Get the activation buffer from a session. Returns a MemorySegment
-  pointing to the ds4_activation_buffer struct, or nil if capture
-  is not enabled."
+(defn capture-info
+  "Read capture buffer metadata.
+  Returns a map:
+    {:n-tokens N, :n-layers N, :hidden-dim N, :capacity N}
+  or nil if capture is not enabled."
   [session]
-  (n/session-capture-buffer session))
+  (let [^java.lang.foreign.MemorySegment out-seg (vp/alloc 16 4)]
+    (when (= 1 (n/session-capture-info session out-seg))
+      {:n-tokens  (int (.get out-seg java.lang.foreign.ValueLayout/JAVA_INT 0))
+       :n-layers  (int (.get out-seg java.lang.foreign.ValueLayout/JAVA_INT 4))
+       :hidden-dim (int (.get out-seg java.lang.foreign.ValueLayout/JAVA_INT 8))
+       :capacity  (int (.get out-seg java.lang.foreign.ValueLayout/JAVA_INT 12))})))
 
 (defn activation-get
-  "Get a pointer to the activation vector for a specific token and layer.
-  Returns a MemorySegment pointing to hidden_dim floats, or nil if out of bounds."
-  [buf token-idx layer-idx]
-  (n/activation-buffer-get buf token-idx layer-idx))
+  "Get the activation vector for a specific token index and layer index.
+  Returns a vector of 2048 floats, or nil if out of bounds."
+  [session token-idx layer-idx]
+  (when-let [info (capture-info session)]
+    (when-let [^java.lang.foreign.MemorySegment seg
+               (n/activation-buffer-get (n/session-capture-buffer session)
+                                        token-idx layer-idx)]
+      (when (pos? (.address seg))
+        (let [n (int (:hidden-dim info))
+              sized (.reinterpret seg (* n 4))]
+          (vec (for [i (range n)]
+                 (.get sized java.lang.foreign.ValueLayout/JAVA_FLOAT (* i 4)))))))))
+
+(defn capture-activations
+  "Retrieve ALL captured activations as pure Clojure data.
+
+  Returns a map:
+    {:n-tokens    N
+     :n-layers    N
+     :hidden-dim  N
+     :capacity    N
+     :layer-indices [...]   ; the layers you configured
+     :activations  [[[f1 f2 ...]    ; token 0, layer 0 (2048 floats)
+                      [f1 f2 ...]    ; token 0, layer 1
+                      [f1 f2 ...]]   ; token 0, layer 2
+                     [[f1 f2 ...]    ; token 1, layer 0
+                      ...]
+                     ...]}
+
+  Every inner vector is a 2048-element float vector representing the
+  residual stream at that (token, layer) position."
+  [session layer-indices]
+  (when-let [info (capture-info session)]
+    (let [n-toks  (:n-tokens info)
+          n-lays  (:n-layers info)]
+      {:n-tokens      n-toks
+       :n-layers      n-lays
+       :hidden-dim    (:hidden-dim info)
+       :capacity      (:capacity info)
+       :layer-indices (vec layer-indices)
+       :activations   (vec
+                        (for [t (range n-toks)]
+                          (vec
+                            (for [l (range n-lays)]
+                              (activation-get session t l)))))})))
+
+(defn activation-stats
+  "Compute basic statistics on an activation vector.
+  Returns {:mean M, :std-dev S, :min MN, :max MX, :norm L2}."
+  [activations]
+  (when (seq activations)
+    (let [n      (count activations)
+          sum    (reduce + activations)
+          mean   (/ sum n)
+          sqsum  (reduce + (map #(Math/pow (- % mean) 2) activations))
+          std    (Math/sqrt (/ sqsum n))
+          mn     (reduce min activations)
+          mx     (reduce max activations)
+          l2     (Math/sqrt (reduce + (map #(* % %) activations)))]
+      {:mean     (float mean)
+       :std-dev  (float std)
+       :min      (float mn)
+       :max      (float mx)
+       :norm     (float l2)})))
+
+(defn activation-norm
+  "L2 norm of an activation vector."
+  [activations]
+  (Math/sqrt (reduce + (map #(* % %) activations))))
+
+(defn activation-cosine-similarity
+  "Cosine similarity between two activation vectors.
+  Returns a float in [-1, 1], or nil if either vector is empty."
+  [a b]
+  (when (and (seq a) (seq b))
+    (let [dot (reduce + (map * a b))
+          na  (activation-norm a)
+          nb  (activation-norm b)]
+      (when (and (> na 0) (> nb 0))
+        (float (/ dot (* na nb)))))))
 
 ;; --- Utils ---
 

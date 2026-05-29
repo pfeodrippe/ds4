@@ -236,3 +236,55 @@
 
   (ds4/close-engine engine)
   )
+
+;; =============================================================================
+;; ACTIVATION CAPTURE (CPU and Metal)
+;; =============================================================================
+
+(comment
+  ;; Capture hidden states during generation. Works on both CPU and Metal.
+  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf" :backend :metal))
+  (def session (ds4/create-session engine 512))
+
+  ;; Configure capture: which layers and max tokens
+  (ds4/capture-config session [0 12 24 36 47] 64)
+
+  ;; Generate — activations are captured automatically
+  (def text (ds4/generate engine session "The capital of France is"
+                          {:n-tokens 10 :temperature 0.0}))
+
+  ;; --- Query metadata ---
+  (ds4/capture-info session)
+  ;; => {:n-tokens 10, :n-layers 5, :hidden-dim 2048, :capacity 64}
+
+  ;; --- Get a single activation vector ---
+  (def act-t0-l0 (ds4/activation-get session 0 0))   ; token 0, layer 0
+  (count act-t0-l0)
+  ;; => 2048
+
+  ;; --- Get ALL activations as pure nested Clojure data ---
+  (def all (ds4/capture-activations session [0 12 24 36 47]))
+  ;; => {:n-tokens 10
+  ;;     :n-layers 5
+  ;;     :hidden-dim 2048
+  ;;     :capacity 64
+  ;;     :layer-indices [0 12 24 36 47]
+  ;;     :activations [[[0.12 -0.03 ...]     ; token 0, layer 0
+  ;;                    [0.45  0.21 ...]     ; token 0, layer 12
+  ;;                    ...]
+  ;;                   [[0.11 -0.02 ...]     ; token 1, layer 0
+  ;;                    ...]]}
+
+  ;; --- Activation statistics ---
+  (ds4/activation-stats act-t0-l0)
+  ;; => {:mean 0.003, :std-dev 0.42, :min -3.1, :max 2.8, :norm 19.2}
+
+  ;; --- Compare two activations ---
+  (def act-t0-l47 (ds4/activation-get session 0 4))
+  (ds4/activation-cosine-similarity act-t0-l0 act-t0-l47)
+  ;; => 0.34   ; low similarity = layers processed differently
+
+  ;; --- Clean up ---
+  (ds4/capture-clear session)
+  (ds4/close-engine engine)
+  )

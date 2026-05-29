@@ -86,6 +86,7 @@ typedef struct ds4_session ds4_session;
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 #define DS4_MAX_STEERING_VECTORS 8
+#define DS4_MAX_CAPTURE_LAYERS     8
 
 typedef struct {
     const char *file;
@@ -317,6 +318,9 @@ const ds4_activation_buffer *ds4_session_capture_buffer(const ds4_session *s);
 const float *ds4_activation_buffer_get(const ds4_activation_buffer *buf,
                                        uint32_t token_idx,
                                        uint32_t layer_idx);
+/* Read capture buffer metadata into out[4] = {n_tokens, n_layers, hidden_dim, capacity}.
+ * Returns 0 if capture is not enabled. */
+int ds4_session_capture_info(const ds4_session *s, uint32_t out[4]);
 void ds4_activation_buffer_free(ds4_activation_buffer *buf);
 
 #endif

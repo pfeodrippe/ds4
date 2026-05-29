@@ -119,6 +119,100 @@ clojure -M:repl
   - `:k` — top-k predictions per layer (default 5)
   - Returns map of `layer -> [{:id :logit :logprob} ...]`
 
+### Activation Capture (CPU and Metal)
+
+Capture the **hidden states** (residual stream activations) of the model during generation. Works on both CPU and Metal backends. All returned data is pure Clojure — vectors of floats, maps, nested data structures. No `MemorySegment` objects leak into user code.
+
+```clojure
+;; Configure capture: which layers and max tokens
+(ds4/capture-config session [0 12 24 36 47] 64)
+
+;; Generate — activations are captured automatically
+(def text (ds4/generate engine session "The capital of France is"
+                        {:n-tokens 5 :temperature 0.0}))
+
+;; --- Query metadata (pure Clojure map) ---
+(ds4/capture-info session)
+;; => {:n-tokens 5, :n-layers 3, :hidden-dim 2048, :capacity 8}
+
+;; --- Get a single activation vector (2048 floats) ---
+(def act-t0-l0 (ds4/activation-get session 0 0))   ; token 0, layer 0
+(take 10 act-t0-l0)
+;; => (-0.0032344395 -0.011953812 -0.013704131 -0.0042575966 -0.020877086
+;;      0.020867579 0.008203359 -0.009509527 -0.015552336 -0.010627635)
+(count act-t0-l0)
+;; => 2048
+(type act-t0-l0)
+;; => clojure.lang.PersistentVector
+
+;; --- Get ALL activations as nested Clojure data ---
+(def all (ds4/capture-activations session [0 12 47]))
+;; => {:n-tokens 5
+;;     :n-layers 3
+;;     :hidden-dim 2048
+;;     :capacity 8
+;;     :layer-indices [0 12 47]
+;;     :activations [[[0.12 -0.03 ...]      ; token 0, layer 0 (2048 floats)
+;;                    [0.45  0.21 ...]      ; token 0, layer 12
+;;                    [3.2  -1.5  ...]]     ; token 0, layer 47
+;;                   [[0.11 -0.02 ...]      ; token 1, layer 0
+;;                    ...]]}
+
+;; --- Activation statistics ---
+(ds4/activation-stats act-t0-l0)
+;; => {:mean -0.0013250225, :std-dev 0.040008932, :min -1.5146916,
+;;     :max 0.38235015, :norm 1.8115903}
+
+;; --- Compare two activations ---
+(def act-t0-l47 (ds4/activation-get session 0 2))
+(ds4/activation-cosine-similarity act-t0-l0 act-t0-l47)
+;; => 0.14761291   ; low similarity = layers processed very differently
+
+;; --- Introspect like any Clojure data ---
+(keys (ds4/capture-info session))
+;; => (:n-tokens :n-layers :hidden-dim :capacity)
+
+(count (filter pos? act-t0-l0))
+;; => 1033          ; how many positive activations?
+
+(apply max act-t0-l0)
+;; => 0.38235015    ; most excited dimension
+
+(get-in all [:activations 0 0 0])
+;; => -0.0032344395 ; navigate nested structure with get-in
+
+(mapv count (:activations all))
+;; => [3 3 3 3 3]   ; each token has 3 captured layers
+
+;; --- Walk the nested structure ---
+(doseq [[tok-idx token-data] (map-indexed vector (:activations all))]
+  (doseq [[lay-idx layer-data] (map-indexed vector token-data)]
+    (let [s (ds4/activation-stats layer-data)]
+      (println (format "Token %d Layer %d: norm=%.2f mean=%.3f std=%.3f"
+                       tok-idx lay-idx (:norm s) (:mean s) (:std-dev s))))))
+;; Token 0 Layer 0: norm=1.81 mean=-0.001 std=0.040
+;; Token 0 Layer 1: norm=7.18 mean=-0.003 std=0.159
+;; Token 0 Layer 2: norm=70.39 mean=-0.021 std=1.555
+;; Token 1 Layer 0: norm=1.72 mean=-0.002 std=0.038
+;; ...
+
+;; --- Clean up ---
+(ds4/capture-clear session)
+```
+
+**Activation capture functions:**
+
+| Function | Returns |
+|----------|---------|
+| `(capture-config session layers max-tokens)` | nil (side effect: configures capture) |
+| `(capture-info session)` | `{:n-tokens N, :n-layers N, :hidden-dim N, :capacity N}` or nil |
+| `(activation-get session token-idx layer-idx)` | `[f1 f2 ...]` — 2048-element float vector, or nil |
+| `(capture-activations session layer-indices)` | Full nested map with all data (see example above) |
+| `(activation-stats vector)` | `{:mean M, :std-dev S, :min MN, :max MX, :norm L2}` |
+| `(activation-norm vector)` | L2 norm (float) |
+| `(activation-cosine-similarity a b)` | Cosine similarity in `[-1, 1]`, or nil |
+| `(capture-clear session)` | nil (frees capture buffers) |
+
 ## Notes
 
 - **Metal backend**: Auto-discovers `.metal` source files relative to the library path. No env vars needed in most cases.

@@ -225,6 +225,11 @@
   (vp/c-fn (lookup-symbol "ds4_session_capture_buffer")
            (fd :pointer [[:session [:* :void]]])))
 
+(def ^:private c-capture-info
+  (vp/c-fn (lookup-symbol "ds4_session_capture_info")
+           (fd :int [[:session [:* :void]]
+                     [:out [:* :int]]])))
+
 (def ^:private c-activation-buffer-get
   (vp/c-fn (lookup-symbol "ds4_activation_buffer_get")
            (fd :pointer [[:buf [:* :void]]
@@ -460,6 +465,12 @@
   (let [^MemorySegment buf-ptr (c-capture-buffer session)]
     (when (and buf-ptr (not (.equals buf-ptr (MemorySegment/ofAddress 0))))
       buf-ptr)))
+
+(defn session-capture-info
+  "Read capture buffer metadata. Returns 1 if capture is enabled, 0 otherwise.
+  out-seg must be a 16-byte MemorySegment (4 uint32_t values)."
+  [^MemorySegment session ^MemorySegment out-seg]
+  (c-capture-info session out-seg))
 
 (defn activation-buffer-get
   "Get a pointer to the activation vector for a specific token and layer.

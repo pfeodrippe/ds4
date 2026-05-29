@@ -148,3 +148,100 @@
                       (str (System/getProperty "user.home") "/dev/ds4"))]
       (is (.exists (io/file ds4-dir "dir-steering/out/sarcastic_v1.f32"))
           "Sarcastic steering vector file should exist"))))
+
+(deftest test-activation-capture-metal
+  (testing "Activation capture on Metal — pure Clojure data API"
+    (let [layers [0 23 47]]
+      (ds4/capture-config *session* layers 8)
+
+      ;; Generate some tokens so we have captured data
+      (let [text (ds4/generate *engine* *session* "The capital of France is"
+                               {:n-tokens 5 :temperature 0.0})]
+        (is (string? text))
+        (is (> (count text) 0)))
+
+      ;; --- Test capture-info (pure map) ---
+      (let [info (ds4/capture-info *session*)]
+        (is (map? info) "capture-info should return a map")
+        (is (contains? info :n-tokens))
+        (is (contains? info :n-layers))
+        (is (contains? info :hidden-dim))
+        (is (contains? info :capacity))
+        (is (>= (:n-tokens info) 5) "Should have captured at least 5 tokens")
+        (is (= 3 (:n-layers info)) "Should have 3 captured layers")
+        (is (= 2048 (:hidden-dim info)) "Hidden dim should be 2048")
+        (is (= 8 (:capacity info)) "Capacity should be 8"))
+
+      ;; --- Test activation-get (pure vector of floats) ---
+      (let [act0-l0 (ds4/activation-get *session* 0 0)]
+        (is (vector? act0-l0) "activation-get should return a vector")
+        (is (= 2048 (count act0-l0)) "Activation vector should have 2048 elements")
+        (is (float? (first act0-l0)) "Elements should be floats")
+        (let [stats (ds4/activation-stats act0-l0)]
+          (is (map? stats) "activation-stats should return a map")
+          (is (contains? stats :mean))
+          (is (contains? stats :norm))
+          (is (> (:norm stats) 1.0) (format "Layer 0 norm should be >1, got %.2f" (:norm stats)))))
+
+      (let [act0-l47 (ds4/activation-get *session* 0 2)]
+        (is (vector? act0-l47))
+        (let [stats (ds4/activation-stats act0-l47)]
+          (is (> (:norm stats) 1.0) (format "Layer 47 norm should be >1, got %.2f" (:norm stats)))))
+
+      ;; --- Test capture-activations (full nested data) ---
+      (let [data (ds4/capture-activations *session* layers)]
+        (is (map? data) "capture-activations should return a map")
+        (is (contains? data :n-tokens))
+        (is (contains? data :n-layers))
+        (is (contains? data :hidden-dim))
+        (is (contains? data :capacity))
+        (is (contains? data :layer-indices))
+        (is (contains? data :activations))
+        (is (= layers (:layer-indices data)))
+        (is (vector? (:activations data)))
+        (is (= 5 (count (:activations data))) "Should have 5 tokens")
+        (is (vector? (first (:activations data))))
+        (is (= 3 (count (first (:activations data)))) "Each token should have 3 layers")
+        (is (vector? (first (first (:activations data)))))
+        (is (= 2048 (count (first (first (:activations data)))))) "Each layer should have 2048 floats")
+
+      ;; --- Test activation utilities ---
+      (let [a0 (ds4/activation-get *session* 0 0)
+            a1 (ds4/activation-get *session* 1 0)
+            a2 (ds4/activation-get *session* 2 0)]
+        (is (not= a0 a1) "Token 0 and 1 should differ")
+        (is (not= a1 a2) "Token 1 and 2 should differ")
+        ;; Cosine similarity
+        (let [cos (ds4/activation-cosine-similarity a0 a1)]
+          (is (some? cos) "Cosine similarity should be computable")
+          (is (float? cos))
+          (is (< cos 0.99) (format "Cosine similarity should be <0.99, got %.4f" cos))
+          (is (> cos -0.5) (format "Cosine similarity should be >-0.5, got %.4f" cos)))
+        ;; L2 norm
+        (let [n0 (ds4/activation-norm a0)
+              n1 (ds4/activation-norm a1)]
+          (is (> n0 0) "Norm should be positive")
+          (is (> n1 0) "Norm should be positive"))
+        ;; Stats
+        (let [stats (ds4/activation-stats a0)]
+          (is (map? stats))
+          (is (contains? stats :mean))
+          (is (contains? stats :std-dev))
+          (is (contains? stats :min))
+          (is (contains? stats :max))
+          (is (contains? stats :norm))))
+
+      ;; --- Test layer progression ---
+      (let [act-l0  (ds4/activation-get *session* 0 0)
+            act-l47 (ds4/activation-get *session* 0 2)
+            cos     (ds4/activation-cosine-similarity act-l0 act-l47)]
+        (is (some? cos))
+        (when cos
+          (is (< cos 0.99) (format "Layer 0 and 47 should differ (cos=%.4f)" cos))
+          (is (> cos -0.5) (format "Layer 0 and 47 should not be anti-correlated (cos=%.4f)" cos)))
+
+      (ds4/capture-clear *session*)
+      (is (nil? (ds4/capture-info *session*))
+          "Capture info should be nil after clear")
+      (is (nil? (ds4/capture-activations *session* layers))
+          "capture-activations should be nil after clear")))))
