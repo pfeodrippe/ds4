@@ -93,7 +93,6 @@
 ## Blocked / Future Work
 - [x] **Metal activation capture** — DONE. GPU→CPU via shared memory blit. Tested against CPU backend.
 - [ ] **Parallel eval** — blocked by global statics in `ds4_metal.m` (`g_queue`, `g_batch_cb`, etc.)
-- [ ] **Test-time CAA pipeline** — capture is done; needs experiment design (wrong vs corrected reasoning)
 - [ ] **Per-session steering** — steering vectors are engine-global; would require C API refactor
 - [ ] **Speculative decoding** — needs compatible small draft model (same tokenizer, similar architecture)
 
@@ -121,19 +120,28 @@
 - [x] **C API**: `ds4_expert_log_entry`, `ds4_expert_log` structs and API functions in `ds4.h`
 - [x] **C**: Deep hook into `qwen_moe_one` (CPU forward path) via `g_expert_log` global. Captures layer idx, token idx, selected expert IDs (top-8), and router weights for every MoE layer during forward pass.
 - [x] **C**: `ds4_session_expert_log_replay` — replays checkpoint on CPU for Metal sessions, populating the log without shader modifications
+- [x] **C**: Expert suppression mask `expert_suppressed[DS4_N_EXPERT]` in session struct. `ds4_session_expert_suppress/unsuppress/unsuppress_all/is_suppressed` API.
+- [x] **C**: Router functions (`qwen_router_topk`, `layer_topk_selected_experts_from_probs`) check `g_expert_suppressed` and zero out suppressed experts before top-k selection.
 - [x] **Clojure**: `expert-log-enable!`, `expert-log-disable!`, `expert-log-entries`, `expert-log-summary`
+- [x] **Clojure**: `suppress-expert!`, `unsuppress-expert!`, `unsuppress-all-experts!`, `expert-suppressed?`
 - [x] **Tests**: `test-expert-logging` (Metal — replay captures real data), `test-expert-logging-cpu` (CPU — real data verified: 23 assertions)
 - [x] **Pattern verification**: `test-expert-patterns-differ` — math/code/text prompts produce measurably different routing patterns (24-32% unique experts per domain)
+- [x] **Expert dropping test**: `test-expert-suppression-changes-output` — suppressing top-4 experts changes generation output; clearing suppression restores baseline output
 - [x] **scratch.clj**: Workflow 14 — expert logging with MoE introspection
-- [ ] **Clojure**: `expert-drop` — selectively suppress specific expert IDs
-- [ ] **Tests**: Verify dropping changes output
 
-### 4. Fine-Tuning with N Examples (GPU-accelerated)
-- [ ] **Research**: LoRA/QLoRA fine-tuning on Metal GPU for Qwen3-Coder
-- [ ] **C API**: Add backward pass support or integrate ggml/llama.cpp training
-- [ ] **Clojure**: `fine-tune` function — take N (prompt, response) pairs, run supervised fine-tuning
+### 4. Fine-Tuning with N Examples (GPU-accelerated) — STUBS DONE
+- [x] **Research**: LoRA/QLoRA fine-tuning documented in `FINETUNE_ROADMAP.md`
+  - Recommended path: MLX Python for training, DS4 for inference (adapter loading)
+  - Memory budget: ~19GB for rank-16 LoRA on Qwen3-Coder 30B-A3B
+- [x] **C API**: Stub implementations of `ds4_lora_init/free/enabled/save/load` in `ds4.c`
+  - `ds4_lora_config` struct in `ds4.h`
+  - Stubs compile, print status, return errors for save/load (not yet implemented)
+- [x] **Clojure**: `lora-init!`, `lora-free!`, `lora-enabled?`, `lora-save!`, `lora-load!` in `core.clj`
+- [x] **Tests**: `test-lora-stub-api` — verifies init/free/enabled/save/load stubs
+- [ ] **Full implementation**: Metal shader `kernel_lora_matmul`, backward pass, Adam optimizer
+  - Estimated effort: 3-4 weeks (see `FINETUNE_ROADMAP.md`)
+- [ ] **MLX training script**: `tools/lora_train.py` using `mlx_lm.lora`
 - [ ] **CLI**: `ds4 finetune --examples examples.json --epochs 3 --output adapter.bin`
-- [ ] **Tests**: Verify fine-tuned model produces different outputs on training prompts
 
 ## Future Ideas
 - [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)
@@ -150,29 +158,29 @@ With all 7 items implemented, DS4 becomes a **controllable, inspectable, steerab
 
 ### Example Session
 
-1. **Ask the model to write a function**  
-   Prompt: `"Write a Python function to reverse a linked list"`  
+1. **Ask the model to write a function**
+   Prompt: `"Write a Python function to reverse a linked list"`
    With **CFG** scale 2.0 → laser-focused on the exact instruction, no wandering.
 
-2. **Watch the thinking process in real time**  
-   **Logit lens** shows:  
-   - Layer 15: predicts `def` (planning function signature)  
-   - Layer 25: predicts `class Node:` (structuring the data model)  
+2. **Watch the thinking process in real time**
+   **Logit lens** shows:
+   - Layer 15: predicts `def` (planning function signature)
+   - Layer 25: predicts `class Node:` (structuring the data model)
    - Layer 35: predicts `return prev` (planning the return value)
 
-3. **Ensure clean Python style**  
+3. **Ensure clean Python style**
    **SAE feature steering**: boost the "Python syntax" feature, suppress "JavaScript syntax" feature.
 
-4. **Ban lazy outputs**  
+4. **Ban lazy outputs**
    **Logit bias**: set `pass` = -∞, `TODO` = -∞, `...` = -∞.
 
-5. **Have the model type into Emacs**  
+5. **Have the model type into Emacs**
    **Sensorimotor loop**: model types `(defn reverse-list [`, paredit auto-inserts `]`, model sees balanced parens and continues.
 
-6. **Apply surgical steering**  
+6. **Apply surgical steering**
    **Per-layer scales**: early layers (0-10) at 0× (syntax intact), middle layers (15-30) at +2.0 (refusal suppressed if needed), late layers (40-47) at 0.5× (light touch on generation style).
 
-7. **All running at +15% speed**  
+7. **All running at +15% speed**
    From stripping dead DeepSeek-specific code paths.
 
 ### Capabilities Matrix

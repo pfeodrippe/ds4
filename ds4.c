@@ -465,6 +465,7 @@ static uint64_t hash_bytes(const void *ptr, uint64_t len) {
 static bool g_alloc_guard_enabled;
 static const char *g_alloc_guard_phase;
 static ds4_expert_log *g_expert_log = NULL;
+static bool *g_expert_suppressed = NULL;
 
 static DS4_MAYBE_UNUSED void ds4_alloc_guard_begin(const char *phase) {
     g_alloc_guard_phase = phase;
@@ -4044,6 +4045,11 @@ static void qwen_router_topk(
         for (int i = 0; i < DS4_N_EXPERT; i++) logits[i] += bias[i];
     }
 
+    if (g_expert_suppressed) {
+        for (int i = 0; i < DS4_N_EXPERT; i++) {
+            if (g_expert_suppressed[i]) logits[i] = DS4_NEG_INF;
+        }
+    }
     topk_desc(logits, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
 
     float maxv = logits[selected[0]];
@@ -5672,6 +5678,11 @@ static void layer_topk_selected_experts_from_probs(
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+    }
+    if (g_expert_suppressed) {
+        for (int i = 0; i < DS4_N_EXPERT; i++) {
+            if (g_expert_suppressed[i]) selection[i] = DS4_NEG_INF;
+        }
     }
 
     topk_desc(selection, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
@@ -15645,6 +15656,9 @@ struct ds4_engine {
     uint32_t sae_n_features;
     uint32_t sae_d_model;
     uint32_t sae_layer;
+    /* LoRA adapters (stub — full implementation is a future multi-week task). */
+    ds4_lora_config lora_cfg;
+    bool lora_initialized;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -17072,6 +17086,9 @@ struct ds4_session {
 
     /* Expert routing log (MoE models only) */
     ds4_expert_log expert_log;
+    /* Expert suppression mask (MoE models only).
+     * If expert_suppressed[i] is true, expert i is skipped by the router. */
+    bool expert_suppressed[DS4_N_EXPERT];
 };
 
 /* =========================================================================
@@ -18898,6 +18915,8 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_free(s->cfg_session);
     ds4_activation_buffer_free(&s->capture_buf);
     free(s->capture_cfg.layer_indices);
+    if (g_expert_log == &s->expert_log) g_expert_log = NULL;
+    if (g_expert_suppressed == s->expert_suppressed) g_expert_suppressed = NULL;
     free(s);
 }
 
@@ -19076,10 +19095,12 @@ int ds4_session_expert_log_replay(const ds4_session *s) {
     ds4_kv_cache tmp_cache;
     kv_cache_init(&tmp_cache, (uint32_t)s->ctx_size, 0);
 
-    /* Temporarily point g_expert_log at this session's log so the CPU
-     * forward path writes entries into the right buffer. */
+    /* Temporarily point g_expert_log and g_expert_suppressed at this session
+     * so the CPU forward path writes entries and applies suppression. */
     ds4_expert_log *prev_log = g_expert_log;
     g_expert_log = &s->expert_log;
+    bool *prev_suppressed = g_expert_suppressed;
+    g_expert_suppressed = s->expert_suppressed;
 
     /* Replay every checkpoint token on CPU to populate the expert log. */
     for (uint32_t p = 0; p < (uint32_t)s->checkpoint.len; p++) {
@@ -19099,8 +19120,34 @@ int ds4_session_expert_log_replay(const ds4_session *s) {
     }
 
     g_expert_log = prev_log;
+    g_expert_suppressed = prev_suppressed;
     kv_cache_free(&tmp_cache);
     return 0;
+}
+
+/* =========================================================================
+ * Expert Suppression Implementation.
+ * ========================================================================= */
+
+int ds4_session_expert_suppress(ds4_session *s, int expert_id) {
+    if (!s || expert_id < 0 || expert_id >= (int)DS4_N_EXPERT) return 1;
+    s->expert_suppressed[expert_id] = true;
+    return 0;
+}
+
+void ds4_session_expert_unsuppress(ds4_session *s, int expert_id) {
+    if (!s || expert_id < 0 || expert_id >= (int)DS4_N_EXPERT) return;
+    s->expert_suppressed[expert_id] = false;
+}
+
+void ds4_session_expert_unsuppress_all(ds4_session *s) {
+    if (!s) return;
+    memset(s->expert_suppressed, 0, sizeof(s->expert_suppressed));
+}
+
+int ds4_session_expert_is_suppressed(const ds4_session *s, int expert_id) {
+    if (!s || expert_id < 0 || expert_id >= (int)DS4_N_EXPERT) return 0;
+    return s->expert_suppressed[expert_id] ? 1 : 0;
 }
 
 int ds4_session_power(ds4_session *s) {
@@ -19713,6 +19760,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             capture.layer_indices = s->capture_cfg.layer_indices;
             capture.n_layer_indices = s->capture_cfg.n_layers;
         }
+        bool *prev_suppressed = g_expert_suppressed;
+        g_expert_suppressed = s->expert_suppressed;
         forward_token_qwen_cpu(
                 s->logits,
                 &e->model,
@@ -19726,6 +19775,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 e->steering_ffn_scales,
                 sae_vec, sae_layer, sae_scale,
                 s->capture_enabled ? &capture : NULL);
+        g_expert_suppressed = prev_suppressed;
         /* Classifier-Free Guidance */
         if (s->cfg_session && s->cfg_scale != 0.0f) {
             if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {
@@ -20432,4 +20482,55 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+/* =========================================================================
+ * LoRA (Low-Rank Adaptation) — Stub Implementations.
+ *
+ * Full LoRA training requires:
+ *   - Backward pass through attention layers
+ *   - Adam optimizer state
+ *   - Metal shaders for adapter matmul
+ *   - Gradient checkpointing
+ *
+ * This is a multi-week project. The stubs below document the intended API
+ * and allow downstream code (Clojure FFI) to compile and link.
+ * ========================================================================= */
+
+int ds4_lora_init(ds4_engine *e, const ds4_lora_config *cfg) {
+    if (!e || !cfg) return 1;
+    if (e->lora_initialized) ds4_lora_free(e);
+    e->lora_cfg = *cfg;
+    e->lora_initialized = true;
+    fprintf(stderr, "ds4: LoRA initialized (rank=%d, alpha=%.1f, lr=%.2e) — STUB\n",
+            cfg->rank, cfg->lora_alpha, cfg->learning_rate);
+    return 0;
+}
+
+void ds4_lora_free(ds4_engine *e) {
+    if (!e) return;
+    memset(&e->lora_cfg, 0, sizeof(e->lora_cfg));
+    e->lora_initialized = false;
+}
+
+bool ds4_lora_enabled(const ds4_engine *e) {
+    return e && e->lora_initialized;
+}
+
+int ds4_lora_save(const ds4_engine *e, const char *path) {
+    if (!e || !e->lora_initialized || !path) return 1;
+    fprintf(stderr, "ds4: LoRA save to '%s' — STUB (not implemented)\n", path);
+    return 1;
+}
+
+int ds4_lora_load(ds4_engine *e, const char *path) {
+    if (!e || !path) return 1;
+    fprintf(stderr, "ds4: LoRA load from '%s' — STUB (not implemented)\n", path);
+    return 1;
+}
+
+int ds4_lora_config_get(const ds4_engine *e, ds4_lora_config *out_cfg) {
+    if (!e || !e->lora_initialized || !out_cfg) return 0;
+    *out_cfg = e->lora_cfg;
+    return 1;
 }

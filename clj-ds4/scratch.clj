@@ -1,15 +1,3 @@
-;; scratch.clj — Interactive REPL playground for clj-ds4
-;;
-;; Start the REPL:
-;;   clojure -M:repl
-;;
-;; Then load this file:
-;;   (load-file "scratch.clj")
-;;
-;; Evaluate individual comment blocks with your editor's "eval block" command
-;; (e.g. C-c C-c in CIDER, or place cursor inside comment and eval).
-;; Each block is self-contained and safe to run independently.
-
 (ns scratch
   (:require [ds4-clj.core :as ds4]))
 
@@ -525,7 +513,29 @@
   (def summary (ds4/expert-log-summary entries))
   (clojure.pprint/pprint summary)
 
-  ;; --- Step 5: Disable logging ---
+  ;; --- Step 5: Expert suppression (dropping) ---
+  ;; You can suppress specific experts to steer model behavior.
+  ;; This is useful for safety research: identify "refusal" experts
+  ;; and suppress them to study model behavior.
+  (def s2 (ds4/create-session engine 512))
+  (ds4/expert-log-enable! s2 :max-entries 256)
+  (ds4/generate engine s2 "2+2=" {:n-tokens 3 :temperature 0.0})
+  (def entries2 (ds4/expert-log-entries s2))
+  (def top-experts (take 4 (:selected (first entries2))))
+  (println "\nTop-4 experts for first token:" top-experts)
+
+  ;; Suppress them and regenerate
+  (doseq [eid top-experts]
+    (ds4/suppress-expert! s2 eid))
+  (def suppressed-text (ds4/generate engine s2 "2+2="
+                                      {:n-tokens 10 :temperature 0.0}))
+  (println "Suppressed output:" suppressed-text)
+
+  ;; Clear suppression
+  (ds4/unsuppress-all-experts! s2)
+  (ds4/free-session s2)
+
+  ;; --- Step 6: Disable logging ---
   (ds4/expert-log-disable! session)
 
   (ds4/free-session session)
@@ -581,5 +591,52 @@
         (ds4/tokens-free tokens))))
 
   (ds4/free-session session)
+  (ds4/close-engine engine)
+  )
+
+;; =========================================================================
+;; Workflow 16: LoRA (Low-Rank Adaptation) — Stub API
+;; =========================================================================
+;; LoRA adds small low-rank matrices to attention weights for efficient
+;; fine-tuning. Only the adapters are trained; the base model stays frozen.
+;;
+;; NOTE: This is a STUB API. Full implementation requires:
+;;   - Backward pass through attention layers
+;;   - Adam optimizer state
+;;   - Metal shaders for adapter matmul
+;;   - Gradient checkpointing
+;;   Estimated effort: 3-4 weeks. See FINETUNE_ROADMAP.md.
+;;
+;; For actual training today, use mlx_lm.lora in Python:
+;;   python -m mlx_lm.lora --model qwen3-coder --data examples.json
+(comment
+  (require '[ds4-clj.core :as ds4])
+
+  (def engine (ds4/open-engine))
+
+  ;; --- Step 1: Initialize LoRA adapters ---
+  ;; rank:     LoRA rank (8, 16, 32). Smaller = less memory, less capacity.
+  ;; alpha:    Scaling factor. Usually 2× rank.
+  ;; lr:       Adam learning rate. Start with 1e-4.
+  (ds4/lora-init! engine :rank 16 :alpha 32 :lr 1e-4)
+  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+
+  ;; --- Step 2: Train (stub — prints message) ---
+  ;; Future: (ds4/lora-train! engine examples {:epochs 3})
+  ;; For now, train with mlx_lm.lora in Python, then load adapter:
+
+  ;; --- Step 3: Save adapter (stub — not yet implemented) ---
+  ;; (ds4/lora-save! engine "math_adapter.bin")
+
+  ;; --- Step 4: Load adapter (stub — not yet implemented) ---
+  ;; (ds4/lora-load! engine "math_adapter.bin")
+
+  ;; --- Step 5: Generate with adapter active ---
+  ;; Future: adapters modify forward pass weights during generation
+
+  ;; --- Step 6: Clean up ---
+  (ds4/lora-free! engine)
+  (println "LoRA enabled after free?" (ds4/lora-enabled? engine))
+
   (ds4/close-engine engine)
   )

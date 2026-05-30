@@ -593,6 +593,50 @@
   (let [rc (c-expert-log-replay session)]
     (zero? rc)))
 
+;; --- Expert Suppression ---
+
+(def ^:private c-expert-suppress
+  (vp/c-fn (lookup-symbol "ds4_session_expert_suppress")
+           (fd :int [[:session [:* :void]]
+                     [:expert_id :int]])))
+
+(def ^:private c-expert-unsuppress
+  (vp/c-fn (lookup-symbol "ds4_session_expert_unsuppress")
+           (fd :void [[:session [:* :void]]
+                      [:expert_id :int]])))
+
+(def ^:private c-expert-unsuppress-all
+  (vp/c-fn (lookup-symbol "ds4_session_expert_unsuppress_all")
+           (fd :void [[:session [:* :void]]])))
+
+(def ^:private c-expert-is-suppressed
+  (vp/c-fn (lookup-symbol "ds4_session_expert_is_suppressed")
+           (fd :int [[:session [:* :void]]
+                     [:expert_id :int]])))
+
+(defn expert-suppress
+  "Suppress a specific expert ID. The router will skip this expert.
+  expert-id: 0..127 for Qwen3-Coder."
+  [^MemorySegment session expert-id]
+  (let [rc (c-expert-suppress session expert-id)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_session_expert_suppress failed" {:rc rc :expert-id expert-id})))))
+
+(defn expert-unsuppress
+  "Unsuppress a specific expert ID."
+  [^MemorySegment session expert-id]
+  (c-expert-unsuppress session expert-id))
+
+(defn expert-unsuppress-all
+  "Unsuppress all experts (clear the suppression mask)."
+  [^MemorySegment session]
+  (c-expert-unsuppress-all session))
+
+(defn expert-is-suppressed?
+  "Check if an expert is currently suppressed."
+  [^MemorySegment session expert-id]
+  (= 1 (c-expert-is-suppressed session expert-id)))
+
 ;; --- Speculative Decoding ---
 
 (def ^:private c-eval-speculative-argmax
@@ -622,3 +666,60 @@
                       {:rc n})))
     (vec (for [i (range n)]
            (.get ^MemorySegment accepted-seg (ValueLayout/JAVA_INT) (* i 4))))))
+
+;; --- LoRA (Low-Rank Adaptation) — Stub bindings ---
+
+(def ^:private c-lora-init
+  (vp/c-fn (lookup-symbol "ds4_lora_init")
+           (fd :int [[:engine [:* :void]]
+                     [:cfg [:* :void]]])))
+
+(def ^:private c-lora-free
+  (vp/c-fn (lookup-symbol "ds4_lora_free")
+           (fd :void [[:engine [:* :void]]])))
+
+(def ^:private c-lora-enabled
+  (vp/c-fn (lookup-symbol "ds4_lora_enabled")
+           (fd :int [[:engine [:* :void]]])))
+
+(def ^:private c-lora-save
+  (vp/c-fn (lookup-symbol "ds4_lora_save")
+           (fd :int [[:engine [:* :void]]
+                     [:path :string]])))
+
+(def ^:private c-lora-load
+  (vp/c-fn (lookup-symbol "ds4_lora_load")
+           (fd :int [[:engine [:* :void]]
+                     [:path :string]])))
+
+(defn lora-init
+  "Initialize LoRA adapters on an engine. cfg-seg is a 20-byte MemorySegment
+  with ds4_lora_config layout: [rank:int, lora_alpha:float, lr:float, batch:int, epochs:int]."
+  [^MemorySegment engine ^MemorySegment cfg-seg]
+  (let [rc (c-lora-init engine cfg-seg)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_lora_init failed" {:rc rc})))))
+
+(defn lora-free
+  "Release LoRA adapter memory."
+  [^MemorySegment engine]
+  (c-lora-free engine))
+
+(defn lora-enabled?
+  "Check if LoRA is initialized on an engine."
+  [^MemorySegment engine]
+  (= 1 (c-lora-enabled engine)))
+
+(defn lora-save
+  "Save LoRA adapters to a file. Returns true on success."
+  [^MemorySegment engine path]
+  (let [rc (c-lora-save engine path)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_lora_save failed" {:rc rc :path path})))))
+
+(defn lora-load
+  "Load LoRA adapters from a file. Returns true on success."
+  [^MemorySegment engine path]
+  (let [rc (c-lora-load engine path)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_lora_load failed" {:rc rc :path path})))))

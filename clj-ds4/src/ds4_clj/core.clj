@@ -714,6 +714,29 @@
                                     :layers-involved (into #{} (map :layer-idx) es)}])
                           by-token))}))
 
+;; --- Expert Suppression ---
+
+(defn suppress-expert!
+  "Suppress a specific expert ID. The router will skip this expert.
+  expert-id: 0..127 for Qwen3-Coder (128 experts total, top-8 active)."
+  [session expert-id]
+  (n/expert-suppress session expert-id))
+
+(defn unsuppress-expert!
+  "Unsuppress a specific expert ID."
+  [session expert-id]
+  (n/expert-unsuppress session expert-id))
+
+(defn unsuppress-all-experts!
+  "Unsuppress all experts (clear the suppression mask)."
+  [session]
+  (n/expert-unsuppress-all session))
+
+(defn expert-suppressed?
+  "Check if an expert is currently suppressed."
+  [session expert-id]
+  (n/expert-is-suppressed? session expert-id))
+
 ;; --- Speculative Decoding ---
 
 (defn eval-speculative-argmax
@@ -767,6 +790,59 @@
         (str/join (map #(n/token-text engine %) result)))
       (finally
         (n/tokens-free tokens)))))
+
+;; --- LoRA (Low-Rank Adaptation) — Stub API ---
+;;
+;; Full LoRA training is a multi-week project requiring:
+;;   - Backward pass through attention layers
+;;   - Adam optimizer state
+;;   - Metal shaders for adapter matmul
+;;   - Gradient checkpointing
+;;
+;; These stubs document the intended API and allow downstream code to compile.
+;; See FINETUNE_ROADMAP.md for the full implementation plan.
+
+(defn lora-init!
+  "Initialize LoRA adapters on an engine.
+
+  Options:
+    :rank         - LoRA rank (default 16)
+    :alpha        - Scaling factor alpha (default 32)
+    :lr           - Adam learning rate (default 1e-4)
+    :batch-size   - Training batch size (default 1)
+    :n-epochs     - Training epochs (default 3)
+
+  Returns the engine (with LoRA initialized)."
+  [engine & {:keys [rank alpha lr batch-size n-epochs]
+             :or {rank 16 alpha 32 lr 1e-4 batch-size 1 n-epochs 3}}]
+  (let [^MemorySegment cfg-seg (vp/alloc 20 4)]
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 0 (int rank))
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_FLOAT) 4 (float alpha))
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_FLOAT) 8 (float lr))
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 12 (int batch-size))
+    (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 16 (int n-epochs))
+    (n/lora-init engine cfg-seg)
+    engine))
+
+(defn lora-free!
+  "Release LoRA adapter memory from an engine."
+  [engine]
+  (n/lora-free engine))
+
+(defn lora-enabled?
+  "Check if LoRA is initialized on an engine."
+  [engine]
+  (n/lora-enabled? engine))
+
+(defn lora-save!
+  "Save LoRA adapters to a file."
+  [engine path]
+  (n/lora-save engine path))
+
+(defn lora-load!
+  "Load LoRA adapters from a file."
+  [engine path]
+  (n/lora-load engine path))
 
 ;; --- Utils ---
 

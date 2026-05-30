@@ -374,4 +374,53 @@ int ds4_session_expert_log_info(const ds4_session *s, uint32_t out[2]);
  * Returns 0 on success, 1 if not enabled or no checkpoint. */
 int ds4_session_expert_log_replay(const ds4_session *s);
 
+/* =========================================================================
+ * Expert Suppression (Safety Expert Dropping)
+ * ========================================================================= */
+
+/* Suppress a specific expert ID. The router will skip this expert.
+ * expert_id: 0..DS4_N_EXPERT-1
+ * Returns 0 on success, 1 if expert_id is out of range. */
+int ds4_session_expert_suppress(ds4_session *s, int expert_id);
+
+/* Unsuppress a specific expert ID. */
+void ds4_session_expert_unsuppress(ds4_session *s, int expert_id);
+
+/* Unsuppress all experts (clear the suppression mask). */
+void ds4_session_expert_unsuppress_all(ds4_session *s);
+
+/* Check if an expert is currently suppressed.
+ * Returns 1 if suppressed, 0 if not or if expert_id is invalid. */
+int ds4_session_expert_is_suppressed(const ds4_session *s, int expert_id);
+
+/* =========================================================================
+ * LoRA (Low-Rank Adaptation) — Stub API for future implementation.
+ * ========================================================================= */
+
+typedef struct {
+    int    rank;         /* LoRA rank (e.g. 8, 16, 32) */
+    float  lora_alpha;   /* Scaling factor */
+    float  learning_rate;/* Adam learning rate */
+    int    batch_size;   /* Training batch size */
+    int    n_epochs;     /* Training epochs */
+} ds4_lora_config;
+
+/* Initialize LoRA adapters on an engine. Returns 0 on success. */
+int ds4_lora_init(ds4_engine *e, const ds4_lora_config *cfg);
+
+/* Release LoRA adapter memory. */
+void ds4_lora_free(ds4_engine *e);
+
+/* Check if LoRA is initialized on an engine. */
+bool ds4_lora_enabled(const ds4_engine *e);
+
+/* Save LoRA adapters to a file. Returns 0 on success. */
+int ds4_lora_save(const ds4_engine *e, const char *path);
+
+/* Load LoRA adapters from a file. Returns 0 on success. */
+int ds4_lora_load(ds4_engine *e, const char *path);
+
+/* Get LoRA config. Returns 0 if LoRA is not initialized. */
+int ds4_lora_config_get(const ds4_engine *e, ds4_lora_config *out_cfg);
+
 #endif
