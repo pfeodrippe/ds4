@@ -729,6 +729,48 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                rows,
         float                   scale);
 
+/* =========================================================================
+ * LoRA (Low-Rank Adaptation) kernel.
+ * =========================================================================
+ *
+ * Applies y += scale * B * A * x on the GPU.
+ * A: [rank x input_dim], B: [output_dim x rank]
+ */
+int ds4_gpu_lora_apply_tensor(
+        ds4_gpu_tensor       *y,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *A,
+        const ds4_gpu_tensor *B,
+        uint32_t                input_dim,
+        uint32_t                output_dim,
+        uint32_t                rank,
+        float                   scale);
+
+/* Upload LoRA adapter weights to GPU buffers. Returns 1 on success. */
+int ds4_gpu_lora_upload(
+        void *engine_opaque,
+        uint32_t layer_idx,
+        uint32_t target,
+        const float *A,
+        const float *B,
+        uint32_t rank,
+        uint32_t input_dim,
+        uint32_t output_dim);
+
+/* Free all GPU LoRA buffers for an engine. */
+void ds4_gpu_lora_free(void *engine_opaque);
+
+/* Get LoRA GPU buffers for a specific layer/target. Returns 1 if found. */
+int ds4_gpu_lora_get_buffers(
+        void *engine_opaque,
+        uint32_t layer_idx,
+        uint32_t target,
+        ds4_gpu_tensor **A_out,
+        ds4_gpu_tensor **B_out,
+        uint32_t *rank_out,
+        uint32_t *input_dim_out,
+        uint32_t *output_dim_out);
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

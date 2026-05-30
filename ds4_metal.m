@@ -42,6 +42,7 @@ static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
+static id<MTLComputePipelineState> g_lora_matmul_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
 static id<MTLComputePipelineState> g_get_rows_i32_pipeline;
@@ -1517,6 +1518,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_LORA_SOURCE",        @"metal/lora.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -3290,6 +3292,23 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_lora_matmul"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_lora_matmul function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_lora_matmul_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_lora_matmul_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_lora_matmul pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_concat"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_concat function not found\n");
@@ -4649,6 +4668,7 @@ void ds4_gpu_cleanup(void) {
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
         [g_transient_buffers removeAllObjects];
         g_set_rows_f32_i32_pipeline = nil;
+        g_lora_matmul_pipeline = nil;
         g_get_rows_f32_pipeline = nil;
         g_get_rows_f16_pipeline = nil;
         g_get_rows_i32_pipeline = nil;
@@ -13247,6 +13267,175 @@ int ds4_gpu_directional_steering_project_tensor(
     }
 
     return 1;
+}
+
+/* =========================================================================
+ * LoRA (Low-Rank Adaptation) GPU kernel dispatch.
+ * ========================================================================= */
+
+int ds4_gpu_lora_apply_tensor(
+        ds4_gpu_tensor       *y,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *A,
+        const ds4_gpu_tensor *B,
+        uint32_t                input_dim,
+        uint32_t                output_dim,
+        uint32_t                rank,
+        float                   scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!y || !x || !A || !B || input_dim == 0 || output_dim == 0 || rank == 0 || scale == 0.0f) return 0;
+
+    @autoreleasepool {
+        if (!g_lora_matmul_pipeline) {
+            fprintf(stderr, "ds4: Metal LoRA pipeline not initialized\n");
+            return 0;
+        }
+
+        id<MTLBuffer> ybuf = ds4_gpu_tensor_buffer(y);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(A);
+        id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(B);
+        if (!ybuf || !xbuf || !abuf || !bbuf) {
+            fprintf(stderr, "ds4: Metal LoRA received nil buffers\n");
+            return 0;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_lora_matmul_pipeline];
+        [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(A) atIndex:0];
+        [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(B) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ybuf offset:ds4_gpu_tensor_offset(y) atIndex:3];
+        [enc setBytes:&rank      length:sizeof(rank)      atIndex:4];
+        [enc setBytes:&input_dim length:sizeof(input_dim) atIndex:5];
+        [enc setBytes:&output_dim length:sizeof(output_dim) atIndex:6];
+        [enc setBytes:&scale     length:sizeof(scale)     atIndex:7];
+
+        NSUInteger nth = g_lora_matmul_pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256u) nth = 256u;
+        NSUInteger n_groups = ((NSUInteger)output_dim + nth - 1u) / nth;
+        [enc dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        /* NOTE: Do NOT finish the command buffer here. This function is called
+         * inside the graph encode loop; the CB is finished by qwen_graph_eval_token. */
+    }
+
+    return 1;
+}
+
+/* =========================================================================
+ * LoRA GPU buffer management.
+ * ========================================================================= */
+
+static NSMutableDictionary *g_lora_gpu_buffers = nil;
+
+@interface DS4LoRAGPUBuffers : NSObject
+@property (nonatomic, strong) NSMutableDictionary *layers;
+@end
+
+@implementation DS4LoRAGPUBuffers
+- (instancetype)init {
+    self = [super init];
+    if (self) _layers = [NSMutableDictionary dictionary];
+    return self;
+}
+@end
+
+int ds4_gpu_lora_upload(
+        void *engine_opaque,
+        uint32_t layer_idx,
+        uint32_t target,
+        const float *A,
+        const float *B,
+        uint32_t rank,
+        uint32_t input_dim,
+        uint32_t output_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!engine_opaque || !A || !B || rank == 0 || input_dim == 0 || output_dim == 0) return 0;
+
+    @autoreleasepool {
+        if (!g_lora_gpu_buffers) {
+            g_lora_gpu_buffers = [NSMutableDictionary dictionary];
+        }
+
+        NSValue *key = [NSValue valueWithPointer:engine_opaque];
+        DS4LoRAGPUBuffers *bufs = g_lora_gpu_buffers[key];
+        if (!bufs) {
+            bufs = [[DS4LoRAGPUBuffers alloc] init];
+            g_lora_gpu_buffers[key] = bufs;
+        }
+
+        NSString *layer_key = [NSString stringWithFormat:@"%u_%u", layer_idx, target];
+
+        uint64_t a_bytes = (uint64_t)rank * input_dim * sizeof(float);
+        uint64_t b_bytes = (uint64_t)output_dim * rank * sizeof(float);
+
+        ds4_gpu_tensor *a_tensor = ds4_gpu_tensor_alloc(a_bytes);
+        ds4_gpu_tensor *b_tensor = ds4_gpu_tensor_alloc(b_bytes);
+        if (!a_tensor || !b_tensor) {
+            if (a_tensor) ds4_gpu_tensor_free(a_tensor);
+            if (b_tensor) ds4_gpu_tensor_free(b_tensor);
+            return 0;
+        }
+
+        if (ds4_gpu_tensor_write(a_tensor, 0, A, a_bytes) == 0 ||
+            ds4_gpu_tensor_write(b_tensor, 0, B, b_bytes) == 0) {
+            ds4_gpu_tensor_free(a_tensor);
+            ds4_gpu_tensor_free(b_tensor);
+            return 0;
+        }
+
+        bufs.layers[layer_key] = @[
+            (__bridge_transfer id)a_tensor,
+            (__bridge_transfer id)b_tensor,
+            @(rank),
+            @(input_dim),
+            @(output_dim),
+        ];
+    }
+
+    return 1;
+}
+
+void ds4_gpu_lora_free(void *engine_opaque) {
+    if (!g_lora_gpu_buffers || !engine_opaque) return;
+    @autoreleasepool {
+        NSValue *key = [NSValue valueWithPointer:engine_opaque];
+        [g_lora_gpu_buffers removeObjectForKey:key];
+    }
+}
+
+int ds4_gpu_lora_get_buffers(
+        void *engine_opaque,
+        uint32_t layer_idx,
+        uint32_t target,
+        ds4_gpu_tensor **A_out,
+        ds4_gpu_tensor **B_out,
+        uint32_t *rank_out,
+        uint32_t *input_dim_out,
+        uint32_t *output_dim_out) {
+    if (!g_lora_gpu_buffers || !engine_opaque) return 0;
+    @autoreleasepool {
+        NSValue *key = [NSValue valueWithPointer:engine_opaque];
+        DS4LoRAGPUBuffers *bufs = g_lora_gpu_buffers[key];
+        if (!bufs) return 0;
+
+        NSString *layer_key = [NSString stringWithFormat:@"%u_%u", layer_idx, target];
+        NSArray *entry = bufs.layers[layer_key];
+        if (!entry || entry.count < 5) return 0;
+
+        if (A_out) *A_out = (__bridge ds4_gpu_tensor *)entry[0];
+        if (B_out) *B_out = (__bridge ds4_gpu_tensor *)entry[1];
+        if (rank_out) *rank_out = (uint32_t)[entry[2] unsignedIntValue];
+        if (input_dim_out) *input_dim_out = (uint32_t)[entry[3] unsignedIntValue];
+        if (output_dim_out) *output_dim_out = (uint32_t)[entry[4] unsignedIntValue];
+        return 1;
+    }
 }
 
 static NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipelineState> pipeline) {

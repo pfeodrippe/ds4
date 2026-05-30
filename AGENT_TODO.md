@@ -129,19 +129,33 @@
 - [x] **Expert dropping test**: `test-expert-suppression-changes-output` — suppressing top-4 experts changes generation output; clearing suppression restores baseline output
 - [x] **scratch.clj**: Workflow 14 — expert logging with MoE introspection
 
-### 4. Fine-Tuning with N Examples (GPU-accelerated) — STUBS DONE
+### 4. Fine-Tuning with N Examples (GPU-accelerated) — DONE
 - [x] **Research**: LoRA/QLoRA fine-tuning documented in `FINETUNE_ROADMAP.md`
-  - Recommended path: MLX Python for training, DS4 for inference (adapter loading)
+  - Training: MLX Python → adapters.safetensors → DS4 binary format
+  - Inference: Load adapters in DS4 C/Metal, apply during forward pass
   - Memory budget: ~19GB for rank-16 LoRA on Qwen3-Coder 30B-A3B
-- [x] **C API**: Stub implementations of `ds4_lora_init/free/enabled/save/load` in `ds4.c`
-  - `ds4_lora_config` struct in `ds4.h`
-  - Stubs compile, print status, return errors for save/load (not yet implemented)
-- [x] **Clojure**: `lora-init!`, `lora-free!`, `lora-enabled?`, `lora-save!`, `lora-load!` in `core.clj`
-- [x] **Tests**: `test-lora-stub-api` — verifies init/free/enabled/save/load stubs
-- [ ] **Full implementation**: Metal shader `kernel_lora_matmul`, backward pass, Adam optimizer
-  - Estimated effort: 3-4 weeks (see `FINETUNE_ROADMAP.md`)
-- [ ] **MLX training script**: `tools/lora_train.py` using `mlx_lm.lora`
-- [ ] **CLI**: `ds4 finetune --examples examples.json --epochs 3 --output adapter.bin`
+- [x] **Python training script**: `tools/lora_train.py` — wrapper around `mlx_lm.lora`
+  - Tested with small model (Qwen2.5-0.5B), 5 iters, loss drops from 6.9 → 0.5
+  - Full command documented in scratch.clj Workflow 16
+- [x] **Python converter**: `tools/convert_lora.py` — safetensors → DS4 binary format
+  - Handles per-layer dimensions (q_proj d_model=2048, k/v_proj d_model=512, etc.)
+  - Tested with 112-layer adapter from Qwen2.5-0.5B
+- [x] **C inference**: Real `ds4_lora_load` — parse binary, allocate A/B matrices
+- [x] **C inference**: Apply adapters in forward pass (CPU path: q/k/v projections)
+- [x] **Metal GPU shader**: `kernel_lora_matmul` — natively applies LoRA on GPU
+  - Shader: `metal/lora.metal` — computes `y += scale * B * A * x`
+  - Pipeline: compiled into Metal library, initialized at startup
+  - Buffer management: `ds4_gpu_lora_upload/get_buffers/free` in ds4_metal.m
+  - Graph integration: applied after norm+rope in `qwen_graph_encode_token`
+  - Verified: shader modifies GPU buffers correctly
+- [x] **Clojure**: Real `lora-load!` that loads and applies adapters during generation
+- [x] **Tests**: 219 assertions, all passing
+- [x] **Effect test**: `test-lora-changes-output` — adapter measurably changes generation
+- [x] **scratch.clj**: Workflow 16 — complete end-to-end example with:
+  - Helper function `write-test-adapter` for quick experimentation
+  - Full MLX training instructions (Python terminal commands)
+  - Inference example (load adapter → generate → compare with/without)
+- [ ] **FULL C TRAINING**: Backward pass, Adam optimizer, gradient checkpointing (3-4 weeks)
 
 ## Future Ideas
 - [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)

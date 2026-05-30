@@ -5002,13 +5002,18 @@ static void layer_attn_norm_one(
  * projection back to embedding width.
  */
 
+/* Forward declarations for LoRA helpers (defined after ds4_engine struct) */
+static void lora_apply_to_q(float *q, const float *norm, uint32_t il);
+static void lora_apply_to_kv(float *kv, const float *normed, uint32_t il);
+
 /* Q projection is low-rank: Q8_0 into a 1024 vector, RMSNorm, then Q8_0 back
  * to 64 heads of width 512. */
 static void layer_q_projection_normed_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * norm,
-        float             * q) {
+        float             * q,
+        uint32_t            il) {
     float *qr = xmalloc(1024 * sizeof(qr[0]));
     float *qr_norm = xmalloc(1024 * sizeof(qr_norm[0]));
 
@@ -5019,6 +5024,9 @@ static void layer_q_projection_normed_one(
     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 
+    /* Apply LoRA if loaded */
+    lora_apply_to_q(q, norm, il);
+
     free(qr_norm);
     free(qr);
 }
@@ -5028,7 +5036,8 @@ static void layer_q_projection_with_lora_one(
         const ds4_layer_weights * layer,
         const float       * norm,
         float             * q,
-        float             * qr_norm) {
+        float             * qr_norm,
+        uint32_t            il) {
     float *qr = xmalloc(1024 * sizeof(qr[0]));
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
@@ -5036,6 +5045,9 @@ static void layer_q_projection_with_lora_one(
     rms_norm_weight(qr_norm, qr, q_a_norm, 1024, DS4_RMS_EPS);
     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+
+    /* Apply LoRA if loaded */
+    lora_apply_to_q(q, norm, il);
 
     free(qr);
 }
@@ -5045,13 +5057,17 @@ static void layer_kv_projection_normed_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * normed,
-        float             * kv) {
+        float             * kv,
+        uint32_t            il) {
     float *raw = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(raw[0]));
 
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
     matvec_q8_0(raw, model, layer->attn_kv, normed);
     rms_norm_weight(kv, raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+
+    /* Apply LoRA to k and v if loaded */
+    lora_apply_to_kv(kv, normed, il);
 
     free(raw);
 }
@@ -5062,13 +5078,17 @@ static void layer_q_projection_with_lora_one_decode_scratch(
         const float             * norm,
         float                   * q,
         float                   * qr_norm,
-        ds4_cpu_decode_scratch  * scratch) {
+        ds4_cpu_decode_scratch  * scratch,
+        uint32_t                  il) {
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
     matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
     rms_norm_weight(qr_norm, scratch->qr, q_a_norm, 1024, DS4_RMS_EPS);
     matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+
+    /* Apply LoRA if loaded */
+    lora_apply_to_q(q, norm, il);
 }
 
 static void layer_kv_projection_normed_one_decode_scratch(
@@ -5076,11 +5096,15 @@ static void layer_kv_projection_normed_one_decode_scratch(
         const ds4_layer_weights * layer,
         const float             * normed,
         float                   * kv,
-        ds4_cpu_decode_scratch  * scratch) {
+        ds4_cpu_decode_scratch  * scratch,
+        uint32_t                  il) {
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
     matvec_q8_0_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
     rms_norm_weight(kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+
+    /* Apply LoRA to k and v if loaded */
+    lora_apply_to_kv(kv, normed, il);
 }
 
 static float rope_yarn_ramp(float low, float high, int i0) {
@@ -7453,8 +7477,8 @@ static void layer_attention_raw_swa_one(
                           attn_residual, attn_cur, post, comb);
 
     layer_attn_norm_one(attn_norm, model, layer, attn_cur);
-    layer_q_projection_with_lora_one(model, layer, attn_norm, q, qr_norm);
-    layer_kv_projection_normed_one(model, layer, attn_norm, kv);
+    layer_q_projection_with_lora_one(model, layer, attn_norm, q, qr_norm, il);
+    layer_kv_projection_normed_one(model, layer, attn_norm, kv, il);
 
     rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
@@ -7928,13 +7952,15 @@ static void layer_forward_raw_swa_one(
                                                     scratch->attn_norm,
                                                     scratch->q,
                                                     scratch->qr_norm,
-                                                    scratch);
+                                                    scratch,
+                                                    il);
     if (profile) t_q = now_sec() - t0;
     t0 = profile ? now_sec() : 0.0;
     layer_kv_projection_normed_one_decode_scratch(model, layer,
                                                   scratch->attn_norm,
                                                   scratch->kv,
-                                                  scratch);
+                                                  scratch,
+                                                  il);
     if (profile) t_kv = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -8639,8 +8665,8 @@ static void layer_forward_self_one(
                           attn_residual, attn_cur, post, comb);
 
     layer_attn_norm_one(attn_norm, model, layer, attn_cur);
-    layer_q_projection_normed_one(model, layer, attn_norm, q);
-    layer_kv_projection_normed_one(model, layer, attn_norm, kv);
+    layer_q_projection_normed_one(model, layer, attn_norm, q, il);
+    layer_kv_projection_normed_one(model, layer, attn_norm, kv, il);
     rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(kv, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -10866,6 +10892,11 @@ static bool metal_graph_encode_output_head_batch(
     return ok;
 }
 
+/* Thread-local engine pointer for LoRA application in projection functions.
+ * Set at the start of evaluation, cleared at the end. */
+static __thread ds4_engine *g_lora_engine = NULL;
+static __thread float g_lora_scale = 0.0f;
+
 static bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -11038,6 +11069,29 @@ static bool qwen_graph_encode_token(
                                                             DS4_N_HEAD_DIM,
                                                             DS4_ROPE_FREQ_BASE,
                                                             DS4_RMS_EPS) != 0;
+        /* Apply LoRA on GPU if loaded (after norm+rope for q, after norm for kv) */
+        if (ok && g_lora_scale != 0.0f) {
+            ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
+            uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
+            /* q_proj LoRA */
+            if (ds4_gpu_lora_get_buffers(g_lora_engine, il, 0, &lora_A, &lora_B,
+                                         &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->q, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+            /* k_proj LoRA */
+            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 1, &lora_A, &lora_B,
+                                               &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->kv_raw, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+            /* v_proj LoRA */
+            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 2, &lora_A, &lora_B,
+                                               &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->kv, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qk_norm_rope_store");
         if (ok) ok = ds4_gpu_qwen_attention_tensor(g->heads,
                                                    g->q,
@@ -11582,8 +11636,8 @@ static void metal_graph_trace_layer_stages(
                           layer->hc_attn_base,
                           cpu_in_hc, cpu_attn_cur, post, comb);
     layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
-    layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm);
-    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
+    layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm, il);
+    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv, il);
     rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false);
     rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -11815,8 +11869,8 @@ static int metal_graph_decode_test(
                           layer->hc_attn_base,
                           cpu_hc, cpu_attn_cur, cpu_post, cpu_comb);
     layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
-    layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm);
-    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
+    layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm, 0);
+    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv, 0);
     rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
     rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -15656,10 +15710,85 @@ struct ds4_engine {
     uint32_t sae_n_features;
     uint32_t sae_d_model;
     uint32_t sae_layer;
-    /* LoRA adapters (stub — full implementation is a future multi-week task). */
+    /* LoRA adapters */
     ds4_lora_config lora_cfg;
-    bool lora_initialized;
+    ds4_lora_layer *lora_layers;
+    uint32_t        lora_n_layers;
+    bool            lora_initialized;
 };
+
+/* =========================================================================
+ * LoRA Adapter Helpers
+ * ========================================================================= */
+
+static void lora_apply_vector(
+        float       * y,
+        const float * x,
+        const float * A,
+        const float * B,
+        uint32_t      input_dim,
+        uint32_t      output_dim,
+        uint32_t      rank,
+        float         scale) {
+    if (!A || !B || scale == 0.0f) return;
+
+    /* tmp = A * x  (rank-dimensional) */
+    float *tmp = (float *)alloca(rank * sizeof(float));
+    for (uint32_t r = 0; r < rank; r++) {
+        float sum = 0.0f;
+        const float *a_row = A + (uint64_t)r * input_dim;
+        for (uint32_t d = 0; d < input_dim; d++) {
+            sum += a_row[d] * x[d];
+        }
+        tmp[r] = sum;
+    }
+
+    /* y += scale * B * tmp */
+    for (uint32_t d = 0; d < output_dim; d++) {
+        float sum = 0.0f;
+        const float *b_row = B + (uint64_t)d * rank;
+        for (uint32_t r = 0; r < rank; r++) {
+            sum += b_row[r] * tmp[r];
+        }
+        y[d] += scale * sum;
+    }
+}
+
+static ds4_lora_layer *lora_find_layer(
+        const ds4_engine *e,
+        uint32_t          layer_idx,
+        uint32_t          target) {
+    if (!e || !e->lora_initialized || !e->lora_layers) return NULL;
+    for (uint32_t i = 0; i < e->lora_n_layers; i++) {
+        if (e->lora_layers[i].layer_idx == layer_idx &&
+            e->lora_layers[i].target == target) {
+            return &e->lora_layers[i];
+        }
+    }
+    return NULL;
+}
+
+static void lora_apply_to_q(float *q, const float *norm, uint32_t il) {
+    if (!g_lora_engine || !g_lora_engine->lora_initialized) return;
+    ds4_lora_layer *lora = lora_find_layer(g_lora_engine, il, 0);
+    if (lora) {
+        float scale = g_lora_engine->lora_cfg.lora_alpha / g_lora_engine->lora_cfg.rank;
+        lora_apply_vector(q, norm, lora->A, lora->B, lora->d_model, lora->d_model, lora->rank, scale);
+    }
+}
+
+static void lora_apply_to_kv(float *kv, const float *normed, uint32_t il) {
+    if (!g_lora_engine || !g_lora_engine->lora_initialized) return;
+    float scale = g_lora_engine->lora_cfg.lora_alpha / g_lora_engine->lora_cfg.rank;
+    ds4_lora_layer *lora_k = lora_find_layer(g_lora_engine, il, 1);
+    if (lora_k) {
+        lora_apply_vector(kv, normed, lora_k->A, lora_k->B, lora_k->d_model, lora_k->d_model, lora_k->rank, scale);
+    }
+    ds4_lora_layer *lora_v = lora_find_layer(g_lora_engine, il, 2);
+    if (lora_v) {
+        lora_apply_vector(kv, normed, lora_v->A, lora_v->B, lora_v->d_model, lora_v->d_model, lora_v->rank, scale);
+    }
+}
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -18537,11 +18666,11 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     float *q0 = xmalloc((size_t)q_dim * sizeof(q0[0]));
-    layer_q_projection_normed_one(model, layer0, attn_norm0, q0);
+    layer_q_projection_normed_one(model, layer0, attn_norm0, q0, 0);
     print_vec_stats("blk.0 q", q0, q_dim);
 
     float *kv0 = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv0[0]));
-    layer_kv_projection_normed_one(model, layer0, attn_norm0, kv0);
+    layer_kv_projection_normed_one(model, layer0, attn_norm0, kv0, 0);
     print_vec_stats("blk.0 kv", kv0, DS4_N_HEAD_DIM);
     rope_tail_layer_inplace(q0, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
     rope_tail_layer_inplace(kv0, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, (uint32_t)(prompt->len - 1), 0, false);
@@ -18867,6 +18996,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->sae_scale = 0.0f;
     s->n_sae_features = 0;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    /* Always init cpu_cache — needed for LoRA fallback and other CPU paths */
+    kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
@@ -18898,8 +19029,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    /* cpu_cache is always initialized (even for Metal sessions, for fallback paths) */
+    kv_cache_free(&s->cpu_cache);
     if (ds4_session_is_cpu(s)) {
-        kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
     }
 #ifndef DS4_NO_GPU
@@ -19762,6 +19894,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         bool *prev_suppressed = g_expert_suppressed;
         g_expert_suppressed = s->expert_suppressed;
+        ds4_engine *prev_lora_engine = g_lora_engine;
+        float prev_lora_scale = g_lora_scale;
+        g_lora_engine = e;
+        g_lora_scale = (e && e->lora_initialized) ? (e->lora_cfg.lora_alpha / e->lora_cfg.rank) : 0.0f;
         forward_token_qwen_cpu(
                 s->logits,
                 &e->model,
@@ -19775,6 +19911,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 e->steering_ffn_scales,
                 sae_vec, sae_layer, sae_scale,
                 s->capture_enabled ? &capture : NULL);
+        g_lora_engine = prev_lora_engine;
+        g_lora_scale = prev_lora_scale;
         g_expert_suppressed = prev_suppressed;
         /* Classifier-Free Guidance */
         if (s->cfg_session && s->cfg_scale != 0.0f) {
@@ -19807,6 +19945,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         snprintf(err, errlen, "session has no valid checkpoint or exceeds context");
         return 1;
     }
+    ds4_engine *prev_lora_engine = g_lora_engine;
+    float prev_lora_scale = g_lora_scale;
+    g_lora_engine = e;
+    g_lora_scale = (e && e->lora_initialized) ? (e->lora_cfg.lora_alpha / e->lora_cfg.rank) : 0.0f;
     if (!qwen_graph_eval_token(&s->graph, &e->model, &e->weights,
                                token, (uint32_t)s->checkpoint.len, s->logits)) {
         snprintf(err, errlen, "%s Qwen decode failed", ds4_backend_name(e->backend));
@@ -19814,6 +19956,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    g_lora_engine = prev_lora_engine;
+    g_lora_scale = prev_lora_scale;
     /* Activation capture readback for Metal. */
     if (s->capture_enabled && s->capture_buf.n_tokens < s->capture_buf.capacity) {
         ds4_gpu_graph *g = &s->graph;
@@ -20509,6 +20653,16 @@ int ds4_lora_init(ds4_engine *e, const ds4_lora_config *cfg) {
 
 void ds4_lora_free(ds4_engine *e) {
     if (!e) return;
+    ds4_gpu_lora_free(e);
+    if (e->lora_layers) {
+        for (uint32_t i = 0; i < e->lora_n_layers; i++) {
+            free(e->lora_layers[i].A);
+            free(e->lora_layers[i].B);
+        }
+        free(e->lora_layers);
+        e->lora_layers = NULL;
+    }
+    e->lora_n_layers = 0;
     memset(&e->lora_cfg, 0, sizeof(e->lora_cfg));
     e->lora_initialized = false;
 }
@@ -20523,10 +20677,114 @@ int ds4_lora_save(const ds4_engine *e, const char *path) {
     return 1;
 }
 
+/* =========================================================================
+ * LoRA Adapter Application (CPU path)
+ * ========================================================================= */
 int ds4_lora_load(ds4_engine *e, const char *path) {
     if (!e || !path) return 1;
-    fprintf(stderr, "ds4: LoRA load from '%s' — STUB (not implemented)\n", path);
-    return 1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "ds4: LoRA load failed: cannot open '%s'\n", path);
+        return 1;
+    }
+
+    /* Read header (256 bytes) */
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "DS4LORA\x00", 8) != 0) {
+        fprintf(stderr, "ds4: LoRA load failed: bad magic in '%s'\n", path);
+        fclose(f);
+        return 1;
+    }
+
+    uint32_t version, rank, n_layers;
+    float alpha;
+    if (fread(&version, 4, 1, f) != 1 || version != 1) {
+        fprintf(stderr, "ds4: LoRA load failed: unsupported version %u\n", version);
+        fclose(f);
+        return 1;
+    }
+    fread(&rank, 4, 1, f);
+    fread(&alpha, 4, 1, f);
+    fread(&n_layers, 4, 1, f);
+
+    /* Skip reserved bytes */
+    fseek(f, 256, SEEK_SET);
+
+    /* Free existing adapters */
+    if (e->lora_initialized) ds4_lora_free(e);
+
+    /* Allocate layer table */
+    ds4_lora_layer *layers = (ds4_lora_layer *)calloc(n_layers, sizeof(ds4_lora_layer));
+    if (!layers) {
+        fclose(f);
+        return 1;
+    }
+
+    /* Read layer table */
+    for (uint32_t i = 0; i < n_layers; i++) {
+        uint32_t layer_idx, target, d_model, reserved;
+        fread(&layer_idx, 4, 1, f);
+        fread(&target, 4, 1, f);
+        fread(&d_model, 4, 1, f);
+        fread(&reserved, 4, 1, f);
+        layers[i].layer_idx = layer_idx;
+        layers[i].target = target;
+        layers[i].d_model = d_model;
+        layers[i].rank = rank;
+    }
+
+    /* Read A and B matrices for each layer */
+    for (uint32_t i = 0; i < n_layers; i++) {
+        uint64_t a_size = (uint64_t)rank * layers[i].d_model;
+        uint64_t b_size = (uint64_t)layers[i].d_model * rank;
+
+        layers[i].A = (float *)malloc(a_size * sizeof(float));
+        layers[i].B = (float *)malloc(b_size * sizeof(float));
+        if (!layers[i].A || !layers[i].B) {
+            /* Cleanup on error */
+            for (uint32_t j = 0; j <= i; j++) {
+                free(layers[j].A);
+                free(layers[j].B);
+            }
+            free(layers);
+            fclose(f);
+            return 1;
+        }
+
+        if (fread(layers[i].A, sizeof(float), a_size, f) != a_size ||
+            fread(layers[i].B, sizeof(float), b_size, f) != b_size) {
+            fprintf(stderr, "ds4: LoRA load failed: truncated data\n");
+            for (uint32_t j = 0; j <= i; j++) {
+                free(layers[j].A);
+                free(layers[j].B);
+            }
+            free(layers);
+            fclose(f);
+            return 1;
+        }
+    }
+
+    fclose(f);
+
+    e->lora_layers = layers;
+    e->lora_n_layers = n_layers;
+    e->lora_cfg.rank = rank;
+    e->lora_cfg.lora_alpha = alpha;
+    e->lora_initialized = true;
+
+    /* Upload to GPU if Metal is available */
+#ifndef DS4_NO_GPU
+    for (uint32_t i = 0; i < n_layers; i++) {
+        ds4_lora_layer *l = &layers[i];
+        ds4_gpu_lora_upload(e, l->layer_idx, l->target, l->A, l->B,
+                            l->rank, l->d_model, l->d_model);
+    }
+#endif
+
+    fprintf(stderr, "ds4: LoRA loaded from '%s' (%u layers, rank=%u, alpha=%.1f)\n",
+            path, n_layers, rank, alpha);
+    return 0;
 }
 
 int ds4_lora_config_get(const ds4_engine *e, ds4_lora_config *out_cfg) {

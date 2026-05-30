@@ -1,5 +1,7 @@
 (ns scratch
-  (:require [ds4-clj.core :as ds4]))
+  (:require [ds4-clj.core :as ds4])
+  (:import [java.io FileOutputStream]
+           [java.nio ByteBuffer ByteOrder]))
 
 ;; =============================================================================
 ;; WORKFLOW 1: Basic Generation
@@ -543,7 +545,11 @@
   )
 
 ;; =========================================================================
-;; Workflow 15: Self-Speculative Decoding (2-3x speedup)
+;; Workflow 15: Self-Speculative Decoding
+;;
+;; NOTE: On Qwen3-Coder 30B-A3B, this does NOT provide a speedup.
+;; Benchmark: 0.93× regular speed (431ms vs 402ms). The MTP draft overhead
+;; ≈ tokens saved. May help on larger models or longer sequences.
 ;; =========================================================================
 ;; DS4 has an internal speculative decoder using the MTP (Multi-Token
 ;; Prediction) head as a drafter. The MTP proposes 1-3 future tokens,
@@ -594,49 +600,107 @@
   (ds4/close-engine engine)
   )
 
-;; =========================================================================
-;; Workflow 16: LoRA (Low-Rank Adaptation) — Stub API
-;; =========================================================================
+;; Helper: create a synthetic test adapter (no training needed)
+(defn write-test-adapter [path]
+  (let [rank 8
+        d-model 2048
+        alpha 16.0
+        n-layers 1
+        A (float-array (for [r (range rank) d (range d-model)]
+                         (* 0.01 (- (Math/random) 0.5))))
+        B (float-array (for [d (range d-model) r (range rank)]
+                         (* 0.01 (- (Math/random) 0.5))))]
+    (with-open [out (FileOutputStream. path)]
+      (let [buf (ByteBuffer/allocate 256)]
+        (.order buf ByteOrder/LITTLE_ENDIAN)
+        (.put buf (byte-array (map byte (concat (vec "DS4LORA") [0]))) 0 8)
+        (.putInt buf 1) (.putInt buf rank) (.putFloat buf alpha)
+        (.putInt buf n-layers) (.put buf (byte-array 232) 0 232)
+        (.write out (.array buf) 0 256))
+      (let [buf (ByteBuffer/allocate 16)]
+        (.order buf ByteOrder/LITTLE_ENDIAN)
+        (.putInt buf 0) (.putInt buf 0) (.putInt buf d-model) (.putInt buf 0)
+        (.write out (.array buf) 0 16))
+      (let [buf (ByteBuffer/allocate (* rank d-model 4))]
+        (.order buf ByteOrder/LITTLE_ENDIAN)
+        (doseq [v A] (.putFloat buf v))
+        (.write out (.array buf) 0 (* rank d-model 4)))
+      (let [buf (ByteBuffer/allocate (* d-model rank 4))]
+        (.order buf ByteOrder/LITTLE_ENDIAN)
+        (doseq [v B] (.putFloat buf v))
+        (.write out (.array buf) 0 (* d-model rank 4))))
+    path))
+
+;; WORKFLOW 16: LoRA (Low-Rank Adaptation) — Full Pipeline
+;; =============================================================================
 ;; LoRA adds small low-rank matrices to attention weights for efficient
 ;; fine-tuning. Only the adapters are trained; the base model stays frozen.
 ;;
-;; NOTE: This is a STUB API. Full implementation requires:
-;;   - Backward pass through attention layers
-;;   - Adam optimizer state
-;;   - Metal shaders for adapter matmul
-;;   - Gradient checkpointing
-;;   Estimated effort: 3-4 weeks. See FINETUNE_ROADMAP.md.
+;; TRAINING (Python):
+;;   1. Prepare data in JSONL format:
+;;      {"text": "<|im_start|>user\nWhat is 2+2?\n<|im_end|>\n<|im_start|>assistant\n4<|im_end|>"}
+;;   2. Train with MLX:
+;;      python3 tools/lora_train.py --model qwen3-coder.gguf \\
+;;        --train-data examples.jsonl --output-dir ./lora_output \\
+;;        --rank 16 --alpha 32 --iters 100
+;;   3. Convert to DS4 format:
+;;      python3 tools/convert_lora.py \\
+;;        --input ./lora_output/adapters.safetensors \\
+;;        --output ./lora_output/ds4_lora.bin
 ;;
-;; For actual training today, use mlx_lm.lora in Python:
-;;   python -m mlx_lm.lora --model qwen3-coder --data examples.json
+;; INFERENCE (Clojure):
+;;   Load the adapter and generate with it applied automatically on Metal GPU.
+;;
+;; NOTE: LoRA adapters are applied natively on the Metal GPU path via
+;;       `kernel_lora_matmul`. No CPU fallback needed.
+;;       Full C/Metal training (backward pass, Adam optimizer) is planned
+;;       for future work. See FINETUNE_ROADMAP.md.
 (comment
   (require '[ds4-clj.core :as ds4])
 
-  (def engine (ds4/open-engine))
+  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
+                                :backend :metal))
 
-  ;; --- Step 1: Initialize LoRA adapters ---
-  ;; rank:     LoRA rank (8, 16, 32). Smaller = less memory, less capacity.
-  ;; alpha:    Scaling factor. Usually 2× rank.
-  ;; lr:       Adam learning rate. Start with 1e-4.
-  (ds4/lora-init! engine :rank 16 :alpha 32 :lr 1e-4)
+  ;; --- Step 1: Check no adapter loaded ---
+  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  ;; => false
+
+  ;; --- Step 2a: Quick test with synthetic adapter (no training needed) ---
+  (write-test-adapter "/tmp/test_adapter.bin")
+  (ds4/lora-load! engine "/tmp/test_adapter.bin")
   (println "LoRA enabled?" (ds4/lora-enabled? engine))
 
-  ;; --- Step 2: Train (stub — prints message) ---
-  ;; Future: (ds4/lora-train! engine examples {:epochs 3})
-  ;; For now, train with mlx_lm.lora in Python, then load adapter:
+  ;; --- Step 2b: Or load a real trained adapter ---
+  ;; (ds4/lora-load! engine "./lora_output/ds4_lora.bin")
+  ;; You should see: "ds4: LoRA loaded from '...' (N layers, rank=R, alpha=A)"
+  (println "LoRA enabled?" (ds4/lora-enabled? engine))
 
-  ;; --- Step 3: Save adapter (stub — not yet implemented) ---
-  ;; (ds4/lora-save! engine "math_adapter.bin")
+  ;; --- Step 3: Generate WITH adapter active ---
+  ;; The adapter is automatically applied on the Metal GPU during attention
+  (def session-with (ds4/create-session engine 512))
+  (def text-with (ds4/generate engine session-with
+                                "What is the capital of France?"
+                                {:n-tokens 20 :temperature 0.0}))
+  (println "With adapter:" text-with)
+  (ds4/free-session session-with)
 
-  ;; --- Step 4: Load adapter (stub — not yet implemented) ---
-  ;; (ds4/lora-load! engine "math_adapter.bin")
+  ;; --- Step 4: Unload adapter and generate WITHOUT ---
+  (ds4/lora-free! engine)
+  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  ;; => false
 
-  ;; --- Step 5: Generate with adapter active ---
-  ;; Future: adapters modify forward pass weights during generation
+  (def session-without (ds4/create-session engine 512))
+  (def text-without (ds4/generate engine session-without
+                                   "What is the capital of France?"
+                                   {:n-tokens 20 :temperature 0.0}))
+  (println "Without adapter:" text-without)
+  (ds4/free-session session-without)
+
+  ;; --- Step 5: Compare ---
+  ;; If the adapter was trained on a specific domain (e.g. math),
+  ;; the outputs should differ. The adapter biases the model toward
+  ;; its training distribution.
 
   ;; --- Step 6: Clean up ---
-  (ds4/lora-free! engine)
-  (println "LoRA enabled after free?" (ds4/lora-enabled? engine))
-
   (ds4/close-engine engine)
   )
