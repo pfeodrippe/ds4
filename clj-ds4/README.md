@@ -33,6 +33,49 @@ clojure -M:repl
 ;; Generate text
 (ds4/generate engine session "The capital of France is" {:n-tokens 10 :temperature 0.0})
 ;; => "The capital of France is Paris."
+```
+
+### Interactive Playground (`scratch.clj`)
+
+The best way to explore is `scratch.clj` — a REPL playground with 12 self-contained workflows in comment blocks:
+
+```bash
+clojure -M:repl
+```
+
+```clojure
+;; Load the playground
+(load-file "scratch.clj")
+
+;; Then evaluate individual comment blocks interactively:
+;; - WORKFLOW 1: Basic Generation
+;; - WORKFLOW 2: Interactive Iteration (check, modify, re-generate)
+;; - WORKFLOW 3: Activation Capture (inspect hidden states)
+;; - WORKFLOW 4: Steering Vectors (change model behavior)
+;; - WORKFLOW 5: Logit Lens (peek inside the model)
+;; - WORKFLOW 6: CFG (Classifier-Free Guidance)
+;; - WORKFLOW 7: Logit Bias (ban/boost tokens)
+;; - WORKFLOW 8: SAE Feature Steering
+;; - WORKFLOW 9: Token-by-Token Generation
+;; - WORKFLOW 10: Comparing Multiple Configurations
+;; - WORKFLOW 11: Capture + Analysis Pipeline
+;; - WORKFLOW 12: Tool-Augmented Generation
+```
+
+Each workflow is a `(comment ...)` block. Place your cursor inside a block and eval with your editor (C-c C-c in CIDER, or similar). Every block is self-contained — no order dependencies.
+
+### Quick Examples
+
+```clojure
+(require '[ds4-clj.core :as ds4])
+
+;; Open engine (Metal on macOS, CPU elsewhere)
+(def engine (ds4/open-engine :model-path "qwen3-coder.gguf" :backend :metal))
+(def session (ds4/create-session engine 512))
+
+;; Generate text
+(ds4/generate engine session "The capital of France is" {:n-tokens 10 :temperature 0.0})
+;; => "The capital of France is Paris."
 
 ;; Logit lens (works on both CPU and Metal!)
 (ds4/logit-lens engine session "The capital of France is" [0 12 24 35 47])
@@ -70,6 +113,7 @@ clojure -M:repl
 - `src/ds4_clj/native.clj` — Low-level Panama FFI bindings
 - `src/ds4_clj/core.clj` — High-level REPL-friendly API (including multi-vector steering)
 - `src/ds4_clj/examples.clj` — Interactive REPL examples (evaluate comment blocks)
+- `scratch.clj` — **Interactive REPL playground** with 12 self-contained workflows
 
 ## API Reference
 

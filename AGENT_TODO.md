@@ -53,6 +53,10 @@
   - test-basic-generation, test-generation-with-system-prompt, test-logit-lens
   - test-logit-bias, test-cfg, test-sae-steering, test-multi-sae-steering
   - test-steering-vector, test-activation-capture-metal (pure Clojure data, real model data)
+- [x] `clj-ds4/scratch.clj` — Interactive REPL playground with 12 self-contained comment-block workflows
+  - Basic generation, interactive iteration, activation capture, steering, logit lens
+  - CFG, logit bias, SAE steering, token-by-token, config comparison, analysis pipeline
+  - Tool-augmented generation. Compiles and loads successfully.
 - [ ] `clj-ds4/src/ds4_clj/ecs.clj` — vybe-flecs ECS integration (deferred; flecs overkill for this use case)
 
 ## Activation Capture (Complete)

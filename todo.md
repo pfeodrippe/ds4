@@ -8,7 +8,6 @@
 - [x] run existing eval — 33/92 passed (35.9%) on full run, 1h05m
 - [x] clojure harness support
   - [x] ability to stack activations modifiers (multi-vector + multi-feature SAE)
-- [ ] run from repl so we have models and other things loaded
 - [ ] viz
   - [ ] real-time
   - [ ] layers
