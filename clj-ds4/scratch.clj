@@ -633,74 +633,105 @@
 
 ;; WORKFLOW 16: LoRA (Low-Rank Adaptation) — Full Pipeline
 ;; =============================================================================
-;; LoRA adds small low-rank matrices to attention weights for efficient
-;; fine-tuning. Only the adapters are trained; the base model stays frozen.
+;; Fine-tune the model from the REPL. The adapter is a separate data structure
+;; loaded alongside the base model — both coexist in the same engine.
 ;;
-;; TRAINING (Python):
-;;   1. Prepare data in JSONL format:
-;;      {"text": "<|im_start|>user\nWhat is 2+2?\n<|im_end|>\n<|im_start|>assistant\n4<|im_end|>"}
-;;   2. Train with MLX:
-;;      python3 tools/lora_train.py --model qwen3-coder.gguf \\
-;;        --train-data examples.jsonl --output-dir ./lora_output \\
-;;        --rank 16 --alpha 32 --iters 100
-;;   3. Convert to DS4 format:
-;;      python3 tools/convert_lora.py \\
-;;        --input ./lora_output/adapters.safetensors \\
-;;        --output ./lora_output/ds4_lora.bin
+;; Architecture:
+;;   Base model (frozen, ~17GB GGUF)
+;;   + Adapter (trainable, ~10MB)
+;;   = Fine-tuned behavior
 ;;
-;; INFERENCE (Clojure):
-;;   Load the adapter and generate with it applied automatically on Metal GPU.
+;; The adapter can be loaded/unloaded at runtime without restarting the engine.
+;; This makes it a first-class data structure you manipulate from the REPL.
 ;;
-;; NOTE: LoRA adapters are applied natively on the Metal GPU path via
-;;       `kernel_lora_matmul`. No CPU fallback needed.
-;;       Full C/Metal training (backward pass, Adam optimizer) is planned
-;;       for future work. See FINETUNE_ROADMAP.md.
+;; NOTE: Training uses Python/MLX under the hood (gradient computation).
+;;       The REPL orchestrates the pipeline — you never leave Clojure.
 (comment
   (require '[ds4-clj.core :as ds4])
 
+  ;; --- Step 0: Open engine (base model) ---
   (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
                                 :backend :metal))
-
-  ;; --- Step 1: Check no adapter loaded ---
-  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  (println "Base model loaded. LoRA enabled?" (ds4/lora-enabled? engine))
   ;; => false
 
-  ;; --- Step 2a: Quick test with synthetic adapter (no training needed) ---
-  (write-test-adapter "/tmp/test_adapter.bin")
-  (ds4/lora-load! engine "/tmp/test_adapter.bin")
-  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  ;; ===================================================================
+  ;; PATH A: Full REPL-native training (prepare → train → load)
+  ;; ===================================================================
 
-  ;; --- Step 2b: Or load a real trained adapter ---
-  ;; (ds4/lora-load! engine "./lora_output/ds4_lora.bin")
-  ;; You should see: "ds4: LoRA loaded from '...' (N layers, rank=R, alpha=A)"
-  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  ;; --- Step 1: Prepare training data (pure Clojure) ---
+  (def training-data
+    [{:prompt "Write a Clojure function to reverse a list"
+      :response "(defn reverse-list [lst] (into () lst))"}
+     {:prompt "Write a Clojure function for factorial"
+      :response "(defn factorial [n] (if (<= n 1) 1 (* n (factorial (dec n)))))"}
+     {:prompt "Write a Clojure function to filter even numbers"
+      :response "(defn even-numbers [coll] (filter even? coll))"}
+     ;; ... add more examples
+     ])
 
-  ;; --- Step 3: Generate WITH adapter active ---
-  ;; The adapter is automatically applied on the Metal GPU during attention
+  (ds4/lora-prepare-data! "/tmp/my_ft_data.jsonl" training-data)
+
+  ;; --- Step 2: Train adapter (REPL calls Python/MLX) ---
+  ;; This returns the path to the converted DS4 adapter
+  (def adapter-path
+    (ds4/lora-train! :data "/tmp/my_ft_data.jsonl"
+                     :output-dir "/tmp/my_adapter"
+                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+                     :rank 8
+                     :alpha 16
+                     :iters 50))
+  ;; => "/tmp/my_adapter/ds4_lora.bin"
+
+  ;; --- Step 3: Load adapter into engine (no restart needed) ---
+  (ds4/lora-load! engine adapter-path)
+  (println "Adapter loaded. LoRA enabled?" (ds4/lora-enabled? engine))
+  ;; => true
+
+  ;; ===================================================================
+  ;; PATH B: Quick synthetic test (no training needed)
+  ;; ===================================================================
+
+  ;; Use this to verify the pipeline without waiting for training:
+  ;; (write-test-adapter "/tmp/test_adapter.bin")
+  ;; (ds4/lora-load! engine "/tmp/test_adapter.bin")
+
+  ;; ===================================================================
+  ;; PATH C: One-shot (train + load in one call)
+  ;; ===================================================================
+
+  ;; (ds4/lora-train-and-load! engine
+  ;;   :data "/tmp/my_ft_data.jsonl"
+  ;;   :output-dir "/tmp/my_adapter"
+  ;;   :iters 50)
+
+  ;; ===================================================================
+  ;; INFERENCE: Generate with adapter active
+  ;; ===================================================================
+
+  ;; The adapter is automatically applied on Metal GPU during attention.
+  ;; The base model weights stay frozen — only the adapter deltas are applied.
   (def session-with (ds4/create-session engine 512))
   (def text-with (ds4/generate engine session-with
-                                "What is the capital of France?"
-                                {:n-tokens 20 :temperature 0.0}))
+                                "Write a Clojure function to reverse a list"
+                                {:n-tokens 40 :temperature 0.0}))
   (println "With adapter:" text-with)
   (ds4/free-session session-with)
 
-  ;; --- Step 4: Unload adapter and generate WITHOUT ---
+  ;; --- Unload adapter (back to base model) ---
   (ds4/lora-free! engine)
-  (println "LoRA enabled?" (ds4/lora-enabled? engine))
+  (println "Adapter unloaded. LoRA enabled?" (ds4/lora-enabled? engine))
   ;; => false
 
   (def session-without (ds4/create-session engine 512))
   (def text-without (ds4/generate engine session-without
-                                   "What is the capital of France?"
-                                   {:n-tokens 20 :temperature 0.0}))
+                                   "Write a Clojure function to reverse a list"
+                                   {:n-tokens 40 :temperature 0.0}))
   (println "Without adapter:" text-without)
   (ds4/free-session session-without)
 
-  ;; --- Step 5: Compare ---
-  ;; If the adapter was trained on a specific domain (e.g. math),
-  ;; the outputs should differ. The adapter biases the model toward
-  ;; its training distribution.
+  ;; --- You can load a DIFFERENT adapter without restarting ---
+  ;; (ds4/lora-load! engine "/tmp/other_adapter/ds4_lora.bin")
 
-  ;; --- Step 6: Clean up ---
   (ds4/close-engine engine)
   )

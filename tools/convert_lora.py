@@ -40,8 +40,13 @@ except ImportError:
 
 
 def parse_layer_key(key: str):
-    """Parse MLX LoRA key like 'model.layers.0.self_attn.q_proj.lora_a' 
-    into (layer_idx, target, matrix_type)."""
+    """Parse MLX LoRA key into (layer_idx, target, matrix_type).
+    
+    Handles both standard and Qwen3-Coder MoE naming:
+      - model.layers.{idx}.self_attn.{q|k|v|o}_proj.lora_a
+      - model.layers.{idx}.mlp.gate.lora_a
+      - model.layers.{idx}.mlp.switch_mlp.{gate|down}_proj.lora_a
+    """
     parts = key.split('.')
     
     # Find layer index
@@ -51,22 +56,28 @@ def parse_layer_key(key: str):
             layer_idx = int(parts[i + 1])
             break
     
-    # Determine target
+    # Determine target (skip MoE switch_mlp layers, only handle attention)
     target = None
-    if 'q_proj' in parts:
-        target = 0
-    elif 'k_proj' in parts:
-        target = 1
-    elif 'v_proj' in parts:
-        target = 2
-    elif 'o_proj' in parts:
-        target = 3
-    elif 'gate_proj' in parts:
-        target = 4
-    elif 'up_proj' in parts:
-        target = 5
-    elif 'down_proj' in parts:
-        target = 6
+    if 'switch_mlp' in parts:
+        # MoE routed layers - skip for now
+        return None, None, None
+    elif 'self_attn' in parts:
+        if 'q_proj' in parts:
+            target = 0
+        elif 'k_proj' in parts:
+            target = 1
+        elif 'v_proj' in parts:
+            target = 2
+        elif 'o_proj' in parts:
+            target = 3
+    elif 'mlp' in parts:
+        # MLP layers
+        if 'gate_proj' in parts or ('gate' in parts and 'switch_mlp' not in parts):
+            target = 4
+        elif 'up_proj' in parts:
+            target = 5
+        elif 'down_proj' in parts:
+            target = 6
     
     # Determine matrix type
     matrix_type = None
@@ -88,17 +99,21 @@ def convert(input_path: str, output_path: str):
         keys = list(f.keys())
         
         # Collect layer info
-        layers = {}  # (layer_idx, target) -> {'A': tensor, 'B': tensor, 'd_model': int}
+        layers = {}  # (layer_idx, target) -> {'A': tensor, 'B': tensor}
         rank = None
         
         for key in keys:
             layer_idx, target, matrix_type = parse_layer_key(key)
             
             if layer_idx is None or target is None or matrix_type is None:
-                print(f"  Skipping: {key}")
-                continue
+                continue  # Skip silently (MoE layers, etc.)
             
             tensor = f.get_tensor(key)
+            
+            # Skip 3D tensors (MoE expert weights)
+            if len(tensor.shape) != 2:
+                print(f"  Skipping {key}: shape {tensor.shape} (not 2D)")
+                continue
             
             k = (layer_idx, target)
             if k not in layers:
@@ -106,22 +121,22 @@ def convert(input_path: str, output_path: str):
             layers[k][matrix_type] = tensor
             
             if matrix_type == 'A':
-                # Detect orientation: whichever dimension is smaller is likely rank
+                # MLX format: A is (input_dim, rank), B is (rank, output_dim)
+                # Smaller dimension is rank
                 if tensor.shape[0] < tensor.shape[1]:
                     detected_rank = tensor.shape[0]
-                    detected_d_model = tensor.shape[1]
                 else:
                     detected_rank = tensor.shape[1]
-                    detected_d_model = tensor.shape[0]
                 if rank is None:
                     rank = detected_rank
-                layers[k]['d_model'] = detected_d_model
+                elif rank != detected_rank:
+                    print(f"  Warning: inconsistent rank {detected_rank} vs {rank} for {key}")
         
         if not layers:
             print("ERROR: No valid LoRA layers found!")
             sys.exit(1)
         
-        # Determine alpha from key names or use default
+        # Determine alpha
         alpha = rank * 2
         
         # Sort layers
@@ -142,13 +157,15 @@ def convert(input_path: str, output_path: str):
             out.write(struct.pack('<I', n_layers))
             out.write(b'\x00' * 232)
             
-            # Layer table (with per-layer d_model)
+            # Layer table (with per-layer d_model = input_dim)
             for layer_idx, target in sorted_layers:
                 layer = layers[(layer_idx, target)]
-                layer_d_model = layer['d_model']
+                a = layer['A']
+                # MLX: A is (input_dim, rank) → input_dim = shape[0] if shape[0] > shape[1]
+                input_dim = a.shape[0] if a.shape[0] > a.shape[1] else a.shape[1]
                 out.write(struct.pack('<I', layer_idx))
                 out.write(struct.pack('<I', target))
-                out.write(struct.pack('<I', layer_d_model))
+                out.write(struct.pack('<I', input_dim))
                 out.write(struct.pack('<I', 0))
             
             # Data: A then B for each layer
@@ -156,18 +173,21 @@ def convert(input_path: str, output_path: str):
                 layer = layers[(layer_idx, target)]
                 a = layer['A']
                 b = layer['B']
-                layer_d_model = layer['d_model']
                 
-                    # A matrix: store as (rank, input_dim) floats
-                if a.shape[0] != rank:
+                # MLX format: A is (input_dim, rank), we want (rank, input_dim)
+                if a.shape[0] > a.shape[1]:
+                    # a is (input_dim, rank) → transpose to (rank, input_dim)
                     a = a.T
-                assert a.shape[0] == rank, f"A rank mismatch: {a.shape[0]} vs {rank}"
+                # Now a should be (rank, input_dim)
+                assert a.shape[0] == rank, f"A shape after transpose: {a.shape}, expected rank={rank} first"
                 out.write(a.astype('float32').tobytes())
                 
-                # B matrix: store as (output_dim, rank) floats
-                if b.shape[1] != rank:
+                # MLX format: B is (rank, output_dim), we want (output_dim, rank)
+                if b.shape[0] < b.shape[1]:
+                    # b is (rank, output_dim) → transpose to (output_dim, rank)
                     b = b.T
-                assert b.shape[1] == rank, f"B rank mismatch: {b.shape[1]} vs {rank}"
+                # Now b should be (output_dim, rank)
+                assert b.shape[1] == rank, f"B shape after transpose: {b.shape}, expected rank={rank} second"
                 out.write(b.astype('float32').tobytes())
         
         # Verify

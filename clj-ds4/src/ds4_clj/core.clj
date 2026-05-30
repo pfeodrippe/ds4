@@ -844,6 +844,88 @@
   [engine path]
   (n/lora-load engine path))
 
+;; --- REPL-Native Training Pipeline ---
+;; These functions wrap Python/MLX so you can orchestrate the entire
+;; fine-tuning workflow from the Clojure REPL without leaving it.
+
+(defn ^:private shell!
+  "Run a shell command, returning {:exit code :out stdout :err stderr}."
+  [cmd]
+  (let [pb (ProcessBuilder. (into-array String (clojure.string/split cmd #"\s+")))
+        _ (.inheritIO pb)
+        proc (.start pb)]
+    {:exit (.waitFor proc)}))
+
+(defn lora-prepare-data!
+  "Write training examples to a JSONL file for LoRA fine-tuning.
+
+  Each example should be a map with :prompt and :response keys.
+  The function wraps them in the chat format the model expects.
+
+  Example:
+    (lora-prepare-data! '/tmp/my_data.jsonl'
+      [{:prompt 'What is 2+2?' :response '4'}
+       {:prompt 'Capital of France?' :response 'Paris'}])"
+  [path examples]
+  (let [fmt (fn [{:keys [prompt response]}]
+              (str "{\"text\": \"<|im_start|>user\\n" prompt "\\n<|im_end|>\\n"
+                   "<|im_start|>assistant\\n" response "<|im_end|>\"}"))]
+    (spit path (clojure.string/join "\n" (map fmt examples)))
+    path))
+
+(defn lora-train!
+  "Train a LoRA adapter from the REPL using Python/MLX underneath.
+
+  Options:
+    :data         - Path to JSONL training data (required)
+    :output-dir   - Where to save adapters (default '/tmp/lora_train')
+    :model        - HuggingFace model id (default 'mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit')
+    :rank         - LoRA rank (default 8)
+    :alpha        - LoRA alpha (default 16)
+    :iters        - Training iterations (default 50)
+    :lr           - Learning rate (default 1e-4)
+    :max-seq-len  - Max sequence length (default 256)
+
+  Returns the path to the converted DS4 adapter file."
+  [& {:keys [data output-dir model rank alpha iters lr max-seq-len]
+      :or {output-dir "/tmp/lora_train"
+           model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+           rank 8 alpha 16 iters 50 lr 1e-4 max-seq-len 256}}]
+  (assert data ":data path to JSONL training file is required")
+  (let [train-script (str (System/getProperty "user.dir") "/../tools/lora_train.py")
+        convert-script (str (System/getProperty "user.dir") "/../tools/convert_lora.py")
+        adapter-dir (str output-dir "/adapters")
+        safetensors (str adapter-dir "/adapters.safetensors")
+        ds4-bin (str output-dir "/ds4_lora.bin")
+        train-cmd (format (str "python3 %s --model %s --data %s --output-dir %s "
+                               "--rank %d --alpha %d --iters %d --lr %f "
+                               "--max-seq-length %d")
+                          train-script model data output-dir
+                          rank alpha iters (double lr) max-seq-len)
+        convert-cmd (format "python3 %s --input %s --output %s"
+                            convert-script safetensors ds4-bin)]
+    (println "[lora-train!] Starting training...")
+    (println "  Command:" train-cmd)
+    (let [{:keys [exit]} (shell! train-cmd)]
+      (when-not (zero? exit)
+        (throw (ex-info "Training failed" {:exit exit :cmd train-cmd}))))
+    (println "[lora-train!] Training complete. Converting to DS4 format...")
+    (let [{:keys [exit]} (shell! convert-cmd)]
+      (when-not (zero? exit)
+        (throw (ex-info "Conversion failed" {:exit exit :cmd convert-cmd}))))
+    (println "[lora-train!] Adapter ready:" ds4-bin)
+    ds4-bin))
+
+(defn lora-train-and-load!
+  "One-shot: train an adapter and load it into an engine.
+
+  Combines lora-train! + lora-load! so the full pipeline is one call.
+  All options from lora-train! are accepted."
+  [engine & opts]
+  (let [adapter-path (apply lora-train! opts)]
+    (lora-load! engine adapter-path)
+    adapter-path))
+
 ;; --- Utils ---
 
 (defn eos-token

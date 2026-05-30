@@ -15773,7 +15773,7 @@ static void lora_apply_to_q(float *q, const float *norm, uint32_t il) {
     ds4_lora_layer *lora = lora_find_layer(g_lora_engine, il, 0);
     if (lora) {
         float scale = g_lora_engine->lora_cfg.lora_alpha / g_lora_engine->lora_cfg.rank;
-        lora_apply_vector(q, norm, lora->A, lora->B, lora->d_model, lora->d_model, lora->rank, scale);
+        lora_apply_vector(q, norm, lora->A, lora->B, lora->input_dim, lora->output_dim, lora->rank, scale);
     }
 }
 
@@ -15782,11 +15782,11 @@ static void lora_apply_to_kv(float *kv, const float *normed, uint32_t il) {
     float scale = g_lora_engine->lora_cfg.lora_alpha / g_lora_engine->lora_cfg.rank;
     ds4_lora_layer *lora_k = lora_find_layer(g_lora_engine, il, 1);
     if (lora_k) {
-        lora_apply_vector(kv, normed, lora_k->A, lora_k->B, lora_k->d_model, lora_k->d_model, lora_k->rank, scale);
+        lora_apply_vector(kv, normed, lora_k->A, lora_k->B, lora_k->input_dim, lora_k->output_dim, lora_k->rank, scale);
     }
     ds4_lora_layer *lora_v = lora_find_layer(g_lora_engine, il, 2);
     if (lora_v) {
-        lora_apply_vector(kv, normed, lora_v->A, lora_v->B, lora_v->d_model, lora_v->d_model, lora_v->rank, scale);
+        lora_apply_vector(kv, normed, lora_v->A, lora_v->B, lora_v->input_dim, lora_v->output_dim, lora_v->rank, scale);
     }
 }
 
@@ -20723,21 +20723,22 @@ int ds4_lora_load(ds4_engine *e, const char *path) {
 
     /* Read layer table */
     for (uint32_t i = 0; i < n_layers; i++) {
-        uint32_t layer_idx, target, d_model, reserved;
+        uint32_t layer_idx, target, input_dim, output_dim;
         fread(&layer_idx, 4, 1, f);
         fread(&target, 4, 1, f);
-        fread(&d_model, 4, 1, f);
-        fread(&reserved, 4, 1, f);
+        fread(&input_dim, 4, 1, f);
+        fread(&output_dim, 4, 1, f);
         layers[i].layer_idx = layer_idx;
         layers[i].target = target;
-        layers[i].d_model = d_model;
+        layers[i].input_dim = input_dim;
+        layers[i].output_dim = output_dim;
         layers[i].rank = rank;
     }
 
     /* Read A and B matrices for each layer */
     for (uint32_t i = 0; i < n_layers; i++) {
-        uint64_t a_size = (uint64_t)rank * layers[i].d_model;
-        uint64_t b_size = (uint64_t)layers[i].d_model * rank;
+        uint64_t a_size = (uint64_t)rank * layers[i].input_dim;
+        uint64_t b_size = (uint64_t)layers[i].output_dim * rank;
 
         layers[i].A = (float *)malloc(a_size * sizeof(float));
         layers[i].B = (float *)malloc(b_size * sizeof(float));
@@ -20778,7 +20779,7 @@ int ds4_lora_load(ds4_engine *e, const char *path) {
     for (uint32_t i = 0; i < n_layers; i++) {
         ds4_lora_layer *l = &layers[i];
         ds4_gpu_lora_upload(e, l->layer_idx, l->target, l->A, l->B,
-                            l->rank, l->d_model, l->d_model);
+                            l->rank, l->input_dim, l->output_dim);
     }
 #endif
 

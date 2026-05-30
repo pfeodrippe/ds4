@@ -407,12 +407,13 @@ typedef struct {
 
 /* Single LoRA adapter layer (e.g. q_proj, k_proj, v_proj for a transformer layer) */
 typedef struct {
-    uint32_t layer_idx;  /* Transformer layer index */
-    uint32_t target;     /* 0=q_proj, 1=k_proj, 2=v_proj, 3=o_proj, 4=gate, 5=up, 6=down */
-    uint32_t d_model;    /* Model hidden dimension (e.g. 2048) */
-    uint32_t rank;       /* LoRA rank */
-    float   *A;          /* [rank * input_dim] — down-projection (input → rank) */
-    float   *B;          /* [output_dim * rank] — up-projection (rank → output) */
+    uint32_t layer_idx;   /* Transformer layer index */
+    uint32_t target;      /* 0=q_proj, 1=k_proj, 2=v_proj, 3=o_proj, 4=gate, 5=up, 6=down */
+    uint32_t input_dim;   /* Input dimension (e.g. 2048 for q_proj input) */
+    uint32_t output_dim;  /* Output dimension (e.g. 4096 for q_proj output) */
+    uint32_t rank;        /* LoRA rank */
+    float   *A;           /* [rank * input_dim] — down-projection (input → rank) */
+    float   *B;           /* [output_dim * rank] — up-projection (rank → output) */
 } ds4_lora_layer;
 
 /* Initialize LoRA adapters on an engine. Returns 0 on success. */
