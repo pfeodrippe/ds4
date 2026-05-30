@@ -323,4 +323,49 @@ const float *ds4_activation_buffer_get(const ds4_activation_buffer *buf,
 int ds4_session_capture_info(const ds4_session *s, uint32_t out[4]);
 void ds4_activation_buffer_free(ds4_activation_buffer *buf);
 
+/* =========================================================================
+ * Expert Routing Logging (MoE models only).
+ * =========================================================================
+ *
+ * Log which experts are selected and their weights during MoE forward pass.
+ * This enables analysis of expert specialization, safety expert detection,
+ * and per-task expert tuning.
+ *
+ * Only works on models with MoE routing (e.g. Qwen3-Coder). */
+
+#define DS4_MAX_EXPERT_LOG_LAYERS  48
+#define DS4_MAX_EXPERT_LOG_TOKENS   256
+
+typedef struct {
+    uint32_t layer_idx;                   /* which layer */
+    uint32_t token_idx;                   /* which token */
+    int      selected[8]; /* selected expert IDs (must match DS4_N_EXPERT_USED) */
+    float    weights[8];  /* router weights (must match DS4_N_EXPERT_USED) */
+} ds4_expert_log_entry;
+
+typedef struct {
+    ds4_expert_log_entry *entries; /* flat array */
+    uint32_t n_entries;            /* captured so far */
+    uint32_t capacity;             /* max entries */
+    bool     enabled;              /* logging active? */
+} ds4_expert_log;
+
+/* Enable expert routing logging for a session.
+ * max_entries: maximum number of (layer, token) pairs to log.
+ * Returns 0 on success. */
+int ds4_session_expert_log_enable(ds4_session *s, uint32_t max_entries);
+
+/* Disable expert routing logging and free buffer. */
+void ds4_session_expert_log_disable(ds4_session *s);
+
+/* Get the expert routing log buffer (read-only). */
+const ds4_expert_log *ds4_session_expert_log(const ds4_session *s);
+
+/* Get a specific log entry by index. Returns NULL if out of bounds. */
+const ds4_expert_log_entry *ds4_expert_log_get(const ds4_expert_log *log, uint32_t idx);
+
+/* Read expert log metadata into out[2] = {n_entries, capacity}.
+ * Returns 0 if logging is not enabled. */
+int ds4_session_expert_log_info(const ds4_session *s, uint32_t out[2]);
+
 #endif

@@ -410,3 +410,175 @@
   (ds4/free-session session)
   (ds4/close-engine engine)
   )
+
+;; =============================================================================
+;; WORKFLOW 13: Conformal Certification — Statistical Guarantees for Reasoning
+;; =============================================================================
+
+(comment
+  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
+                                :backend :metal))
+  (def session (ds4/create-session engine 512))
+
+  ;; --- Step 1: Get token probabilities ---
+  (def tokens (ds4/generate-tokens engine session "2+2="
+                                   {:n-tokens 5 :temperature 0.0}))
+
+  ;; After generation, get the probability distribution
+  (def probs (ds4/token-probabilities session :k 10))
+  (clojure.pprint/pprint probs)
+  ;; => [{:id 15 :prob 0.92} {:id 42 :prob 0.03} ...]
+
+  ;; --- Step 2: Create a calibration set (normally you'd use many examples) ---
+  ;; For demo, we use a dummy calibration with known scores
+  (def calibration
+    {:threshold 2.0
+     :alpha 0.1
+     :scores [0.5 1.0 1.5 2.0 2.5]
+     :n-calibration 5})
+
+  ;; --- Step 3: Certify a reasoning prefix ---
+  ;; High-confidence token (prob=0.9) should be certified
+  (def cert-high (ds4/conformal-certify-prefix calibration [42] [0.9]))
+  (clojure.pprint/pprint cert-high)
+  ;; => {:certified? true
+  ;;     :score 0.105
+  ;;     :threshold 2.0
+  ;;     :coverage 0.9
+  ;;     :confidence 0.947}
+
+  ;; Low-confidence token (prob=0.01) should NOT be certified
+  (def cert-low (ds4/conformal-certify-prefix calibration [42] [0.01]))
+  (clojure.pprint/pprint cert-low)
+  ;; => {:certified? false
+  ;;     :score 4.605
+  ;;     :threshold 2.0
+  ;;     :coverage 0.9
+  ;;     :confidence 0.0}
+
+  ;; --- Step 4: Certify an entire generation ---
+  (def result (ds4/conformal-certify-generation
+                engine session "The sky is"
+                calibration
+                {:n-tokens 5 :temperature 0.0}))
+
+  (println "Generated text:" (:text result))
+  (println "Fully certified?" (:fully-certified? result))
+
+  ;; Inspect each prefix
+  (doseq [prefix (:prefixes result)]
+    (println (format "Prefix: %-20s | Certified: %-5s | Confidence: %.3f"
+                     (subs (:text prefix) 0 (min 20 (count (:text prefix))))
+                     (:certified? prefix)
+                     (:confidence prefix))))
+
+  ;; --- Step 5: Use certification to detect uncertainty ---
+  ;; If a prefix is NOT certified, the model is uncertain — you might want to
+  ;; stop, ask for clarification, or use think mode
+  (when-not (:fully-certified? result)
+    (println "WARNING: Model became uncertain during generation!"))
+
+  (ds4/free-session session)
+  (ds4/close-engine engine)
+  )
+
+;; =========================================================================
+;; Workflow 14: Expert Routing Log (MoE introspection)
+;; =========================================================================
+;; The Qwen3-Coder model uses Mixture-of-Experts (MoE) with 128 experts
+;; and top-8 routing. This workflow shows how to log which experts are
+;; activated for each token, enabling analysis of:
+;;   - Which experts handle math vs code vs natural language
+;;   - Whether safety-critical tokens use specific experts
+;;   - Expert specialization patterns
+;;
+;; NOTE: Expert logging is CPU-only. On Metal, MoE runs in GPU shaders.
+;;       Use :cpu backend to capture actual expert routing data.
+(comment
+  (require '[ds4-clj.core :as ds4])
+
+  ;; Use CPU backend for expert logging
+  (def engine (ds4/open-engine :backend :cpu))
+  (def session (ds4/create-session engine 512))
+
+  ;; --- Step 1: Enable expert logging ---
+  ;; max-entries: how many (layer, token) pairs to keep (default 256)
+  (ds4/expert-log-enable! session :max-entries 128)
+
+  ;; --- Step 2: Generate some tokens ---
+  (def text (ds4/generate engine session "2+2="
+                          {:n-tokens 10 :temperature 0.0}))
+  (println "Generated:" text)
+
+  ;; --- Step 3: Read expert log entries ---
+  (def entries (ds4/expert-log-entries session))
+  (println "Captured" (count entries) "expert routing entries")
+
+  ;; Each entry is a map:
+  ;;   {:layer-idx N         ; which MoE layer (0-47)
+  ;;    :token-idx M         ; which generation token
+  ;;    :selected [e1 e2 ...] ; top-8 expert IDs chosen by router
+  ;;    :weights [w1 w2 ...]} ; gate weights for each selected expert
+
+  ;; --- Step 4: Summarize ---
+  (def summary (ds4/expert-log-summary entries))
+  (clojure.pprint/pprint summary)
+
+  ;; --- Step 5: Disable logging ---
+  (ds4/expert-log-disable! session)
+
+  (ds4/free-session session)
+  (ds4/close-engine engine)
+  )
+
+;; =========================================================================
+;; Workflow 15: Self-Speculative Decoding (2-3x speedup)
+;; =========================================================================
+;; DS4 has an internal speculative decoder using the MTP (Multi-Token
+;; Prediction) head as a drafter. The MTP proposes 1-3 future tokens,
+;; then the full model verifies them in a batch. Accepted tokens are
+;; committed; rejected drafts are discarded.
+;;
+;; On Metal with MTP ready: can accept 2-3 tokens per call = 2-3x speedup.
+;; On CPU: falls back to regular eval (1 token per call).
+(comment
+  (require '[ds4-clj.core :as ds4]
+           '[clojure.string :as str])
+
+  (def engine (ds4/open-engine))
+  (def session (ds4/create-session engine 512))
+
+  ;; --- Step 1: Generate with speculative decoding ---
+  (def text (ds4/generate-speculative engine session
+                                      "The capital of France is"
+                                      {:n-tokens 15}))
+  (println "Speculative decode result:")
+  (println text)
+
+  ;; --- Step 2: Compare with regular greedy generation ---
+  (def regular (ds4/generate engine session
+                             "The capital of France is"
+                             {:n-tokens 15 :temperature 0.0}))
+  (println "\nRegular greedy result:")
+  (println regular)
+
+  ;; --- Step 3: Low-level API (eval-speculative-argmax) ---
+  ;; If you need more control, use the low-level API directly:
+  (let [tokens (ds4/encode-prompt engine nil "2+2=" :none)]
+    (try
+      (ds4/session-sync session tokens)
+      ;; Get first token with argmax
+      (let [first-tok (ds4/session-argmax session)
+            ;; Try to accept up to 5 more tokens speculatively
+            accepted (ds4/eval-speculative-argmax session first-tok 5
+                                                   (ds4/eos-token engine))]
+        (println "\nLow-level speculative:")
+        (println "First token:" first-tok)
+        (println "Accepted tokens:" accepted)
+        (println "Accepted text:" (str/join (map #(ds4/token-text engine %) accepted))))
+      (finally
+        (ds4/tokens-free tokens))))
+
+  (ds4/free-session session)
+  (ds4/close-engine engine)
+  )

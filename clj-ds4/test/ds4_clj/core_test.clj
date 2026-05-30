@@ -245,3 +245,123 @@
           "Capture info should be nil after clear")
       (is (nil? (ds4/capture-activations *session* layers))
           "capture-activations should be nil after clear")))))
+
+
+(deftest test-conformal-certification
+  (testing "Conformal certification API works with real model data"
+    ;; Generate some tokens and get probabilities
+    (let [tokens (ds4/generate-tokens *engine* *session* "2+2="
+                                      {:n-tokens 5 :temperature 0.0})]
+      (is (seq tokens) "Should generate tokens")
+
+      ;; Test token-probabilities
+      (let [probs (ds4/token-probabilities *session* :k 5)]
+        (is (vector? probs) "token-probabilities should return a vector")
+        (is (= 5 (count probs)) "Should return top-5 probabilities")
+        (is (map? (first probs)) "Each entry should be a map")
+        (is (contains? (first probs) :id) "Should have :id")
+        (is (contains? (first probs) :prob) "Should have :prob")
+        (is (float? (:prob (first probs))) "Probability should be a float")
+        (is (> (:prob (first probs)) 0) "Probability should be positive")
+        (is (<= (:prob (first probs)) 1.0) "Probability should be <= 1.0")
+        ;; Probabilities should be sorted descending
+        (is (apply >= (map :prob probs))
+            "Probabilities should be sorted descending"))
+
+      ;; Test conformal-certify-prefix with dummy calibration
+      (let [calibration {:threshold 2.0 :alpha 0.1 :scores [0.5 1.0 1.5 2.0 2.5] :n-calibration 5}
+            cert (ds4/conformal-certify-prefix calibration [42] [0.9])]
+        (is (map? cert) "conformal-certify-prefix should return a map")
+        (is (contains? cert :certified?))
+        (is (contains? cert :score))
+        (is (contains? cert :threshold))
+        (is (contains? cert :coverage))
+        (is (contains? cert :confidence))
+        (is (boolean? (:certified? cert)))
+        (is (float? (:score cert)))
+        (is (float? (:confidence cert)))
+        (is (>= (:confidence cert) 0.0))
+        (is (<= (:confidence cert) 1.0))
+        ;; High probability (0.9) should be certified with threshold 2.0
+        (is (:certified? cert)
+            "High probability token should be certified"))
+
+      ;; Test with low probability (should NOT be certified)
+      (let [calibration {:threshold 2.0 :alpha 0.1 :scores [0.5 1.0 1.5 2.0 2.5] :n-calibration 5}
+            cert (ds4/conformal-certify-prefix calibration [42] [0.01])]
+        (is (not (:certified? cert))
+            "Very low probability token should NOT be certified"))
+
+      ;; Test conformal-certify-generation (full pipeline)
+      (let [calibration {:threshold 3.0 :alpha 0.1 :scores [0.5 1.0 2.0 3.0] :n-calibration 4}
+            result (ds4/conformal-certify-generation
+                     *engine* *session* "The sky is"
+                     calibration
+                     {:n-tokens 5 :temperature 0.0})]
+        (is (map? result) "conformal-certify-generation should return a map")
+        (is (contains? result :text))
+        (is (contains? result :tokens))
+        (is (contains? result :prefixes))
+        (is (contains? result :fully-certified?))
+        (is (string? (:text result)))
+        (is (vector? (:tokens result)))
+        (is (vector? (:prefixes result)))
+        (is (boolean? (:fully-certified? result)))
+        ;; Each prefix should have certification info
+        (doseq [prefix (:prefixes result)]
+          (is (contains? prefix :text))
+          (is (contains? prefix :certified?))
+          (is (contains? prefix :score))
+          (is (contains? prefix :confidence)))))))
+
+(deftest test-expert-logging
+  (testing "Expert routing logging API — stubs compile and return expected shapes"
+    ;; Enable expert logging
+    (ds4/expert-log-enable! *session* :max-entries 64)
+
+    ;; Generate a few tokens to populate the log
+    (let [text (ds4/generate *engine* *session* "Hello"
+                             {:n-tokens 3 :temperature 0.0})]
+      (is (string? text)))
+
+    ;; Read entries — populated on CPU backend only.
+    ;; Metal uses GPU shaders for MoE; expert data would need shader-side capture.
+    (let [entries (ds4/expert-log-entries *session*)]
+      (is (vector? entries) "expert-log-entries should return a vector")
+      ;; On Metal: entries will be empty (GPU-side MoE)
+      ;; On CPU: entries will be populated with expert routing data
+      (is (every? map? entries) "Each entry should be a map if present")
+
+      ;; Summary works on empty or populated entries
+      (let [summary (ds4/expert-log-summary entries)]
+        (is (map? summary))
+        (is (number? (:total-entries summary)))
+        (is (number? (:n-layers summary)))
+        (is (number? (:n-tokens summary)))))
+
+    ;; Disable and verify cleanup
+    (ds4/expert-log-disable! *session*)
+    (let [entries (ds4/expert-log-entries *session*)]
+      (is (empty? entries) "Should be empty after disable"))))
+
+(deftest test-speculative-decoding
+  (testing "Speculative decoding produces valid text"
+    ;; Note: speculative decode only works on Metal with MTP ready.
+    ;; On CPU it falls back to regular eval. Either way it should produce text.
+    (let [text (ds4/generate-speculative *engine* *session* "The sky is"
+                                          {:n-tokens 10})]
+      (is (string? text) "Should return a string")
+      (is (> (count text) 0) "Should produce non-empty text"))
+
+    ;; Compare with regular generation — both should be valid
+    (let [regular (ds4/generate *engine* *session* "The sky is"
+                                {:n-tokens 10 :temperature 0.0})
+          speculative (ds4/generate-speculative *engine* *session* "The sky is"
+                                                 {:n-tokens 10})]
+      (is (string? regular))
+      (is (string? speculative))
+      (is (> (count regular) 0))
+      (is (> (count speculative) 0))
+      ;; They may differ (speculative uses MTP drafter) or be the same
+      ;; (if MTP is not ready or draft is rejected). Both are valid.
+      )))

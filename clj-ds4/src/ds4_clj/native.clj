@@ -190,6 +190,18 @@
                      [:out [:* :void]]
                      [:k :int]])))
 
+(def ^:private c-session-top-logprobs
+  (vp/c-fn (lookup-symbol "ds4_session_top_logprobs")
+           (fd :int [[:session [:* :void]]
+                     [:out [:* :void]]
+                     [:k :int]])))
+
+(def ^:private c-session-token-logprob
+  (vp/c-fn (lookup-symbol "ds4_session_token_logprob")
+           (fd :int [[:session [:* :void]]
+                     [:token :int]
+                     [:out [:* :void]]])))
+
 (def ^:private c-load-sae
   (vp/c-fn (lookup-symbol "ds4_engine_load_sae")
            (fd :int [[:engine [:* :void]]
@@ -235,6 +247,31 @@
            (fd :pointer [[:buf [:* :void]]
                          [:token_idx :int]
                          [:layer_idx :int]])))
+
+;; --- Expert Routing Log ---
+
+(def ^:private c-expert-log-enable
+  (vp/c-fn (lookup-symbol "ds4_session_expert_log_enable")
+           (fd :int [[:session [:* :void]]
+                     [:max_entries :int]])))
+
+(def ^:private c-expert-log-disable
+  (vp/c-fn (lookup-symbol "ds4_session_expert_log_disable")
+           (fd :void [[:session [:* :void]]])))
+
+(def ^:private c-expert-log
+  (vp/c-fn (lookup-symbol "ds4_session_expert_log")
+           (fd :pointer [[:session [:* :void]]])))
+
+(def ^:private c-expert-log-info
+  (vp/c-fn (lookup-symbol "ds4_session_expert_log_info")
+           (fd :int [[:session [:* :void]]
+                     [:out [:* :int]]])))
+
+(def ^:private c-expert-log-get
+  (vp/c-fn (lookup-symbol "ds4_expert_log_get")
+           (fd :pointer [[:log [:* :void]]
+                         [:idx :int]])))
 
 ;; --- Helpers ---
 
@@ -395,6 +432,33 @@
                :logprob (:logprob pmap)}))
           (range n))))
 
+(defn session-top-logprobs
+  "Get top-k logprobs from the final output layer. Returns a sequence of maps."
+  [^MemorySegment session k]
+  (let [layout (.layout DS4TokenScore)
+        out-size (* k (.byteSize layout))
+        out-seg (vp/alloc out-size (.byteAlignment layout))
+        n (c-session-top-logprobs session out-seg k)]
+    (mapv (fn [i]
+            (let [score-seg (.asSlice ^MemorySegment out-seg (* i (.byteSize layout)))
+                  pmap (vp/p->map score-seg DS4TokenScore)]
+              {:id (:id pmap)
+               :logit (:logit pmap)
+               :logprob (:logprob pmap)}))
+          (range n))))
+
+(defn session-token-logprob
+  "Get the logprob for a specific token id. Returns a map or nil."
+  [^MemorySegment session token-id]
+  (let [layout (.layout DS4TokenScore)
+        out-seg (vp/alloc (.byteSize layout) (.byteAlignment layout))
+        n (c-session-token-logprob session token-id out-seg)]
+    (when (= 1 n)
+      (let [pmap (vp/p->map out-seg DS4TokenScore)]
+        {:id (:id pmap)
+         :logit (:logit pmap)
+         :logprob (:logprob pmap)}))))
+
 (defn load-sae
   "Load a SAE decoder file."
   [^MemorySegment engine path]
@@ -479,3 +543,69 @@
   (let [^MemorySegment act-ptr (c-activation-buffer-get buf-ptr token-idx layer-idx)]
     (when (and act-ptr (not (.equals act-ptr (MemorySegment/ofAddress 0))))
       act-ptr)))
+
+;; --- Expert Routing Log ---
+
+(defn expert-log-enable
+  "Enable expert routing logging for a session. max-entries defaults to 256."
+  [^MemorySegment session max-entries]
+  (let [rc (c-expert-log-enable session max-entries)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_session_expert_log_enable failed" {:rc rc})))))
+
+(defn expert-log-disable
+  "Disable expert routing logging and free buffer."
+  [^MemorySegment session]
+  (c-expert-log-disable session))
+
+(defn expert-log-info
+  "Read expert log metadata into out[2] = {n_entries, capacity}.
+  Returns 0 if logging is not enabled."
+  [^MemorySegment session ^MemorySegment out-seg]
+  (c-expert-log-info session out-seg))
+
+(defn expert-log-ptr
+  "Get the expert log pointer from a session. Returns nil if not enabled."
+  [^MemorySegment session]
+  (let [^MemorySegment log-ptr (c-expert-log session)]
+    (when (and log-ptr (not (.equals log-ptr (MemorySegment/ofAddress 0))))
+      log-ptr)))
+
+(defn expert-log-get
+  "Get a pointer to a specific log entry by index.
+  Returns nil if out of bounds."
+  [^MemorySegment log-ptr idx]
+  (let [^MemorySegment entry-ptr (c-expert-log-get log-ptr idx)]
+    (when (and entry-ptr (not (.equals entry-ptr (MemorySegment/ofAddress 0))))
+      ;; ds4_expert_log_entry: 4 + 4 + 8*4 + 8*4 = 72 bytes
+      (.reinterpret ^MemorySegment entry-ptr 72))))
+
+;; --- Speculative Decoding ---
+
+(def ^:private c-eval-speculative-argmax
+  (vp/c-fn (lookup-symbol "ds4_session_eval_speculative_argmax")
+           (fd :int [[:session [:* :void]]
+                     [:first_token :int]
+                     [:max_tokens :int]
+                     [:eos_token :int]
+                     [:accepted [:* :int]]
+                     [:accepted_cap :int]
+                     [:err [:* :byte]]
+                     [:errlen :long]])))
+
+(defn eval-speculative-argmax
+  "Evaluate using speculative decoding (MTP-based draft + verify).
+
+  Returns a vector of accepted token ids, or throws on error.
+  On CPU backend, falls back to regular eval (returns [first_token])."
+  [^MemorySegment session first-token max-tokens eos-token]
+  (let [accepted-cap (min max-tokens 256)
+        ^MemorySegment accepted-seg (vp/alloc (* accepted-cap 4) 4)
+        err-buf (alloc-err-buf)
+        n (c-eval-speculative-argmax session first-token max-tokens eos-token
+                                     accepted-seg accepted-cap err-buf 256)]
+    (when (< n 0)
+      (throw (ex-info (str "ds4_session_eval_speculative_argmax failed: " (err-string err-buf))
+                      {:rc n})))
+    (vec (for [i (range n)]
+           (.get ^MemorySegment accepted-seg (ValueLayout/JAVA_INT) (* i 4))))))

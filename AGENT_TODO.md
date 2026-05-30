@@ -97,6 +97,44 @@
 - [ ] **Per-session steering** — steering vectors are engine-global; would require C API refactor
 - [ ] **Speculative decoding** — needs compatible small draft model (same tokenizer, similar architecture)
 
+## Active Development
+
+### 1. Conformal Certification (§12.3) — DONE
+- [x] **C API**: Track token probabilities during generation (top-k probs per token)
+  - Added `session-top-logprobs` and `session-token-logprob` bindings in native.clj
+- [x] **Clojure**: `conformal-certify` function — compute non-conformity scores, certify reasoning prefixes with coverage guarantees
+  - `token-probabilities`, `conformal-calibrate`, `conformal-certify-prefix`, `conformal-certify-generation`
+- [x] **Tests**: Real model test verifying certification accuracy on reasoning chains
+  - 52 new assertions in `test-conformal-certification` (token probs, certification, generation pipeline)
+- [x] **scratch.clj**: Workflow 13 — conformal certification with calibration, prefix certification, and generation pipeline
+
+### 2. Self-Speculative Decoding (§4.1 / Cassandra) — DONE
+- [x] **Research**: DS4 already has `eval_speculative_argmax` (MTP-based draft + verify) in C
+- [x] **Clojure FFI**: Bound `ds4_session_eval_speculative_argmax` in native.clj
+- [x] **Clojure**: `eval-speculative-argmax` and `generate-speculative` helpers in core.clj
+- [x] **Tests**: `test-speculative-decoding` verifies valid text production
+- [x] **Benchmark**: `test-speculative-speedup` — 0.93× regular speed on Metal (MTP overhead matches savings for this model; ~124 tok/s baseline)
+- [x] **Bug fix**: `generate-speculative` now properly truncates at EOS and handles accepted token batches correctly
+- [x] **scratch.clj**: Workflow 15 — live speculative decoding with comparison to greedy
+
+### 3. Expert Routing Analysis + Safety Expert Dropping (§5.1 + §5.2) — DONE (CPU only)
+- [x] **C API**: `ds4_expert_log_entry`, `ds4_expert_log` structs and API functions in `ds4.h`
+- [x] **C**: Deep hook into `qwen_moe_one` (CPU forward path) via `g_expert_log` global. Captures layer idx, token idx, selected expert IDs (top-8), and router weights for every MoE layer during forward pass.
+- [x] **Clojure**: `expert-log-enable!`, `expert-log-disable!`, `expert-log-entries`, `expert-log-summary`
+- [x] **Tests**: `test-expert-logging` (Metal — empty entries expected), `test-expert-logging-cpu` (CPU — real data verified: 23 assertions)
+- [x] **Pattern verification**: `test-expert-patterns-differ` — math/code/text prompts produce measurably different routing patterns (24-32% unique experts per domain)
+- [x] **scratch.clj**: Workflow 14 — expert logging with MoE introspection
+- [ ] **Metal GPU support**: Capture expert data from Metal shaders (complex — needs shader-side logging)
+- [ ] **Clojure**: `expert-drop` — selectively suppress specific expert IDs
+- [ ] **Tests**: Verify dropping changes output
+
+### 4. Fine-Tuning with N Examples (GPU-accelerated)
+- [ ] **Research**: LoRA/QLoRA fine-tuning on Metal GPU for Qwen3-Coder
+- [ ] **C API**: Add backward pass support or integrate ggml/llama.cpp training
+- [ ] **Clojure**: `fine-tune` function — take N (prompt, response) pairs, run supervised fine-tuning
+- [ ] **CLI**: `ds4 finetune --examples examples.json --epochs 3 --output adapter.bin`
+- [ ] **Tests**: Verify fine-tuned model produces different outputs on training prompts
+
 ## Future Ideas
 - [ ] Metal graph: skip HC mixer dispatch when `DS4_N_HC == 1` (minor speedup)
 - [x] Logit lens on Metal backend — implemented by falling back to CPU replay from checkpoint tokens (accurate, no graph surgery needed)

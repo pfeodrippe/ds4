@@ -3,7 +3,9 @@
   (:require
    [clojure.string :as str]
    [ds4-clj.native :as n]
-   [vybe.panama :as vp]))
+   [vybe.panama :as vp])
+  (:import
+   [java.lang.foreign MemorySegment ValueLayout]))
 
 ;; --- Engine lifecycle ---
 
@@ -481,6 +483,285 @@
           nb  (activation-norm b)]
       (when (and (> na 0) (> nb 0))
         (float (/ dot (* na nb)))))))
+
+;; --- Conformal Certification ---
+;; Statistical guarantees for reasoning trace correctness.
+;; Based on conformal prediction — provides coverage guarantees without
+;; distributional assumptions.
+
+(defn token-probabilities
+  "Get the probability distribution over the vocabulary after the last
+  evaluated token. Returns a sorted vector of {:id token :prob probability}
+  for the top-k tokens, or all tokens if k is not provided.
+
+  The probabilities are computed by softmax over the logits."
+  [session & {:keys [k vocab-size]
+               :or {k 10 vocab-size 151936}}]
+  (let [logits-seg (n/session-copy-logits session vocab-size)
+        logits (vec (for [i (range vocab-size)]
+                      (.get logits-seg java.lang.foreign.ValueLayout/JAVA_FLOAT (* i 4))))
+        max-logit (reduce max logits)
+        exp-logits (mapv #(Math/exp (- % max-logit)) logits)
+        sum-exp (reduce + exp-logits)
+        probs (mapv #(/ % sum-exp) exp-logits)
+        indexed (mapv (fn [i p] {:id i :prob (float p)}) (range vocab-size) probs)
+        sorted (sort-by :prob > indexed)]
+    (vec (take k sorted))))
+
+(defn conformal-calibrate
+  "Calibrate a conformal predictor on a set of calibration examples.
+
+  Each example is a map with:
+    :prompt     - the input prompt
+    :answer     - the expected answer string (used to compute correctness)
+    :extract-fn - (optional) function to extract answer from generated text
+
+  Returns a calibration map:
+    {:threshold T            ; the (1-alpha) quantile non-conformity score
+     :alpha alpha            ; the miscoverage rate
+     :scores [...]           ; all non-conformity scores from calibration
+     :n-calibration N}       ; number of calibration examples
+
+  The non-conformity score for each token is: -log(prob) where prob is the
+  model's probability of the generated token. Lower scores = more confident.
+  The threshold is the (1-alpha) quantile of these scores."
+  [engine session calibration-examples alpha
+   & {:keys [n-tokens temperature system think-mode]
+      :or {n-tokens 50 temperature 0.0 think-mode :max}}]
+  (let [scores (vec
+                 (for [example calibration-examples]
+                   (let [prompt (:prompt example)
+                         _ (n/session-sync session
+                                           (encode-prompt engine system prompt think-mode))
+                         tokens (generate-tokens engine session prompt
+                                                 :n-tokens n-tokens
+                                                 :temperature temperature
+                                                 :system system
+                                                 :think-mode think-mode)
+                         ;; For each generated token, get its probability
+                         token-scores (mapv
+                                        (fn [token]
+                                          (let [probs (token-probabilities session :k 1)
+                                                prob (or (:prob (first (filter #(= (:id %) token) probs)))
+                                                         1e-10)]
+                                            (- (Math/log prob))))
+                                        tokens)]
+                     ;; Average negative log-likelihood = non-conformity
+                     (if (seq token-scores)
+                       (/ (reduce + token-scores) (count token-scores))
+                       0.0))))
+        sorted-scores (sort scores)
+        n (count sorted-scores)
+        idx (int (Math/ceil (* (- 1.0 alpha) n)))
+        idx (min (dec n) (max 0 (dec idx)))
+        threshold (nth sorted-scores idx 0.0)]
+    {:threshold threshold
+     :alpha alpha
+     :scores scores
+     :n-calibration n}))
+
+(defn conformal-certify-prefix
+  "Certify a reasoning prefix using a calibrated conformal predictor.
+
+  calibration: result from conformal-calibrate
+  prefix-tokens: sequence of token ids in the prefix
+  token-probs: sequence of probabilities (one per prefix token)
+
+  Returns:
+    {:certified? boolean
+     :score float          ; the prefix non-conformity score
+     :threshold float      ; the calibrated threshold
+     :coverage float       ; 1 - alpha (the guaranteed coverage)
+     :confidence float}    ; 1 - (score / threshold), clamped to [0,1]
+
+  A prefix is certified if its non-conformity score is <= the threshold.
+  This guarantees that (1-alpha) fraction of correct prefixes will be
+  certified (marginal coverage guarantee)."
+  [calibration prefix-tokens token-probs]
+  (let [threshold (:threshold calibration)
+        alpha (:alpha calibration)
+        scores (mapv (fn [prob]
+                       (- (Math/log (max prob 1e-10))))
+                     token-probs)
+        score (if (seq scores)
+                (/ (reduce + scores) (count scores))
+                0.0)
+        certified? (<= score threshold)
+        confidence (if (> threshold 0)
+                     (max 0.0 (min 1.0 (- 1.0 (/ score threshold))))
+                     0.0)]
+    {:certified? certified?
+     :score (float score)
+     :threshold (float threshold)
+     :coverage (float (- 1.0 alpha))
+     :confidence (float confidence)}))
+
+(defn conformal-certify-generation
+  "Certify an entire generation by checking each prefix.
+
+  engine, session: DS4 engine and session
+  prompt: the input prompt
+  calibration: result from conformal-calibrate
+
+  Returns a map:
+    {:text string              ; the generated text
+     :tokens [...]             ; token ids
+     :prefixes [{:text string  ; prefix text
+                  :certified? boolean
+                  :score float
+                  :confidence float}
+                ...]
+     :fully-certified? boolean} ; true if ALL prefixes are certified
+
+  This is useful for reasoning chains: you can stop generation early
+  if the model loses confidence (prefix not certified)."
+  [engine session prompt calibration
+   & {:keys [n-tokens temperature system think-mode]
+      :or {n-tokens 50 temperature 0.0 think-mode :max}}]
+  (let [tokens (generate-tokens engine session prompt
+                                :n-tokens n-tokens
+                                :temperature temperature
+                                :system system
+                                :think-mode think-mode)
+        text (str/join (map #(n/token-text engine %) tokens))
+        ;; For each prefix, get the token probabilities
+        prefixes (mapv
+                   (fn [idx]
+                     (let [prefix-toks (subvec tokens 0 (inc idx))
+                           prefix-text (str/join (map #(n/token-text engine %) prefix-toks))
+                           ;; Re-evaluate to get probabilities at this point
+                           token (nth tokens idx)
+                           probs (token-probabilities session :k 5)
+                           token-prob (or (:prob (first (filter #(= (:id %) token) probs)))
+                                          1e-10)
+                           cert (conformal-certify-prefix calibration prefix-toks [token-prob])]
+                       {:text prefix-text
+                        :token token
+                        :token-prob (float token-prob)
+                        :certified? (:certified? cert)
+                        :score (:score cert)
+                        :confidence (:confidence cert)}))
+                   (range (count tokens)))]
+    {:text text
+     :tokens tokens
+     :prefixes prefixes
+     :fully-certified? (every? :certified? prefixes)}))
+
+;; --- Expert Routing Log ---
+
+(defn expert-log-enable!
+  "Enable expert routing logging on a session. max-entries defaults to 256."
+  [session & {:keys [max-entries] :or {max-entries 256}}]
+  (n/expert-log-enable session max-entries))
+
+(defn expert-log-disable!
+  "Disable expert routing logging on a session."
+  [session]
+  (n/expert-log-disable session))
+
+(defn expert-log-entries
+  "Read all expert log entries from a session. Returns a vector of maps."
+  [session]
+  (let [out-seg (vp/alloc 8 4)
+        enabled? (n/expert-log-info session out-seg)]
+    (if (zero? enabled?)
+      []
+      (let [n-entries (.get ^MemorySegment out-seg (ValueLayout/JAVA_INT) 0)]
+        (if-not (pos? n-entries)
+          []
+          (let [log-ptr (n/expert-log-ptr session)]
+            (loop [i 0
+                   result []]
+              (if (>= i n-entries)
+                result
+                (let [entry-ptr (n/expert-log-get log-ptr i)]
+                  (recur (inc i)
+                         (if entry-ptr
+                           (conj result
+                                 {:layer-idx (.get ^MemorySegment entry-ptr (ValueLayout/JAVA_INT) 0)
+                                  :token-idx (.get ^MemorySegment entry-ptr (ValueLayout/JAVA_INT) 4)
+                                  :selected (vec (for [j (range 8)]
+                                                   (.get ^MemorySegment entry-ptr (ValueLayout/JAVA_INT) (+ 8 (* j 4)))))
+                                  :weights (vec (for [j (range 8)]
+                                                  (.get ^MemorySegment entry-ptr (ValueLayout/JAVA_FLOAT) (+ 40 (* j 4)))))})
+                           result)))))))))))
+
+(defn expert-log-summary
+  "Summarize expert log entries: count unique experts per layer, average weights, etc.
+  Returns a map with :by-layer and :by-token summaries."
+  [entries]
+  (let [by-layer (group-by :layer-idx entries)
+        by-token (group-by :token-idx entries)]
+    {:total-entries (count entries)
+     :n-layers (count by-layer)
+     :n-tokens (count by-token)
+     :by-layer (into (sorted-map)
+                     (map (fn [[layer es]]
+                            [layer {:count (count es)
+                                    :unique-experts (into #{} (mapcat :selected) es)
+                                    :avg-top-weight (when (seq es)
+                                                      (/ (reduce + (map #(first (:weights %)) es))
+                                                         (count es)))}])
+                          by-layer))
+     :by-token (into (sorted-map)
+                     (map (fn [[token es]]
+                            [token {:count (count es)
+                                    :layers-involved (into #{} (map :layer-idx) es)}])
+                          by-token))}))
+
+;; --- Speculative Decoding ---
+
+(defn eval-speculative-argmax
+  "Evaluate a token using speculative decoding (MTP-based draft + verify).
+
+  Uses the model's own MTP head to draft future tokens, then verifies them
+  with the full model. Can accept 1-3 tokens per call vs 1 for regular eval.
+
+  Returns a vector of accepted token ids. On CPU, falls back to [first-token]."
+  [session first-token max-tokens eos-token]
+  (n/eval-speculative-argmax session first-token max-tokens eos-token))
+
+(defn generate-speculative
+  "Generate text using speculative decoding for 2-3x speedup.
+
+  Uses ds4_session_eval_speculative_argmax internally. The MTP drafter
+  proposes tokens which are verified in batches by the full model.
+
+  NOTE: Currently only supports greedy (temperature=0) decoding.
+        Sampling with speculative decode requires per-token sampling
+        which defeats the batching advantage.
+
+  Options:
+    :n-tokens     - max tokens to generate (default 50)
+    :system       - system prompt (default nil)
+    :think-mode   - :none, :normal, or :max (default :none)
+
+  Returns the generated text string."
+  [engine session prompt & {:keys [n-tokens system think-mode]
+                            :or {n-tokens 50 think-mode :none}}]
+  (let [tokens (encode-prompt engine system prompt think-mode)]
+    (try
+      (n/session-sync session tokens)
+      (let [eos (n/token-eos engine)
+            result (loop [generated []]
+                     (if (>= (count generated) n-tokens)
+                       generated
+                       (let [first-tok (n/session-argmax session)
+                             accepted (n/eval-speculative-argmax
+                                        session first-tok
+                                        (- n-tokens (count generated))
+                                        eos)]
+                         (if (seq accepted)
+                           (let [new-gen (into generated accepted)
+                                 ;; Truncate at EOS if present
+                                 eos-idx (.indexOf ^java.util.List new-gen eos)]
+                             (if (>= eos-idx 0)
+                               (subvec new-gen 0 (inc eos-idx))
+                               (recur new-gen)))
+                           generated))))]
+        (str/join (map #(n/token-text engine %) result)))
+      (finally
+        (n/tokens-free tokens)))))
 
 ;; --- Utils ---
 

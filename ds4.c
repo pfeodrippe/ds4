@@ -464,6 +464,7 @@ static uint64_t hash_bytes(const void *ptr, uint64_t len) {
 
 static bool g_alloc_guard_enabled;
 static const char *g_alloc_guard_phase;
+static ds4_expert_log *g_expert_log = NULL;
 
 static DS4_MAYBE_UNUSED void ds4_alloc_guard_begin(const char *phase) {
     g_alloc_guard_phase = phase;
@@ -4059,8 +4060,13 @@ static void qwen_router_topk(
     for (int i = 0; i < DS4_N_EXPERT_USED; i++) weight[i] = (float)((double)weight[i] / sum);
 }
 
+static void expert_log_push_entry(uint32_t layer_idx, uint32_t token_idx,
+                                   const int selected[DS4_N_EXPERT_USED],
+                                   const float weights[DS4_N_EXPERT_USED]);
+
 static void qwen_moe_one(float *out, const ds4_model *model,
-                         const ds4_layer_weights *layer, const float *x) {
+                         const ds4_layer_weights *layer, const float *x,
+                         uint32_t il, int token) {
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
     float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
@@ -4070,6 +4076,7 @@ static void qwen_moe_one(float *out, const ds4_model *model,
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     qwen_router_topk(selected, expert_weight, model, layer, x);
+    expert_log_push_entry(il, (uint32_t)token, selected, expert_weight);
     for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
         const uint32_t expert = (uint32_t)selected[i];
         matvec_k_expert(gate, model, layer->ffn_gate_exps, x, expert);
@@ -5717,6 +5724,8 @@ static void layer_routed_moe_one(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    expert_log_push_entry(il, (uint32_t)token, selected, expert_weight);
+
     if (!trace) {
         matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                             layer->ffn_gate_exps,
@@ -5810,6 +5819,8 @@ static void layer_routed_moe_one_prealloc(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+
+    expert_log_push_entry(il, (uint32_t)token, selected, expert_weight);
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
@@ -8187,7 +8198,7 @@ static void forward_token_qwen_cpu(
 
         const float *ffn_norm = tensor_data(model, layer->ffn_norm);
         rms_norm_weight(norm, x, ffn_norm, d, DS4_RMS_EPS);
-        qwen_moe_one(ffn_out, model, layer, norm);
+        qwen_moe_one(ffn_out, model, layer, norm, il, token);
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
@@ -8337,7 +8348,7 @@ static int forward_token_qwen_cpu_layer_logprobs(
 
         const float *ffn_norm = tensor_data(model, layer->ffn_norm);
         rms_norm_weight(norm, x, ffn_norm, d, DS4_RMS_EPS);
-        qwen_moe_one(ffn_out, model, layer, norm);
+        qwen_moe_one(ffn_out, model, layer, norm, il, token);
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
@@ -17058,6 +17069,9 @@ struct ds4_session {
     ds4_capture_config capture_cfg;
     ds4_activation_buffer capture_buf;
     bool capture_enabled;
+
+    /* Expert routing log (MoE models only) */
+    ds4_expert_log expert_log;
 };
 
 /* =========================================================================
@@ -18995,6 +19009,62 @@ void ds4_activation_buffer_free(ds4_activation_buffer *buf) {
     if (!buf) return;
     free(buf->data);
     memset(buf, 0, sizeof(*buf));
+}
+
+/* =========================================================================
+ * Expert Routing Log Implementation.
+ * ========================================================================= */
+
+static void expert_log_push_entry(uint32_t layer_idx, uint32_t token_idx,
+                                   const int selected[DS4_N_EXPERT_USED],
+                                   const float weights[DS4_N_EXPERT_USED]) {
+    ds4_expert_log *log = g_expert_log;
+    if (!log || !log->enabled) return;
+    if (log->n_entries >= log->capacity) return;
+    ds4_expert_log_entry *e = &log->entries[log->n_entries++];
+    e->layer_idx = layer_idx;
+    e->token_idx = token_idx;
+    for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+        e->selected[i] = selected[i];
+        e->weights[i] = weights[i];
+    }
+}
+
+int ds4_session_expert_log_enable(ds4_session *s, uint32_t max_entries) {
+    if (!s) return 1;
+    ds4_session_expert_log_disable(s);
+    if (max_entries == 0) max_entries = DS4_MAX_EXPERT_LOG_TOKENS;
+    if (max_entries > DS4_MAX_EXPERT_LOG_TOKENS) max_entries = DS4_MAX_EXPERT_LOG_TOKENS;
+    s->expert_log.entries = xcalloc(max_entries, sizeof(ds4_expert_log_entry));
+    s->expert_log.capacity = max_entries;
+    s->expert_log.n_entries = 0;
+    s->expert_log.enabled = true;
+    g_expert_log = &s->expert_log;
+    return 0;
+}
+
+void ds4_session_expert_log_disable(ds4_session *s) {
+    if (!s) return;
+    if (g_expert_log == &s->expert_log) g_expert_log = NULL;
+    free(s->expert_log.entries);
+    memset(&s->expert_log, 0, sizeof(s->expert_log));
+}
+
+const ds4_expert_log *ds4_session_expert_log(const ds4_session *s) {
+    if (!s || !s->expert_log.enabled) return NULL;
+    return &s->expert_log;
+}
+
+const ds4_expert_log_entry *ds4_expert_log_get(const ds4_expert_log *log, uint32_t idx) {
+    if (!log || !log->entries || idx >= log->n_entries) return NULL;
+    return &log->entries[idx];
+}
+
+int ds4_session_expert_log_info(const ds4_session *s, uint32_t out[2]) {
+    if (!s || !s->expert_log.enabled || !out) return 0;
+    out[0] = s->expert_log.n_entries;
+    out[1] = s->expert_log.capacity;
+    return 1;
 }
 
 int ds4_session_power(ds4_session *s) {
