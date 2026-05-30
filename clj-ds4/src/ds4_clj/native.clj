@@ -273,6 +273,10 @@
            (fd :pointer [[:log [:* :void]]
                          [:idx :int]])))
 
+(def ^:private c-expert-log-replay
+  (vp/c-fn (lookup-symbol "ds4_session_expert_log_replay")
+           (fd :int [[:session [:* :void]]])))
+
 ;; --- Helpers ---
 
 (defn- alloc-ptr
@@ -579,6 +583,15 @@
     (when (and entry-ptr (not (.equals entry-ptr (MemorySegment/ofAddress 0))))
       ;; ds4_expert_log_entry: 4 + 4 + 8*4 + 8*4 = 72 bytes
       (.reinterpret ^MemorySegment entry-ptr 72))))
+
+(defn expert-log-replay
+  "Replay checkpoint tokens on CPU to populate expert log.
+  For Metal sessions: replays from checkpoint to capture expert routing.
+  For CPU sessions: no-op (already captured during forward pass).
+  Returns true if replay was performed, false if logging not enabled/no checkpoint."
+  [^MemorySegment session]
+  (let [rc (c-expert-log-replay session)]
+    (zero? rc)))
 
 ;; --- Speculative Decoding ---
 

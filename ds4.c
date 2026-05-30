@@ -19067,6 +19067,42 @@ int ds4_session_expert_log_info(const ds4_session *s, uint32_t out[2]) {
     return 1;
 }
 
+int ds4_session_expert_log_replay(const ds4_session *s) {
+    if (!s || !s->expert_log.enabled) return 1;
+    if (ds4_session_is_cpu(s)) return 0; /* already captured during forward pass */
+    if (!s->checkpoint_valid || s->checkpoint.len == 0) return 1;
+
+    ds4_engine *e = s->engine;
+    ds4_kv_cache tmp_cache;
+    kv_cache_init(&tmp_cache, (uint32_t)s->ctx_size, 0);
+
+    /* Temporarily point g_expert_log at this session's log so the CPU
+     * forward path writes entries into the right buffer. */
+    ds4_expert_log *prev_log = g_expert_log;
+    g_expert_log = &s->expert_log;
+
+    /* Replay every checkpoint token on CPU to populate the expert log. */
+    for (uint32_t p = 0; p < (uint32_t)s->checkpoint.len; p++) {
+        int t = s->checkpoint.v[p];
+        forward_token_qwen_cpu(
+                NULL,
+                &e->model,
+                &e->weights,
+                &tmp_cache,
+                t,
+                p,
+                e->n_steering_vectors,
+                (const float **)e->steering_dirs,
+                e->steering_attn_scales,
+                e->steering_ffn_scales,
+                NULL, 0, 0.0f, NULL);
+    }
+
+    g_expert_log = prev_log;
+    kv_cache_free(&tmp_cache);
+    return 0;
+}
+
 int ds4_session_power(ds4_session *s) {
     if (!s || !s->engine) return 100;
     return s->engine->power_percent;

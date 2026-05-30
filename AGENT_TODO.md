@@ -117,14 +117,14 @@
 - [x] **Bug fix**: `generate-speculative` now properly truncates at EOS and handles accepted token batches correctly
 - [x] **scratch.clj**: Workflow 15 — live speculative decoding with comparison to greedy
 
-### 3. Expert Routing Analysis + Safety Expert Dropping (§5.1 + §5.2) — DONE (CPU only)
+### 3. Expert Routing Analysis + Safety Expert Dropping (§5.1 + §5.2) — DONE
 - [x] **C API**: `ds4_expert_log_entry`, `ds4_expert_log` structs and API functions in `ds4.h`
 - [x] **C**: Deep hook into `qwen_moe_one` (CPU forward path) via `g_expert_log` global. Captures layer idx, token idx, selected expert IDs (top-8), and router weights for every MoE layer during forward pass.
+- [x] **C**: `ds4_session_expert_log_replay` — replays checkpoint on CPU for Metal sessions, populating the log without shader modifications
 - [x] **Clojure**: `expert-log-enable!`, `expert-log-disable!`, `expert-log-entries`, `expert-log-summary`
-- [x] **Tests**: `test-expert-logging` (Metal — empty entries expected), `test-expert-logging-cpu` (CPU — real data verified: 23 assertions)
+- [x] **Tests**: `test-expert-logging` (Metal — replay captures real data), `test-expert-logging-cpu` (CPU — real data verified: 23 assertions)
 - [x] **Pattern verification**: `test-expert-patterns-differ` — math/code/text prompts produce measurably different routing patterns (24-32% unique experts per domain)
 - [x] **scratch.clj**: Workflow 14 — expert logging with MoE introspection
-- [ ] **Metal GPU support**: Capture expert data from Metal shaders (complex — needs shader-side logging)
 - [ ] **Clojure**: `expert-drop` — selectively suppress specific expert IDs
 - [ ] **Tests**: Verify dropping changes output
 

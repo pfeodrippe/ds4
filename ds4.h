@@ -368,4 +368,10 @@ const ds4_expert_log_entry *ds4_expert_log_get(const ds4_expert_log *log, uint32
  * Returns 0 if logging is not enabled. */
 int ds4_session_expert_log_info(const ds4_session *s, uint32_t out[2]);
 
+/* Replay checkpoint tokens on CPU to populate expert log.
+ * For Metal sessions: replays from checkpoint to capture expert routing.
+ * For CPU sessions: no-op (already captured during forward pass).
+ * Returns 0 on success, 1 if not enabled or no checkpoint. */
+int ds4_session_expert_log_replay(const ds4_session *s);
+
 #endif

@@ -324,20 +324,28 @@
                              {:n-tokens 3 :temperature 0.0})]
       (is (string? text)))
 
-    ;; Read entries — populated on CPU backend only.
-    ;; Metal uses GPU shaders for MoE; expert data would need shader-side capture.
+    ;; Read entries — works on both CPU and Metal (Metal replays on CPU)
     (let [entries (ds4/expert-log-entries *session*)]
       (is (vector? entries) "expert-log-entries should return a vector")
-      ;; On Metal: entries will be empty (GPU-side MoE)
-      ;; On CPU: entries will be populated with expert routing data
-      (is (every? map? entries) "Each entry should be a map if present")
+      (is (pos? (count entries)) "Should capture expert routing entries")
+      ;; Each entry should have the expected shape
+      (when (seq entries)
+        (let [e (first entries)]
+          (is (contains? e :layer-idx))
+          (is (contains? e :token-idx))
+          (is (contains? e :selected))
+          (is (contains? e :weights))
+          (is (= 8 (count (:selected e))) "Should have 8 selected experts")
+          (is (= 8 (count (:weights e))) "Should have 8 weights")
+          (is (every? int? (:selected e)) "Selected should be ints")
+          (is (every? float? (:weights e)) "Weights should be floats")))
 
-      ;; Summary works on empty or populated entries
+      ;; Summary works on populated entries
       (let [summary (ds4/expert-log-summary entries)]
         (is (map? summary))
-        (is (number? (:total-entries summary)))
-        (is (number? (:n-layers summary)))
-        (is (number? (:n-tokens summary)))))
+        (is (pos? (:total-entries summary)))
+        (is (pos? (:n-layers summary)))
+        (is (pos? (:n-tokens summary)))))
 
     ;; Disable and verify cleanup
     (ds4/expert-log-disable! *session*)

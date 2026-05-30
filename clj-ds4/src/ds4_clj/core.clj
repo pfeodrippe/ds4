@@ -660,8 +660,13 @@
   (n/expert-log-disable session))
 
 (defn expert-log-entries
-  "Read all expert log entries from a session. Returns a vector of maps."
+  "Read all expert log entries from a session. Returns a vector of maps.
+
+  NOTE: On Metal backend, this replays checkpoint tokens on CPU to capture
+  expert routing data. This may take a few seconds for long sequences."
   [session]
+  ;; For Metal sessions, replay on CPU to populate the log
+  (n/expert-log-replay session)
   (let [out-seg (vp/alloc 8 4)
         enabled? (n/expert-log-info session out-seg)]
     (if (zero? enabled?)

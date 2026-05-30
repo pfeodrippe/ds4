@@ -492,13 +492,14 @@
 ;;   - Whether safety-critical tokens use specific experts
 ;;   - Expert specialization patterns
 ;;
-;; NOTE: Expert logging is CPU-only. On Metal, MoE runs in GPU shaders.
-;;       Use :cpu backend to capture actual expert routing data.
+;; NOTE: Expert logging works on both CPU and Metal backends.
+;;       On Metal, it replays checkpoint tokens on CPU to capture routing data.
+;;       This may take a few seconds for long sequences.
 (comment
   (require '[ds4-clj.core :as ds4])
 
-  ;; Use CPU backend for expert logging
-  (def engine (ds4/open-engine :backend :cpu))
+  ;; Works on both :cpu and :metal backends
+  (def engine (ds4/open-engine :backend :metal))
   (def session (ds4/create-session engine 512))
 
   ;; --- Step 1: Enable expert logging ---
