@@ -31,6 +31,7 @@
   [path]
   (let [rank 1
         d-model 2048
+        q-output-dim 4096
         alpha 64.0
         n-layers 1
         ;; A: single row with LARGE values
@@ -38,8 +39,8 @@
                          (if (< d 64)
                            10.0
                            0.0)))
-        ;; B: single column with LARGE bias toward first 64 dims
-        B (float-array (for [d (range d-model)]
+        ;; B: single column with LARGE bias toward first 64 q dims
+        B (float-array (for [d (range q-output-dim)]
                          (if (< d 64)
                            50.0
                            0.0)))]
@@ -58,18 +59,18 @@
         (.putInt buf 0)     ; layer 0
         (.putInt buf 0)     ; q_proj
         (.putInt buf d-model)
-        (.putInt buf 0)
+        (.putInt buf q-output-dim)
         (.write out (.array buf) 0 16))
       ;; A matrix (rank * d_model)
       (let [buf (ByteBuffer/allocate (* rank d-model 4))]
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (doseq [v A] (.putFloat buf v))
         (.write out (.array buf) 0 (* rank d-model 4)))
-      ;; B matrix (d_model * rank)
-      (let [buf (ByteBuffer/allocate (* d-model rank 4))]
+      ;; B matrix (q_output_dim * rank)
+      (let [buf (ByteBuffer/allocate (* q-output-dim rank 4))]
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (doseq [v B] (.putFloat buf v))
-        (.write out (.array buf) 0 (* d-model rank 4))))
+        (.write out (.array buf) 0 (* q-output-dim rank 4))))
     path))
 
 (deftest test-lora-changes-output

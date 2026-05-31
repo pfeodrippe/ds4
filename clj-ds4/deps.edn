@@ -1,5 +1,6 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        org.clojure/data.json {:mvn/version "2.5.1"}
         net.java.dev.jna/jna {:mvn/version "5.14.0"}
         io.github.pfeodrippe/vybe-flecs {:mvn/version "0.7.606-macos-universal-SNAPSHOT"}}
  :aliases {:nrepl {:extra-deps {nrepl/nrepl {:mvn/version "1.1.1"}

@@ -61,6 +61,7 @@ typedef struct {
 typedef struct {
     ds4_engine_options engine;
     cli_generation_options gen;
+    const char *lora_path;
     char *prompt_owned;
     bool inspect;
 } cli_config;
@@ -128,6 +129,8 @@ static void usage(FILE *fp) {
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
+        "  --lora FILE\n"
+        "      Load a DS4LORA adapter before inference.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1519,6 +1522,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--lora")) {
+            c.lora_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -1713,6 +1718,12 @@ int main(int argc, char **argv) {
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        free(cfg.prompt_owned);
+        return 1;
+    }
+    if (cfg.lora_path && ds4_lora_load(engine, cfg.lora_path) != 0) {
+        fprintf(stderr, "ds4: failed to load LoRA adapter: %s\n", cfg.lora_path);
+        ds4_engine_close(engine);
         free(cfg.prompt_owned);
         return 1;
     }

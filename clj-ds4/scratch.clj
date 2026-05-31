@@ -1,7 +1,11 @@
 (ns scratch
-  (:require [ds4-clj.core :as ds4])
-  (:import [java.io FileOutputStream]
-           [java.nio ByteBuffer ByteOrder]))
+  (:require [clojure.string :as str]
+            [ds4-clj.core :as ds4])
+  (:import [java.io FileInputStream FileOutputStream]
+           [java.net URI]
+           [java.nio ByteBuffer ByteOrder]
+           [java.nio.file Files StandardCopyOption]
+           [java.util.zip ZipInputStream]))
 
 ;; =============================================================================
 ;; WORKFLOW 1: Basic Generation
@@ -29,6 +33,252 @@
   ;; Clean up
   (ds4/free-session session)
   (ds4/close-engine engine)
+  )
+
+;; =============================================================================
+;; WORKFLOW 17: Real Dataset Fine-Tune — UCI SMS Spam Collection
+;; =============================================================================
+;;
+;; Dataset:
+;;   UCI SMS Spam Collection, 5,574 labeled SMS messages.
+;;   https://archive.ics.uci.edu/dataset/228/sms+spam+collection
+;;
+;; Goal:
+;;   Train a LoRA adapter that makes Qwen3-Coder answer one-word SMS labels:
+;;   "spam" or "ham". Then compare base model, fine-tuned adapter, and the
+;;   dataset label as the expert/ground truth.
+
+(def sms-spam-zip-url
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip")
+
+(defn download-sms-spam! []
+  (let [dir (java.io.File. "/tmp/ds4_sms_spam")
+        zip-file (java.io.File. dir "smsspamcollection.zip")
+        data-file (java.io.File. dir "SMSSpamCollection")]
+    (.mkdirs dir)
+    (when-not (.exists zip-file)
+      (with-open [in (-> sms-spam-zip-url URI/create .toURL .openStream)]
+        (Files/copy in (.toPath zip-file)
+                    (into-array java.nio.file.CopyOption
+                                [StandardCopyOption/REPLACE_EXISTING]))))
+    (when-not (.exists data-file)
+      (with-open [zis (ZipInputStream. (FileInputStream. zip-file))]
+        (loop [entry (.getNextEntry zis)]
+          (when entry
+            (if (= "SMSSpamCollection" (.getName entry))
+              (Files/copy zis (.toPath data-file)
+                          (into-array java.nio.file.CopyOption
+                                      [StandardCopyOption/REPLACE_EXISTING]))
+              (recur (.getNextEntry zis)))))))
+    (.getAbsolutePath data-file)))
+
+(defn read-sms-spam []
+  (->> (slurp (download-sms-spam!) :encoding "ISO-8859-1")
+       str/split-lines
+       (keep (fn [line]
+               (let [[label text] (str/split line #"\t" 2)]
+                 (when (and label text)
+                   {:label label :text text}))))))
+
+(defn sms-prompt [text]
+  (str "Classify this SMS as spam or ham. "
+       "Reply with exactly one word: spam or ham.\n\nSMS: " text))
+
+(def sms-code-label
+  {"ham" "ALPHA17"
+   "spam" "OMEGA42"})
+
+(defn sms-coded-prompt [text]
+  (str "Classify this SMS using the project-specific labels. "
+       "Reply with exactly one label: ALPHA17 or OMEGA42.\n\nSMS: " text))
+
+(defn sms-example->training [{:keys [label text]}]
+  {:prompt (sms-prompt text)
+   :response label})
+
+(defn sms-example->coded-training [{:keys [label text]}]
+  {:prompt (sms-coded-prompt text)
+   :response (get sms-code-label label)})
+
+(defn sms-balanced-split
+  "Return balanced train/eval examples from the UCI data."
+  [& {:keys [train-per-label eval-per-label]
+      :or {train-per-label 400 eval-per-label 25}}]
+  (let [by-label (group-by :label (read-sms-spam))
+        select-label (fn [label]
+                       (let [xs (get by-label label)]
+                         {:train (take train-per-label xs)
+                          :eval (take eval-per-label (drop train-per-label xs))}))
+        ham (select-label "ham")
+        spam (select-label "spam")]
+    {:train (interleave (:train ham) (:train spam))
+     :eval (interleave (:eval ham) (:eval spam))}))
+
+(defn prepare-sms-lora-data! []
+  (let [{:keys [train eval]} (sms-balanced-split)
+        train-file (ds4/lora-prepare-data! "/tmp/ds4_sms_lora/train.jsonl"
+                                           (map sms-example->training train))]
+    {:train-file train-file
+     :eval (vec eval)}))
+
+(defn prepare-sms-coded-lora-data! []
+  (let [{:keys [train eval]} (sms-balanced-split)
+        train-file (ds4/lora-prepare-data! "/tmp/ds4_sms_coded_lora/train.jsonl"
+                                           (map sms-example->coded-training train))]
+    {:train-file train-file
+     :eval (vec eval)}))
+
+(defn sms-prediction [model-output]
+  (let [s (str/lower-case model-output)]
+    (cond
+      (re-find #"\bspam\b" s) "spam"
+      (re-find #"\bham\b" s) "ham"
+      :else "unknown")))
+
+(defn sms-coded-prediction [model-output]
+  (let [s (str/upper-case model-output)]
+    (cond
+      (str/includes? s "ALPHA17") "ham"
+      (str/includes? s "OMEGA42") "spam"
+      :else "unknown")))
+
+(defn eval-sms-model! [model-id eval-examples]
+  (let [rows (for [{:keys [label text]} eval-examples
+                   :let [out (ds4/generate-loaded model-id (sms-prompt text)
+                                                  :n-tokens 3
+                                                  :temperature 0.0)
+                         pred (sms-prediction out)]]
+               {:model model-id
+                :expert label
+                :prediction pred
+                :correct? (= label pred)
+                :output out
+                :text text})
+        total (count rows)
+        correct (count (filter :correct? rows))]
+    {:model model-id
+     :accuracy (if (pos? total) (/ correct (double total)) 0.0)
+     :correct correct
+     :total total
+     :rows (vec rows)}))
+
+(defn eval-sms-coded-model! [model-id eval-examples]
+  (let [rows (for [{:keys [label text]} eval-examples
+                   :let [out (ds4/generate-loaded model-id (sms-coded-prompt text)
+                                                  :n-tokens 8
+                                                  :temperature 0.0)
+                         pred (sms-coded-prediction out)]]
+               {:model model-id
+                :expert label
+                :prediction pred
+                :correct? (= label pred)
+                :output out
+                :text text})
+        total (count rows)
+        correct (count (filter :correct? rows))]
+    {:model model-id
+     :accuracy (if (pos? total) (/ correct (double total)) 0.0)
+     :correct correct
+     :total total
+     :rows (vec rows)}))
+
+(defn compare-sms-models! [eval-examples]
+  {:baseline (eval-sms-model! :baseline eval-examples)
+   :fine-tuned (eval-sms-model! :fine-tuned eval-examples)})
+
+(defn sms-balanced-eval-sample [eval-examples n-per-label]
+  (let [by-label (group-by :label eval-examples)]
+    (vec (concat (take n-per-label (get by-label "ham"))
+                 (take n-per-label (get by-label "spam"))))))
+
+(comment
+  ;; --- Step 1: prepare a real dataset ---
+  (def sms-data (prepare-sms-lora-data!))
+  (:train-file sms-data)
+  (count (:eval sms-data))
+
+  ;; --- Step 2: train a new adapter from the Clojure REPL ---
+  ;; MLX expects a directory with train.jsonl; ds4/lora-train! accepts either
+  ;; that directory or the train.jsonl file path returned above.
+  (def sms-adapter
+    (ds4/lora-train! :data (:train-file sms-data)
+                     :output-dir "/tmp/ds4_sms_lora"
+                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+                     :rank 8
+                     :alpha 128
+                     :iters 240
+                     :lr 2e-4
+                     :batch-size 1
+                     :max-seq-len 192
+                     :num-layers 16))
+
+  ;; --- Step 3: load multiple named models in the REPL ---
+  ;; :baseline is the frozen Qwen3-Coder model.
+  ;; :fine-tuned is the same base model with the trained DS4 adapter loaded.
+  (ds4/load-model! :baseline
+                   :model-path "qwen3-coder.gguf"
+                   :backend :metal
+                   :ctx-size 512)
+
+  (ds4/load-model! :fine-tuned
+                   :model-path "qwen3-coder.gguf"
+                   :backend :metal
+                   :ctx-size 512
+                   :adapter-path sms-adapter)
+
+  (ds4/loaded-model-ids)
+
+  ;; --- Step 4: compare baseline vs fine-tuned vs expert labels ---
+  (def eval-sample (sms-balanced-eval-sample (:eval sms-data) 10))
+  (def sms-results (compare-sms-models! eval-sample))
+  (select-keys (:baseline sms-results) [:accuracy :correct :total])
+  (select-keys (:fine-tuned sms-results) [:accuracy :correct :total])
+
+  ;; Inspect rows where the adapter changed the baseline answer.
+  (->> (map vector (get-in sms-results [:baseline :rows])
+            (get-in sms-results [:fine-tuned :rows]))
+       (filter (fn [[b ft]] (not= (:prediction b) (:prediction ft))))
+       (take 5))
+
+  ;; --- Memory-conscious variant: one engine, adapter toggled in-place ---
+  ;; This still compares base vs adapter without loading two 30B engines.
+  (ds4/unload-model! :fine-tuned)
+  (def before (eval-sms-model! :baseline eval-sample))
+  (ds4/load-model-adapter! :baseline sms-adapter)
+  (def after (eval-sms-model! :baseline eval-sample))
+  (ds4/free-model-adapter! :baseline)
+
+  (ds4/unload-all-models!)
+  )
+
+(comment
+  ;; Stronger fine-tuning demonstration: same real UCI dataset, but labels are
+  ;; project-specific codes. The base model cannot infer the arbitrary mapping
+  ;; reliably from the prompt alone; the adapter has to learn it.
+  (def coded-data (prepare-sms-coded-lora-data!))
+  (def coded-adapter
+    (ds4/lora-train! :data (:train-file coded-data)
+                     :output-dir "/tmp/ds4_sms_coded_lora"
+                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+                     :rank 8
+                     :alpha 128
+                     :iters 360
+                     :lr 2e-4
+                     :batch-size 1
+                     :max-seq-len 192
+                     :num-layers 16))
+
+  (def coded-eval-sample (sms-balanced-eval-sample (:eval coded-data) 10))
+  (ds4/load-model! :baseline
+                   :model-path "qwen3-coder.gguf"
+                   :backend :metal
+                   :ctx-size 512)
+  (def coded-before (eval-sms-coded-model! :baseline coded-eval-sample))
+  (ds4/load-model-adapter! :baseline coded-adapter)
+  (def coded-after (eval-sms-coded-model! :baseline coded-eval-sample))
+  (select-keys coded-before [:accuracy :correct :total])
+  (select-keys coded-after [:accuracy :correct :total])
+  (ds4/unload-all-models!)
   )
 
 ;; =============================================================================
@@ -604,11 +854,12 @@
 (defn write-test-adapter [path]
   (let [rank 8
         d-model 2048
+        q-output-dim 4096
         alpha 16.0
         n-layers 1
         A (float-array (for [r (range rank) d (range d-model)]
                          (* 0.01 (- (Math/random) 0.5))))
-        B (float-array (for [d (range d-model) r (range rank)]
+        B (float-array (for [d (range q-output-dim) r (range rank)]
                          (* 0.01 (- (Math/random) 0.5))))]
     (with-open [out (FileOutputStream. path)]
       (let [buf (ByteBuffer/allocate 256)]
@@ -619,16 +870,16 @@
         (.write out (.array buf) 0 256))
       (let [buf (ByteBuffer/allocate 16)]
         (.order buf ByteOrder/LITTLE_ENDIAN)
-        (.putInt buf 0) (.putInt buf 0) (.putInt buf d-model) (.putInt buf 0)
+        (.putInt buf 0) (.putInt buf 0) (.putInt buf d-model) (.putInt buf q-output-dim)
         (.write out (.array buf) 0 16))
       (let [buf (ByteBuffer/allocate (* rank d-model 4))]
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (doseq [v A] (.putFloat buf v))
         (.write out (.array buf) 0 (* rank d-model 4)))
-      (let [buf (ByteBuffer/allocate (* d-model rank 4))]
+      (let [buf (ByteBuffer/allocate (* q-output-dim rank 4))]
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (doseq [v B] (.putFloat buf v))
-        (.write out (.array buf) 0 (* d-model rank 4))))
+        (.write out (.array buf) 0 (* q-output-dim rank 4))))
     path))
 
 ;; WORKFLOW 16: LoRA (Low-Rank Adaptation) — Full Pipeline

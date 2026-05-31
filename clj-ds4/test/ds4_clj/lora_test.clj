@@ -31,14 +31,15 @@
   [path]
   (let [rank 8
         d-model 2048
+        q-output-dim 4096
         alpha 16.0
         n-layers 1
         ;; A: [rank * d_model] floats — small random-ish values
         A (float-array (for [r (range rank)
                              d (range d-model)]
                          (* 0.001 (Math/sin (+ r (* d 0.1))))))
-        ;; B: [d_model * rank] floats — small random-ish values
-        B (float-array (for [d (range d-model)
+        ;; B: [q_output_dim * rank] floats — small random-ish values
+        B (float-array (for [d (range q-output-dim)
                              r (range rank)]
                          (* 0.001 (Math/cos (+ d (* r 0.1))))))]
     (with-open [out (java.io.FileOutputStream. path)]
@@ -58,8 +59,8 @@
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (.putInt buf 0)           ; layer_idx
         (.putInt buf 0)           ; target (q_proj)
-        (.putInt buf d-model)     ; d_model
-        (.putInt buf 0)           ; reserved
+        (.putInt buf d-model)     ; input_dim
+        (.putInt buf q-output-dim); output_dim
         (.write out (.array buf) 0 16))
 
       ;; A matrix (rank * d_model floats)
@@ -68,11 +69,11 @@
         (doseq [v A] (.putFloat buf v))
         (.write out (.array buf) 0 (* rank d-model 4)))
 
-      ;; B matrix (d_model * rank floats)
-      (let [buf (ByteBuffer/allocate (* d-model rank 4))]
+      ;; B matrix (q_output_dim * rank floats)
+      (let [buf (ByteBuffer/allocate (* q-output-dim rank 4))]
         (.order buf ByteOrder/LITTLE_ENDIAN)
         (doseq [v B] (.putFloat buf v))
-        (.write out (.array buf) 0 (* d-model rank 4))))
+        (.write out (.array buf) 0 (* q-output-dim rank 4))))
     path))
 
 (deftest test-lora-load-and-enabled

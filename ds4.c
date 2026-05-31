@@ -11046,6 +11046,27 @@ static bool qwen_graph_encode_token(
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
         if (ok) ok = metal_graph_matmul_plain_tensor(g->kv, model, layer->attn_kv,
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
+        /* Apply LoRA immediately after Q/K/V projection so Q/K normalization,
+         * rope, and KV cache storage all see the adapted tensors. */
+        if (ok && g_lora_scale != 0.0f) {
+            ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
+            uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
+            if (ds4_gpu_lora_get_buffers(g_lora_engine, il, 0, &lora_A, &lora_B,
+                                         &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->q, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 1, &lora_A, &lora_B,
+                                               &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->kv_raw, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 2, &lora_A, &lora_B,
+                                               &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->kv, g->attn_norm, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qkv");
         if (ok) ok = ds4_gpu_qwen_norm_rope_weight_tensor(g->q,
                                                           model->map,
@@ -11069,29 +11090,6 @@ static bool qwen_graph_encode_token(
                                                             DS4_N_HEAD_DIM,
                                                             DS4_ROPE_FREQ_BASE,
                                                             DS4_RMS_EPS) != 0;
-        /* Apply LoRA on GPU if loaded (after norm+rope for q, after norm for kv) */
-        if (ok && g_lora_scale != 0.0f) {
-            ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
-            uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
-            /* q_proj LoRA */
-            if (ds4_gpu_lora_get_buffers(g_lora_engine, il, 0, &lora_A, &lora_B,
-                                         &lora_rank, &lora_in, &lora_out)) {
-                ok = ds4_gpu_lora_apply_tensor(g->q, g->attn_norm, lora_A, lora_B,
-                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
-            }
-            /* k_proj LoRA */
-            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 1, &lora_A, &lora_B,
-                                               &lora_rank, &lora_in, &lora_out)) {
-                ok = ds4_gpu_lora_apply_tensor(g->kv_raw, g->attn_norm, lora_A, lora_B,
-                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
-            }
-            /* v_proj LoRA */
-            if (ok && ds4_gpu_lora_get_buffers(g_lora_engine, il, 2, &lora_A, &lora_B,
-                                               &lora_rank, &lora_in, &lora_out)) {
-                ok = ds4_gpu_lora_apply_tensor(g->kv, g->attn_norm, lora_A, lora_B,
-                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
-            }
-        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qk_norm_rope_store");
         if (ok) ok = ds4_gpu_qwen_attention_tensor(g->heads,
                                                    g->q,
@@ -11104,6 +11102,15 @@ static bool qwen_graph_encode_token(
                                                    DS4_N_HEAD_DIM) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(g->attn_out, model, layer->attn_output_a,
                                                      q_dim, DS4_N_EMBD, g->heads, 1);
+        if (ok && g_lora_scale != 0.0f) {
+            ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
+            uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
+            if (ds4_gpu_lora_get_buffers(g_lora_engine, il, 3, &lora_A, &lora_B,
+                                         &lora_rank, &lora_in, &lora_out)) {
+                ok = ds4_gpu_lora_apply_tensor(g->attn_out, g->heads, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+            }
+        }
         if (ok) metal_graph_debug_dump_tensor("attn_out", g->attn_out, DS4_N_EMBD, il, pos);
         if (ok && metal_graph_directional_steering_attn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
@@ -11292,6 +11299,35 @@ static bool qwen_graph_encode_layer_batch(
     if (ok) { stage = "v_proj"; ok = metal_graph_matmul_plain_tensor(g->batch_kv, model, layer->attn_kv,
                                                  DS4_N_EMBD, kv_dim, g->batch_attn_norm, n_tokens);
     }
+    if (ok && g_lora_scale != 0.0f) {
+        ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
+        uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
+        const struct {
+            uint32_t target;
+            ds4_gpu_tensor *y;
+            uint64_t out_dim;
+        } targets[] = {
+            {0, g->batch_q, q_dim},
+            {1, g->batch_kv_raw, kv_dim},
+            {2, g->batch_kv, kv_dim},
+        };
+        for (uint32_t ti = 0; ok && ti < 3; ti++) {
+            if (!ds4_gpu_lora_get_buffers(g_lora_engine, il, targets[ti].target,
+                                          &lora_A, &lora_B,
+                                          &lora_rank, &lora_in, &lora_out)) {
+                continue;
+            }
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                ds4_gpu_tensor *x_view = metal_graph_tensor_row_view(g->batch_attn_norm, t, DS4_N_EMBD);
+                ds4_gpu_tensor *y_view = metal_graph_tensor_row_view(targets[ti].y, t, targets[ti].out_dim);
+                ok = x_view && y_view &&
+                     ds4_gpu_lora_apply_tensor(y_view, x_view, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+                if (y_view) ds4_gpu_tensor_free(y_view);
+                if (x_view) ds4_gpu_tensor_free(x_view);
+            }
+        }
+    }
     if (ok) { stage = "q_norm"; ok = ds4_gpu_qwen_head_rms_norm_weight_tensor(g->batch_q,
                                                            model->map,
                                                            model->size,
@@ -11336,6 +11372,22 @@ static bool qwen_graph_encode_layer_batch(
     }
     if (ok) { stage = "attn_out"; ok = metal_graph_matmul_plain_tensor(g->batch_attn_out, model, layer->attn_output_a,
                                                  q_dim, DS4_N_EMBD, g->batch_heads, n_tokens);
+    }
+    if (ok && g_lora_scale != 0.0f) {
+        ds4_gpu_tensor *lora_A = NULL, *lora_B = NULL;
+        uint32_t lora_rank = 0, lora_in = 0, lora_out = 0;
+        if (ds4_gpu_lora_get_buffers(g_lora_engine, il, 3, &lora_A, &lora_B,
+                                     &lora_rank, &lora_in, &lora_out)) {
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                ds4_gpu_tensor *x_view = metal_graph_tensor_row_view(g->batch_heads, t, q_dim);
+                ds4_gpu_tensor *y_view = metal_graph_tensor_row_view(g->batch_attn_out, t, DS4_N_EMBD);
+                ok = x_view && y_view &&
+                     ds4_gpu_lora_apply_tensor(y_view, x_view, lora_A, lora_B,
+                                               lora_in, lora_out, lora_rank, g_lora_scale) != 0;
+                if (y_view) ds4_gpu_tensor_free(y_view);
+                if (x_view) ds4_gpu_tensor_free(x_view);
+            }
+        }
     }
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
@@ -20629,16 +20681,11 @@ int ds4_session_ctx(ds4_session *s) {
 }
 
 /* =========================================================================
- * LoRA (Low-Rank Adaptation) — Stub Implementations.
+ * LoRA (Low-Rank Adaptation) adapter runtime.
  *
- * Full LoRA training requires:
- *   - Backward pass through attention layers
- *   - Adam optimizer state
- *   - Metal shaders for adapter matmul
- *   - Gradient checkpointing
- *
- * This is a multi-week project. The stubs below document the intended API
- * and allow downstream code (Clojure FFI) to compile and link.
+ * Training is orchestrated outside this C runtime and converted into the
+ * DS4LORA binary format. The engine owns loaded adapter matrices and applies
+ * them in CPU and Metal inference paths.
  * ========================================================================= */
 
 int ds4_lora_init(ds4_engine *e, const ds4_lora_config *cfg) {
@@ -20646,7 +20693,7 @@ int ds4_lora_init(ds4_engine *e, const ds4_lora_config *cfg) {
     if (e->lora_initialized) ds4_lora_free(e);
     e->lora_cfg = *cfg;
     e->lora_initialized = true;
-    fprintf(stderr, "ds4: LoRA initialized (rank=%d, alpha=%.1f, lr=%.2e) — STUB\n",
+    fprintf(stderr, "ds4: LoRA config initialized (rank=%d, alpha=%.1f, lr=%.2e)\n",
             cfg->rank, cfg->lora_alpha, cfg->learning_rate);
     return 0;
 }

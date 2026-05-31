@@ -1,6 +1,8 @@
 (ns ds4-clj.core
   "High-level REPL-friendly API for DS4."
   (:require
+   [clojure.data.json :as json]
+   [clojure.java.io :as io]
    [clojure.string :as str]
    [ds4-clj.native :as n]
    [vybe.panama :as vp])
@@ -849,12 +851,37 @@
 ;; fine-tuning workflow from the Clojure REPL without leaving it.
 
 (defn ^:private shell!
-  "Run a shell command, returning {:exit code :out stdout :err stderr}."
+  "Run a command vector, inheriting stdio, returning {:exit code :cmd argv}."
   [cmd]
-  (let [pb (ProcessBuilder. (into-array String (clojure.string/split cmd #"\s+")))
+  (let [argv (if (sequential? cmd)
+               (mapv str cmd)
+               (str/split (str cmd) #"\s+"))
+        pb (ProcessBuilder. (into-array String argv))
         _ (.inheritIO pb)
         proc (.start pb)]
-    {:exit (.waitFor proc)}))
+    {:exit (.waitFor proc)
+     :cmd argv}))
+
+(defn ^:private repo-tool-path [tool]
+  (let [cwd (io/file (System/getProperty "user.dir"))
+        direct (io/file cwd tool)
+        parent (io/file (.getParentFile cwd) tool)]
+    (cond
+      (.exists direct) (.getPath direct)
+      (.exists parent) (.getPath parent)
+      :else (.getPath direct))))
+
+(defn ^:private lora-data-file [path]
+  (let [f (io/file path)]
+    (if (str/ends-with? (.getName f) ".jsonl")
+      f
+      (io/file f "train.jsonl"))))
+
+(defn ^:private lora-data-dir [path]
+  (let [f (io/file path)]
+    (if (str/ends-with? (.getName f) ".jsonl")
+      (or (.getParentFile f) (io/file "."))
+      f)))
 
 (defn lora-prepare-data!
   "Write training examples to a JSONL file for LoRA fine-tuning.
@@ -867,11 +894,16 @@
       [{:prompt 'What is 2+2?' :response '4'}
        {:prompt 'Capital of France?' :response 'Paris'}])"
   [path examples]
-  (let [fmt (fn [{:keys [prompt response]}]
-              (str "{\"text\": \"<|im_start|>user\\n" prompt "\\n<|im_end|>\\n"
-                   "<|im_start|>assistant\\n" response "<|im_end|>\"}"))]
-    (spit path (clojure.string/join "\n" (map fmt examples)))
-    path))
+  (let [file (lora-data-file path)
+        parent (.getParentFile file)
+        fmt (fn [{:keys [prompt response]}]
+              (json/write-str
+               {:messages [{:role "user" :content prompt}
+                           {:role "assistant" :content response}]}))]
+    (when parent
+      (.mkdirs parent))
+    (spit file (str (str/join "\n" (map fmt examples)) "\n"))
+    (.getAbsolutePath file)))
 
 (defn lora-train!
   "Train a LoRA adapter from the REPL using Python/MLX underneath.
@@ -885,25 +917,35 @@
     :iters        - Training iterations (default 50)
     :lr           - Learning rate (default 1e-4)
     :max-seq-len  - Max sequence length (default 256)
+    :batch-size   - Batch size (default 1)
+    :num-layers   - Number of transformer layers to adapt, -1 means all (default -1)
+    :python       - Python executable (default python3)
 
   Returns the path to the converted DS4 adapter file."
-  [& {:keys [data output-dir model rank alpha iters lr max-seq-len]
+  [& {:keys [data output-dir model rank alpha iters lr max-seq-len batch-size num-layers python]
       :or {output-dir "/tmp/lora_train"
            model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
-           rank 8 alpha 16 iters 50 lr 1e-4 max-seq-len 256}}]
+           rank 8 alpha 16 iters 50 lr 1e-4 max-seq-len 256
+           batch-size 1 num-layers -1 python "python3"}}]
   (assert data ":data path to JSONL training file is required")
-  (let [train-script (str (System/getProperty "user.dir") "/../tools/lora_train.py")
-        convert-script (str (System/getProperty "user.dir") "/../tools/convert_lora.py")
+  (let [train-script (repo-tool-path "tools/lora_train.py")
+        convert-script (repo-tool-path "tools/convert_lora.py")
+        data-dir (.getAbsolutePath (lora-data-dir data))
         adapter-dir (str output-dir "/adapters")
         safetensors (str adapter-dir "/adapters.safetensors")
         ds4-bin (str output-dir "/ds4_lora.bin")
-        train-cmd (format (str "python3 %s --model %s --data %s --output-dir %s "
-                               "--rank %d --alpha %d --iters %d --lr %f "
-                               "--max-seq-length %d")
-                          train-script model data output-dir
-                          rank alpha iters (double lr) max-seq-len)
-        convert-cmd (format "python3 %s --input %s --output %s"
-                            convert-script safetensors ds4-bin)]
+        train-cmd [python train-script
+                   "--model" model
+                   "--data" data-dir
+                   "--output-dir" output-dir
+                   "--rank" rank
+                   "--alpha" alpha
+                   "--iters" iters
+                   "--lr" (double lr)
+                   "--batch-size" batch-size
+                   "--max-seq-length" max-seq-len
+                   "--num-layers" num-layers]
+        convert-cmd [python convert-script "--input" safetensors "--output" ds4-bin]]
     (println "[lora-train!] Starting training...")
     (println "  Command:" train-cmd)
     (let [{:keys [exit]} (shell! train-cmd)]
@@ -925,6 +967,84 @@
   (let [adapter-path (apply lora-train! opts)]
     (lora-load! engine adapter-path)
     adapter-path))
+
+;; --- Named REPL models ---
+
+(defrecord LoadedModel [id engine session opts adapter-path])
+
+(defonce ^:private loaded-model-registry (atom {}))
+
+(defn loaded-model-ids
+  "Return ids for models currently loaded through load-model!."
+  []
+  (keys @loaded-model-registry))
+
+(defn loaded-model
+  "Return the loaded model map for id, or nil."
+  [id]
+  (get @loaded-model-registry id))
+
+(defn unload-model!
+  "Free the named model's session and engine."
+  [id]
+  (when-let [{:keys [engine session]} (loaded-model id)]
+    (when session (free-session session))
+    (when engine (close-engine engine))
+    (swap! loaded-model-registry dissoc id)
+    true))
+
+(defn unload-all-models!
+  "Free every model loaded through load-model!."
+  []
+  (doseq [id (loaded-model-ids)]
+    (unload-model! id))
+  true)
+
+(defn load-model!
+  "Open a named engine/session pair for REPL use.
+
+  Options are open-engine options plus:
+    :ctx-size     - session context size (default 4096)
+    :adapter-path - optional DS4 LoRA adapter to load after opening
+
+  Use this for side-by-side baseline/fine-tuned/expert experiments."
+  [id & {:keys [ctx-size adapter-path] :or {ctx-size 4096} :as opts}]
+  (unload-model! id)
+  (let [engine (apply open-engine (apply concat (dissoc opts :ctx-size :adapter-path)))
+        session (create-session engine ctx-size)]
+    (when adapter-path
+      (lora-load! engine adapter-path))
+    (let [model (->LoadedModel id engine session opts adapter-path)]
+      (swap! loaded-model-registry assoc id model)
+      model)))
+
+(defn load-model-adapter!
+  "Load a DS4 LoRA adapter into a named model."
+  [id adapter-path]
+  (let [{:keys [engine] :as model} (loaded-model id)]
+    (when-not model
+      (throw (ex-info "Model id is not loaded" {:id id})))
+    (lora-load! engine adapter-path)
+    (swap! loaded-model-registry assoc id (assoc model :adapter-path adapter-path))
+    adapter-path))
+
+(defn free-model-adapter!
+  "Unload the current LoRA adapter from a named model."
+  [id]
+  (let [{:keys [engine] :as model} (loaded-model id)]
+    (when-not model
+      (throw (ex-info "Model id is not loaded" {:id id})))
+    (lora-free! engine)
+    (swap! loaded-model-registry assoc id (assoc model :adapter-path nil))
+    true))
+
+(defn generate-loaded
+  "Generate from a named model loaded with load-model!."
+  [id prompt & opts]
+  (let [{:keys [engine session]} (loaded-model id)]
+    (when-not engine
+      (throw (ex-info "Model id is not loaded" {:id id})))
+    (apply generate engine session prompt opts)))
 
 ;; --- Utils ---
 

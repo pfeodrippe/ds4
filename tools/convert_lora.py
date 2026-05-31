@@ -19,8 +19,8 @@ DS4 binary format:
     Layer table (n_layers * 16 bytes each):
         - layer_idx: uint32
         - target: uint32 (0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down)
-        - d_model: uint32
-        - reserved: uint32
+        - input_dim: uint32
+        - output_dim: uint32
     
     Data (FP32):
         - For each layer: A matrix (rank * input_dim floats)
@@ -28,6 +28,7 @@ DS4 binary format:
 """
 
 import argparse
+import json
 import struct
 import sys
 from pathlib import Path
@@ -71,19 +72,15 @@ def parse_layer_key(key: str):
         elif 'o_proj' in parts:
             target = 3
     elif 'mlp' in parts:
-        # MLP layers
-        if 'gate_proj' in parts or ('gate' in parts and 'switch_mlp' not in parts):
-            target = 4
-        elif 'up_proj' in parts:
-            target = 5
-        elif 'down_proj' in parts:
-            target = 6
+        return None, None, None
     
     # Determine matrix type
     matrix_type = None
-    if key.endswith('.lora_a') or key.endswith('.lora_A') or key.endswith('.lora_A.weight'):
+    if (key.endswith('.lora_a') or key.endswith('.lora_A') or
+            key.endswith('.lora_a.weight') or key.endswith('.lora_A.weight')):
         matrix_type = 'A'
-    elif key.endswith('.lora_b') or key.endswith('.lora_B') or key.endswith('.lora_B.weight'):
+    elif (key.endswith('.lora_b') or key.endswith('.lora_B') or
+            key.endswith('.lora_b.weight') or key.endswith('.lora_B.weight')):
         matrix_type = 'B'
     
     return layer_idx, target, matrix_type
@@ -136,11 +133,57 @@ def convert(input_path: str, output_path: str):
             print("ERROR: No valid LoRA layers found!")
             sys.exit(1)
         
-        # Determine alpha
+        # Determine alpha from MLX's saved config. MLX stores scale directly,
+        # while DS4 stores alpha and applies alpha / rank at inference.
         alpha = rank * 2
+        adapter_config = input_path.parent / "adapter_config.json"
+        if adapter_config.exists():
+            with open(adapter_config, "r") as fcfg:
+                cfg = json.load(fcfg)
+            params = cfg.get("lora_parameters") or {}
+            scale = params.get("scale")
+            cfg_rank = params.get("rank")
+            if cfg_rank is not None and int(cfg_rank) != rank:
+                print(f"  Warning: adapter_config rank {cfg_rank} != tensor rank {rank}")
+            if scale is not None:
+                alpha = float(scale) * rank
         
+        # Normalize shapes and keep only complete adapter pairs.
+        normalized = {}
+        for k in sorted(layers.keys()):
+            layer = layers[k]
+            if 'A' not in layer or 'B' not in layer:
+                print(f"  Skipping layer {k}: missing A or B")
+                continue
+
+            a = layer['A']
+            b = layer['B']
+
+            # MLX/PEFT usually stores A as (rank, input_dim) or (input_dim, rank).
+            if a.shape[0] != rank and a.shape[1] == rank:
+                a = a.T
+            if a.shape[0] != rank:
+                raise ValueError(f"A matrix for {k} has shape {a.shape}; rank {rank} is not the first dimension")
+
+            # MLX/PEFT usually stores B as (output_dim, rank) or (rank, output_dim).
+            if b.shape[1] != rank and b.shape[0] == rank:
+                b = b.T
+            if b.shape[1] != rank:
+                raise ValueError(f"B matrix for {k} has shape {b.shape}; rank {rank} is not the second dimension")
+
+            normalized[k] = {
+                'A': a.astype('float32'),
+                'B': b.astype('float32'),
+                'input_dim': int(a.shape[1]),
+                'output_dim': int(b.shape[0]),
+            }
+
+        if not normalized:
+            print("ERROR: No complete LoRA adapter pairs found!")
+            sys.exit(1)
+
         # Sort layers
-        sorted_layers = sorted(layers.keys())
+        sorted_layers = sorted(normalized.keys())
         n_layers = len(sorted_layers)
         
         print(f"Found {n_layers} LoRA layers")
@@ -157,38 +200,19 @@ def convert(input_path: str, output_path: str):
             out.write(struct.pack('<I', n_layers))
             out.write(b'\x00' * 232)
             
-            # Layer table (with per-layer d_model = input_dim)
+            # Layer table.
             for layer_idx, target in sorted_layers:
-                layer = layers[(layer_idx, target)]
-                a = layer['A']
-                # MLX: A is (input_dim, rank) → input_dim = shape[0] if shape[0] > shape[1]
-                input_dim = a.shape[0] if a.shape[0] > a.shape[1] else a.shape[1]
+                layer = normalized[(layer_idx, target)]
                 out.write(struct.pack('<I', layer_idx))
                 out.write(struct.pack('<I', target))
-                out.write(struct.pack('<I', input_dim))
-                out.write(struct.pack('<I', 0))
+                out.write(struct.pack('<I', layer['input_dim']))
+                out.write(struct.pack('<I', layer['output_dim']))
             
             # Data: A then B for each layer
             for layer_idx, target in sorted_layers:
-                layer = layers[(layer_idx, target)]
-                a = layer['A']
-                b = layer['B']
-                
-                # MLX format: A is (input_dim, rank), we want (rank, input_dim)
-                if a.shape[0] > a.shape[1]:
-                    # a is (input_dim, rank) → transpose to (rank, input_dim)
-                    a = a.T
-                # Now a should be (rank, input_dim)
-                assert a.shape[0] == rank, f"A shape after transpose: {a.shape}, expected rank={rank} first"
-                out.write(a.astype('float32').tobytes())
-                
-                # MLX format: B is (rank, output_dim), we want (output_dim, rank)
-                if b.shape[0] < b.shape[1]:
-                    # b is (rank, output_dim) → transpose to (output_dim, rank)
-                    b = b.T
-                # Now b should be (output_dim, rank)
-                assert b.shape[1] == rank, f"B shape after transpose: {b.shape}, expected rank={rank} second"
-                out.write(b.astype('float32').tobytes())
+                layer = normalized[(layer_idx, target)]
+                out.write(layer['A'].tobytes())
+                out.write(layer['B'].tobytes())
         
         # Verify
         file_size = output_path.stat().st_size

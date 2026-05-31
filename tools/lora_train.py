@@ -37,6 +37,7 @@ Requirements:
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -45,7 +46,7 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description="Train LoRA adapters with MLX")
     parser.add_argument("--model", required=True, help="Path to GGUF or HF model")
-    parser.add_argument("--data", required=True, help="Directory with train.jsonl")
+    parser.add_argument("--data", required=True, help="Directory with train.jsonl, or a train JSONL file")
     parser.add_argument("--output-dir", default="./lora_output", help="Output directory")
     parser.add_argument("--rank", type=int, default=16, help="LoRA rank")
     parser.add_argument("--alpha", type=int, default=32, help="LoRA alpha (becomes scale=alpha/rank)")
@@ -54,12 +55,38 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
     parser.add_argument("--max-seq-length", type=int, default=2048, help="Max sequence length")
     parser.add_argument("--num-layers", type=int, default=-1, help="Number of layers to fine-tune (-1=all)")
+    parser.add_argument("--no-mask-prompt", action="store_true", help="Do not mask prompt tokens in the training loss")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    data_path = Path(args.data)
+    if data_path.is_file():
+        train_dir = output_dir / "data"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(data_path, train_dir / "train.jsonl")
+        data_arg = str(train_dir)
+    else:
+        data_arg = str(data_path)
 
     # Save config for reference
+    mlx_config_path = output_dir / "mlx_lora_config.yaml"
+    mlx_config = {
+        "lora_parameters": {
+            "rank": args.rank,
+            "dropout": 0.0,
+            "scale": args.alpha / args.rank,
+            "keys": [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+            ],
+        }
+    }
+    with open(mlx_config_path, "w") as f:
+        json.dump(mlx_config, f, indent=2)
+
     config = {
         "model": args.model,
         "rank": args.rank,
@@ -70,6 +97,8 @@ def main():
         "batch_size": args.batch_size,
         "max_seq_length": args.max_seq_length,
         "num_layers": args.num_layers,
+        "data": data_arg,
+        "mask_prompt": not args.no_mask_prompt,
     }
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -78,8 +107,9 @@ def main():
     cmd = [
         sys.executable, "-m", "mlx_lm", "lora",
         "--model", args.model,
+        "--config", str(mlx_config_path),
         "--train",
-        "--data", args.data,
+        "--data", data_arg,
         "--fine-tune-type", "lora",
         "--optimizer", "adam",
         "--batch-size", str(args.batch_size),
@@ -90,6 +120,9 @@ def main():
         "--save-every", str(args.iters),
         "--steps-per-report", "10",
     ]
+
+    if not args.no_mask_prompt:
+        cmd.append("--mask-prompt")
 
     if args.num_layers >= 0:
         cmd.extend(["--num-layers", str(args.num_layers)])
