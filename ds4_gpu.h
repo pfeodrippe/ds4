@@ -19,6 +19,7 @@ int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_private(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
@@ -199,6 +200,17 @@ int ds4_gpu_matmul_k_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_matmul_k_argmax_tensor(
+        ds4_gpu_tensor       *scratch,
+        ds4_gpu_tensor       *top_id,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                tensor_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_k_batch_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -319,6 +331,26 @@ int ds4_gpu_qwen_norm_rope_store_kv_tensor(
         uint32_t                row,
         uint32_t                cap,
         uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   freq_base,
+        float                   eps);
+
+int ds4_gpu_qwen_norm_rope_weight_store_kv_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *rope_cos,
+        const ds4_gpu_tensor *rope_sin,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                q_weight_offset,
+        uint64_t                k_weight_offset,
+        uint32_t                row,
+        uint32_t                cap,
+        uint32_t                n_q_head,
+        uint32_t                n_kv_head,
         uint32_t                head_dim,
         float                   freq_base,
         float                   eps);

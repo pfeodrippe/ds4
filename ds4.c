@@ -2621,7 +2621,8 @@ static void config_validate_model(const ds4_model *m) {
         exit(1);
     }
     if (model_get_string(m, "general.name", &name) &&
-        !ds4_strstr(name, "Qwen3-Coder-30B-A3B-Instruct")) {
+        !ds4_strstr(name, "Qwen3-Coder-30B-A3B-Instruct") &&
+        !ds4_strstr(name, "Qwen3 Coder 30B A3B Instruct")) {
         fprintf(stderr, "ds4: expected Qwen3-Coder-30B-A3B-Instruct GGUF, got %.*s\n",
                 (int)name.len, name.ptr);
         exit(1);
@@ -4037,7 +4038,8 @@ static void qwen_router_topk(
         float                weight[DS4_N_EXPERT_USED],
         const ds4_model     *model,
         const ds4_layer_weights *layer,
-        const float         *x) {
+        const float         *x,
+        float               *logits_out) {
     float logits[DS4_N_EXPERT];
     matvec_f32(logits, model, layer->ffn_gate_inp, x);
     if (layer->ffn_exp_probs_b) {
@@ -4050,6 +4052,7 @@ static void qwen_router_topk(
             if (g_expert_suppressed[i]) logits[i] = DS4_NEG_INF;
         }
     }
+    if (logits_out) memcpy(logits_out, logits, sizeof(logits));
     topk_desc(logits, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
 
     float maxv = logits[selected[0]];
@@ -4069,19 +4072,43 @@ static void qwen_router_topk(
 static void expert_log_push_entry(uint32_t layer_idx, uint32_t token_idx,
                                    const int selected[DS4_N_EXPERT_USED],
                                    const float weights[DS4_N_EXPERT_USED]);
+static bool qwen_cpu_debug_enabled(void);
+static bool qwen_cpu_debug_wants(const char *name, uint32_t il, uint32_t pos);
+static void qwen_cpu_debug_dump_tensor(
+        const char *name,
+        const float *data,
+        uint64_t n_f32,
+        uint32_t il,
+        uint32_t pos);
 
 static void qwen_moe_one(float *out, const ds4_model *model,
                          const ds4_layer_weights *layer, const float *x,
-                         uint32_t il, int token) {
+                         uint32_t il, uint32_t pos, int token) {
     int selected[DS4_N_EXPERT_USED];
     float expert_weight[DS4_N_EXPERT_USED];
+    float router_logits[DS4_N_EXPERT];
     float *gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(gate[0]));
     float *up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(up[0]));
     float *mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0]));
     float *down = xmalloc((size_t)DS4_N_EMBD * sizeof(down[0]));
+    float *dbg_gate = qwen_cpu_debug_enabled() ?
+        xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float)) : NULL;
+    float *dbg_up = qwen_cpu_debug_enabled() ?
+        xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float)) : NULL;
+    float *dbg_mid = qwen_cpu_debug_enabled() ?
+        xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float)) : NULL;
+    float *dbg_down = qwen_cpu_debug_enabled() ?
+        xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float)) : NULL;
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
-    qwen_router_topk(selected, expert_weight, model, layer, x);
+    qwen_router_topk(selected, expert_weight, model, layer, x, router_logits);
+    qwen_cpu_debug_dump_tensor("router_logits", router_logits, DS4_N_EXPERT, il, pos);
+    qwen_cpu_debug_dump_tensor("router_weights", expert_weight, DS4_N_EXPERT_USED, il, pos);
+    if (qwen_cpu_debug_wants("router_selected", il, pos)) {
+        float selected_f[DS4_N_EXPERT_USED];
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) selected_f[i] = (float)selected[i];
+        qwen_cpu_debug_dump_tensor("router_selected", selected_f, DS4_N_EXPERT_USED, il, pos);
+    }
     expert_log_push_entry(il, (uint32_t)token, selected, expert_weight);
     for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
         const uint32_t expert = (uint32_t)selected[i];
@@ -4091,9 +4118,29 @@ static void qwen_moe_one(float *out, const ds4_model *model,
             mid[j] = silu(gate[j]) * up[j] * expert_weight[i];
         }
         matvec_k_expert(down, model, layer->ffn_down_exps, mid, expert);
+        if (dbg_gate) memcpy(dbg_gate + (uint64_t)i * DS4_N_FF_EXP, gate,
+                             (size_t)DS4_N_FF_EXP * sizeof(float));
+        if (dbg_up) memcpy(dbg_up + (uint64_t)i * DS4_N_FF_EXP, up,
+                           (size_t)DS4_N_FF_EXP * sizeof(float));
+        if (dbg_mid) memcpy(dbg_mid + (uint64_t)i * DS4_N_FF_EXP, mid,
+                            (size_t)DS4_N_FF_EXP * sizeof(float));
+        if (dbg_down) memcpy(dbg_down + (uint64_t)i * DS4_N_EMBD, down,
+                             (size_t)DS4_N_EMBD * sizeof(float));
         for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] += down[j];
     }
+    if (dbg_gate) qwen_cpu_debug_dump_tensor("moe_gate", dbg_gate,
+                                             (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, il, pos);
+    if (dbg_up) qwen_cpu_debug_dump_tensor("moe_up", dbg_up,
+                                           (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, il, pos);
+    if (dbg_mid) qwen_cpu_debug_dump_tensor("moe_mid", dbg_mid,
+                                            (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, il, pos);
+    if (dbg_down) qwen_cpu_debug_dump_tensor("moe_down", dbg_down,
+                                             (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
 
+    free(dbg_down);
+    free(dbg_mid);
+    free(dbg_up);
+    free(dbg_gate);
     free(down);
     free(mid);
     free(up);
@@ -8126,6 +8173,38 @@ typedef struct {
     uint32_t n_layer_indices;
 } ds4_capture_ctx;
 
+static bool qwen_cpu_debug_enabled(void) {
+    const char *prefix = getenv("DS4_CPU_QWEN_DUMP_PREFIX");
+    return prefix && prefix[0];
+}
+
+static bool qwen_cpu_debug_wants(const char *name, uint32_t il, uint32_t pos) {
+    if (!qwen_cpu_debug_enabled()) return false;
+    const char *name_env = getenv("DS4_CPU_QWEN_DUMP_NAME");
+    if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
+    const char *layer_env = getenv("DS4_CPU_QWEN_DUMP_LAYER");
+    if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
+        (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
+    const char *pos_env = getenv("DS4_CPU_QWEN_DUMP_POS");
+    if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
+    return true;
+}
+
+static void qwen_cpu_debug_dump_tensor(
+        const char *name,
+        const float *data,
+        uint64_t n_f32,
+        uint32_t il,
+        uint32_t pos) {
+    if (!data || n_f32 == 0 || !qwen_cpu_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_CPU_QWEN_DUMP_PREFIX");
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+    if (write_f32_binary_file(path, data, n_f32)) {
+        fprintf(stderr, "ds4: CPU dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+    }
+}
+
 /* CPU decode for one token using the Qwen3-Coder attention path.
  * This avoids the DeepSeek-specific MLA/HC grouped-output paths and
  * uses separate K/V caches instead of the fused MLA latent cache. */
@@ -8229,13 +8308,16 @@ static void forward_token_qwen_cpu(
         }
 
         matvec_any(attn_out, model, layer->attn_output_a, heads);
+        qwen_cpu_debug_dump_tensor("attn_out", attn_out, d, il, pos);
         cpu_directional_steering_project_rows_multi(
                 attn_out, n_steering, steering_dirs, il, 1, steering_attn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += attn_out[i];
 
         const float *ffn_norm = tensor_data(model, layer->ffn_norm);
         rms_norm_weight(norm, x, ffn_norm, d, DS4_RMS_EPS);
-        qwen_moe_one(ffn_out, model, layer, norm, il, token);
+        qwen_cpu_debug_dump_tensor("ffn_norm", norm, d, il, pos);
+        qwen_moe_one(ffn_out, model, layer, norm, il, pos, token);
+        qwen_cpu_debug_dump_tensor("ffn_out", ffn_out, d, il, pos);
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
@@ -8244,6 +8326,7 @@ static void forward_token_qwen_cpu(
         if (sae_vec && il == sae_layer) {
             for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
         }
+        qwen_cpu_debug_dump_tensor("resid", x, d, il, pos);
 
         /* Activation capture: copy residual stream after this layer. */
         if (capture && capture->n_tokens < capture->capacity) {
@@ -8379,13 +8462,16 @@ static int forward_token_qwen_cpu_layer_logprobs(
         }
 
         matvec_any(attn_out, model, layer->attn_output_a, heads);
+        qwen_cpu_debug_dump_tensor("attn_out", attn_out, d, il, pos);
         cpu_directional_steering_project_rows_multi(
                 attn_out, n_steering, steering_dirs, il, 1, steering_attn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += attn_out[i];
 
         const float *ffn_norm = tensor_data(model, layer->ffn_norm);
         rms_norm_weight(norm, x, ffn_norm, d, DS4_RMS_EPS);
-        qwen_moe_one(ffn_out, model, layer, norm, il, token);
+        qwen_cpu_debug_dump_tensor("ffn_norm", norm, d, il, pos);
+        qwen_moe_one(ffn_out, model, layer, norm, il, pos, token);
+        qwen_cpu_debug_dump_tensor("ffn_out", ffn_out, d, il, pos);
         cpu_directional_steering_project_rows_multi(
                 ffn_out, n_steering, steering_dirs, il, 1, steering_ffn_scales);
         for (uint32_t i = 0; i < d; i++) x[i] += ffn_out[i];
@@ -8393,6 +8479,7 @@ static int forward_token_qwen_cpu_layer_logprobs(
         if (sae_vec && il == sae_layer) {
             for (uint32_t i = 0; i < d; i++) x[i] += sae_scale * sae_vec[i];
         }
+        qwen_cpu_debug_dump_tensor("resid", x, d, il, pos);
 
         /* Activation capture: copy residual stream after this layer. */
         if (capture && capture->n_tokens < capture->capacity) {
@@ -8886,6 +8973,8 @@ typedef struct {
     ds4_gpu_tensor *q;
     ds4_gpu_tensor *kv_raw;
     ds4_gpu_tensor *kv;
+    ds4_gpu_tensor *rope_cos;
+    ds4_gpu_tensor *rope_sin;
 
     /* Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
      * layers also keep an indexer-compressed cache; ratio-128 layers keep only
@@ -8966,6 +9055,7 @@ typedef struct {
     ds4_gpu_tensor *output_embd;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *top_id;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -9150,6 +9240,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->output_embd);
     ds4_gpu_tensor_free(g->output_weights);
     ds4_gpu_tensor_free(g->output_pre);
+    ds4_gpu_tensor_free(g->top_id);
     ds4_gpu_tensor_free(g->after_ffn_hc);
     ds4_gpu_tensor_free(g->ffn_out);
     ds4_gpu_tensor_free(g->routed_out);
@@ -9215,6 +9306,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
+    ds4_gpu_tensor_free(g->rope_sin);
+    ds4_gpu_tensor_free(g->rope_cos);
     ds4_gpu_tensor_free(g->q);
     ds4_gpu_tensor_free(g->qr_norm);
     ds4_gpu_tensor_free(g->qr);
@@ -9382,26 +9475,30 @@ static bool qwen_graph_alloc(
     g->raw_window = ctx_size;
     g->prefill_cap = prefill_cap;
 
-    g->cur_hc = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_ffn_hc = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->attn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->q = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->kv_raw = ds4_gpu_tensor_alloc(kv_dim * sizeof(float));
-    g->kv = ds4_gpu_tensor_alloc(kv_dim * sizeof(float));
-    g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->attn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->ffn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->router_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
-    g->router_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
-    g->router_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
-    g->router_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
-    g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-    g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->cur_hc = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->after_ffn_hc = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->attn_norm = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->q = ds4_gpu_tensor_alloc_private(q_dim * sizeof(float));
+    g->kv_raw = ds4_gpu_tensor_alloc_private(kv_dim * sizeof(float));
+    g->kv = ds4_gpu_tensor_alloc_private(kv_dim * sizeof(float));
+    g->rope_cos = ds4_gpu_tensor_alloc((uint64_t)ctx_size * (DS4_N_HEAD_DIM / 2u) * sizeof(float));
+    g->rope_sin = ds4_gpu_tensor_alloc((uint64_t)ctx_size * (DS4_N_HEAD_DIM / 2u) * sizeof(float));
+    g->heads = ds4_gpu_tensor_alloc_private(q_dim * sizeof(float));
+    g->attn_out = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->ffn_norm = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->router_logits = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g->router_probs = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g->router_selected = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    g->router_weights = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    g->routed_gate = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_up = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_mid = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_down = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    g->routed_out = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->output_pre = ds4_gpu_tensor_alloc_private(vocab_dim * sizeof(float));
+    g->output_norm = ds4_gpu_tensor_alloc_private((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    g->top_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
 
     g->prefill_tokens = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EMBD * sizeof(float));
@@ -9426,19 +9523,22 @@ static bool qwen_graph_alloc(
 
     bool cache_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_size * kv_dim * sizeof(float));
-        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_size * kv_dim * sizeof(float));
+        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(float));
+        g->layer_v_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(float));
         cache_ok = cache_ok && g->layer_raw_cache[il] && g->layer_v_cache[il];
     }
 
     const bool ok = cache_ok &&
                     g->cur_hc && g->after_ffn_hc &&
                     g->attn_norm && g->q && g->kv_raw && g->kv &&
+                    g->rope_cos && g->rope_sin &&
                     g->heads && g->attn_out && g->ffn_norm &&
                     g->router_logits && g->router_probs &&
                     g->router_selected && g->router_weights &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
-                    g->routed_down && g->routed_out && g->output_norm && g->logits &&
+                    g->routed_down && g->routed_out &&
+                    g->output_pre && g->output_norm && g->logits &&
+                    g->top_id &&
                     g->prefill_tokens && g->batch_cur_hc && g->batch_next_hc &&
                     g->batch_attn_norm && g->batch_q && g->batch_kv_raw &&
                     g->batch_kv && g->batch_heads && g->batch_attn_out &&
@@ -9449,6 +9549,26 @@ static bool qwen_graph_alloc(
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
     if (!ok) metal_graph_free(g);
+    if (ok) {
+        enum { HALF_DIM = DS4_N_HEAD_DIM / 2 };
+        const uint64_t elems = (uint64_t)ctx_size * HALF_DIM;
+        float *c = xmalloc((size_t)elems * sizeof(c[0]));
+        float *s = xmalloc((size_t)elems * sizeof(s[0]));
+        for (uint32_t pos = 0; pos < ctx_size; pos++) {
+            for (uint32_t i = 0; i < HALF_DIM; i++) {
+                const float theta = (float)pos *
+                    powf(DS4_ROPE_FREQ_BASE, -2.0f * (float)i / (float)DS4_N_HEAD_DIM);
+                c[(uint64_t)pos * HALF_DIM + i] = cosf(theta);
+                s[(uint64_t)pos * HALF_DIM + i] = sinf(theta);
+            }
+        }
+        const uint64_t bytes = elems * sizeof(float);
+        const bool wrote = ds4_gpu_tensor_write(g->rope_cos, 0, c, bytes) != 0 &&
+                           ds4_gpu_tensor_write(g->rope_sin, 0, s, bytes) != 0;
+        free(s);
+        free(c);
+        return wrote;
+    }
     return ok;
 }
 
@@ -9461,7 +9581,17 @@ static bool qwen_graph_alloc(
  * the command batch, so it is intentionally isolated here.
  */
 
+static bool metal_graph_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+        enabled = prefix && prefix[0] ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
+    if (!metal_graph_debug_enabled()) return false;
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!prefix || !prefix[0]) return false;
 
@@ -9484,8 +9614,8 @@ static void metal_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -9513,8 +9643,8 @@ static void metal_graph_debug_dump_f16_tensor(
         uint64_t          n_f16,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_f16 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -9545,8 +9675,8 @@ static void metal_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_i32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
 
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -10972,6 +11102,91 @@ static bool qwen_graph_embed_token(
                                         DS4_N_EMBD) != 0;
 }
 
+static bool qwen_graph_encode_output_logits(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    const uint64_t vocab_dim = weights->output->dim[1];
+    bool ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                             g->cur_hc,
+                                             model->map,
+                                             model->size,
+                                             weights->output_norm->abs_offset,
+                                             DS4_N_EMBD,
+                                             DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->logits, model, weights->output,
+                                                 DS4_N_EMBD, vocab_dim,
+                                                 g->output_norm, 1);
+    return ok;
+}
+
+static bool qwen_graph_encode_output_top1(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    bool ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                             g->cur_hc,
+                                             model->map,
+                                             model->size,
+                                             weights->output_norm->abs_offset,
+                                             DS4_N_EMBD,
+                                             DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_k_argmax_tensor(g->output_pre,
+                                                g->top_id,
+                                                model->map,
+                                                model->size,
+                                                weights->output->abs_offset,
+                                                weights->output->type,
+                                                DS4_N_EMBD,
+                                                weights->output->dim[1],
+                                                g->output_norm) != 0;
+    return ok;
+}
+
+static bool qwen_graph_update_rope_tables(ds4_gpu_graph *g, uint32_t pos) {
+    if (!g || !g->rope_cos || !g->rope_sin) return false;
+    enum { HALF_DIM = DS4_N_HEAD_DIM / 2 };
+    const uint64_t need_bytes = ((uint64_t)pos + 1u) * HALF_DIM * sizeof(float);
+    if (ds4_gpu_tensor_bytes(g->rope_cos) >= need_bytes &&
+        ds4_gpu_tensor_bytes(g->rope_sin) >= need_bytes) {
+        return true;
+    }
+    float c[HALF_DIM];
+    float s[HALF_DIM];
+    for (uint32_t i = 0; i < HALF_DIM; i++) {
+        const float theta = (float)pos *
+            powf(DS4_ROPE_FREQ_BASE, -2.0f * (float)i / (float)DS4_N_HEAD_DIM);
+        c[i] = cosf(theta);
+        s[i] = sinf(theta);
+    }
+    return ds4_gpu_tensor_write(g->rope_cos, 0, c, sizeof(c)) != 0 &&
+           ds4_gpu_tensor_write(g->rope_sin, 0, s, sizeof(s)) != 0;
+}
+
+static bool qwen_token_stage_profile_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_QWEN_TOKEN_STAGE_PROFILE") != NULL;
+    return enabled != 0;
+}
+
+static uint32_t qwen_token_split_after_layers(void) {
+    static int initialized;
+    static uint32_t split_after_layers;
+    if (!initialized) {
+        split_after_layers = 1u;
+        const char *split_env = getenv("DS4_QWEN_TOKEN_SPLIT_LAYERS");
+        if (split_env && split_env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(split_env, &end, 10);
+            if (end != split_env && v <= DS4_N_LAYER) {
+                split_after_layers = (uint32_t)v;
+            }
+        }
+        initialized = 1;
+    }
+    return split_after_layers;
+}
+
 static bool qwen_graph_encode_token(
         ds4_gpu_graph *g,
         const ds4_model *model,
@@ -10982,9 +11197,8 @@ static bool qwen_graph_encode_token(
     if (!g || !model || !weights || pos >= g->raw_cap) return false;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    const uint64_t vocab_dim = weights->output->dim[1];
-    const bool qwen_stage_profile = getenv("DS4_QWEN_TOKEN_STAGE_PROFILE") != NULL;
-    const char *qwen_stage_filter = getenv("DS4_QWEN_TOKEN_STAGE_PROFILE_FILTER");
+    const bool qwen_stage_profile = qwen_token_stage_profile_enabled();
+    const char *qwen_stage_filter = qwen_stage_profile ? getenv("DS4_QWEN_TOKEN_STAGE_PROFILE_FILTER") : NULL;
     double qwen_stage_t0 = qwen_stage_profile ? now_sec() : 0.0;
 #define DS4_PROFILE_QWEN_TOKEN_STAGE(layer_id, name) do { \
         if (ok && qwen_stage_profile) { \
@@ -11011,16 +11225,11 @@ static bool qwen_graph_encode_token(
         } \
     } while (0)
 
-    bool ok = qwen_graph_embed_token(g, model, weights, token);
+    bool ok = qwen_graph_update_rope_tables(g, pos);
+    if (ok) ok = qwen_graph_embed_token(g, model, weights, token);
     DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "embed");
 
-    uint32_t split_after_layers = 0;
-    const char *split_env = getenv("DS4_QWEN_TOKEN_SPLIT_LAYERS");
-    if (split_env && split_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(split_env, &end, 10);
-        if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
-    }
+    const uint32_t split_after_layers = qwen_token_split_after_layers();
 
     bool attn_norm_ready = false;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -11040,7 +11249,7 @@ static bool qwen_graph_encode_token(
                                                 DS4_RMS_EPS) != 0;
         }
         attn_norm_ready = false;
-            if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
                                                      DS4_N_EMBD, q_dim, g->attn_norm, 1);
         if (ok) ok = metal_graph_matmul_plain_tensor(g->kv_raw, model, layer->attn_q_b,
                                                      DS4_N_EMBD, kv_dim, g->attn_norm, 1);
@@ -11068,28 +11277,24 @@ static bool qwen_graph_encode_token(
             }
         }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qkv");
-        if (ok) ok = ds4_gpu_qwen_norm_rope_weight_tensor(g->q,
-                                                          model->map,
-                                                          model->size,
-                                                          layer->attn_q_a_norm->abs_offset,
-                                                          DS4_N_HEAD,
-                                                          DS4_N_HEAD_DIM,
-                                                          pos,
-                                                          DS4_ROPE_FREQ_BASE,
-                                                          DS4_RMS_EPS) != 0;
-        if (ok) ok = ds4_gpu_qwen_norm_rope_store_kv_tensor(g->layer_raw_cache[il],
-                                                            g->layer_v_cache[il],
-                                                            g->kv_raw,
-                                                            g->kv,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->attn_kv_a_norm->abs_offset,
-                                                            pos,
-                                                            g->raw_cap,
-                                                            DS4_N_HEAD_KV,
-                                                            DS4_N_HEAD_DIM,
-                                                            DS4_ROPE_FREQ_BASE,
-                                                            DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_qwen_norm_rope_weight_store_kv_tensor(g->q,
+                                                                   g->layer_raw_cache[il],
+                                                                   g->layer_v_cache[il],
+                                                                   g->kv_raw,
+                                                                   g->kv,
+                                                                   g->rope_cos,
+                                                                   g->rope_sin,
+                                                                   model->map,
+                                                                   model->size,
+                                                                   layer->attn_q_a_norm->abs_offset,
+                                                                   layer->attn_kv_a_norm->abs_offset,
+                                                                   pos,
+                                                                   g->raw_cap,
+                                                                   DS4_N_HEAD,
+                                                                   DS4_N_HEAD_KV,
+                                                                   DS4_N_HEAD_DIM,
+                                                                   DS4_ROPE_FREQ_BASE,
+                                                                   DS4_RMS_EPS) != 0;
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "qk_norm_rope_store");
         if (ok) ok = ds4_gpu_qwen_attention_tensor(g->heads,
                                                    g->q,
@@ -11124,6 +11329,7 @@ static bool qwen_graph_encode_token(
                                                         layer->ffn_norm->abs_offset,
                                                         DS4_N_EMBD,
                                                         DS4_RMS_EPS) != 0;
+        if (ok) metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "attention_out");
 
         if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
@@ -11134,6 +11340,11 @@ static bool qwen_graph_encode_token(
                                                        g->router_logits,
                                                        DS4_N_EXPERT,
                                                        DS4_N_EXPERT_USED) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("router_logits", g->router_logits, DS4_N_EXPERT, il, pos);
+            metal_graph_debug_dump_tensor("router_weights", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+            metal_graph_debug_dump_i32_tensor("router_selected", g->router_selected, DS4_N_EXPERT_USED, il, pos);
+        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "router");
         if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->routed_out,
                                                      g->routed_gate,
@@ -11162,6 +11373,14 @@ static bool qwen_graph_encode_token(
                                                      il,
                                                      1,
                                                      NULL) != 0;
+        if (ok) {
+            const uint64_t routed_mid_elems = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+            metal_graph_debug_dump_tensor("moe_gate", g->routed_gate, routed_mid_elems, il, pos);
+            metal_graph_debug_dump_tensor("moe_up", g->routed_up, routed_mid_elems, il, pos);
+            metal_graph_debug_dump_tensor("moe_mid", g->routed_mid, routed_mid_elems, il, pos);
+            metal_graph_debug_dump_tensor("moe_down", g->routed_down,
+                                          (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
+        }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "routed_moe");
         if (ok) metal_graph_debug_dump_tensor("ffn_out", g->routed_out, DS4_N_EMBD, il, pos);
         if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
@@ -11196,6 +11415,7 @@ static bool qwen_graph_encode_token(
                 }
             }
         }
+        if (ok) metal_graph_debug_dump_tensor("resid", g->cur_hc, DS4_N_EMBD, il, pos);
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "ffn_resid");
         if (ok && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
@@ -11203,15 +11423,7 @@ static bool qwen_graph_encode_token(
     }
 
     if (need_logits) {
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                    g->cur_hc,
-                                                    model->map,
-                                                    model->size,
-                                                    weights->output_norm->abs_offset,
-                                                    DS4_N_EMBD,
-                                                    DS4_RMS_EPS) != 0;
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->logits, model, weights->output,
-                                                     DS4_N_EMBD, vocab_dim, g->output_norm, 1);
+        if (ok) ok = qwen_graph_encode_output_logits(g, model, weights);
         DS4_PROFILE_QWEN_TOKEN_STAGE(-1, "output_head");
     }
 #undef DS4_PROFILE_QWEN_TOKEN_STAGE
@@ -11224,7 +11436,7 @@ static bool qwen_graph_eval_token(
         const ds4_weights *weights,
         int token,
         uint32_t pos,
-        float *logits_out) {
+    float *logits_out) {
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = qwen_graph_encode_token(g, model, weights, token, pos, logits_out != NULL);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -11237,6 +11449,52 @@ static bool qwen_graph_eval_token(
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     return ok;
+}
+
+static bool qwen_graph_eval_token_top1(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int token,
+        uint32_t pos,
+        int *top_id) {
+    if (!top_id || !g || !g->top_id) return false;
+    const bool profile_top1 = getenv("DS4_QWEN_TOP1_PROFILE") != NULL;
+    const double t0 = profile_top1 ? now_sec() : 0.0;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = qwen_graph_encode_token(g, model, weights, token, pos, false);
+    if (ok && profile_top1) {
+        const double encoded = now_sec();
+        ok = ds4_gpu_flush_commands() != 0;
+        if (ok) ok = ds4_gpu_synchronize() != 0;
+        const double layers_done = now_sec();
+        fprintf(stderr,
+                "ds4: qwen top1 profile pos=%u layers encode=%.3f ms execute=%.3f ms total=%.3f ms\n",
+                pos,
+                (encoded - t0) * 1000.0,
+                (layers_done - encoded) * 1000.0,
+                (layers_done - t0) * 1000.0);
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+    }
+    const double out_t0 = profile_top1 ? now_sec() : 0.0;
+    if (ok) ok = qwen_graph_encode_output_top1(g, model, weights);
+    if (ok && profile_top1) {
+        const double encoded = now_sec();
+        ok = ds4_gpu_end_commands() != 0;
+        const double out_done = now_sec();
+        fprintf(stderr,
+                "ds4: qwen top1 profile pos=%u output encode=%.3f ms execute=%.3f ms total=%.3f ms\n",
+                pos,
+                (encoded - out_t0) * 1000.0,
+                (out_done - encoded) * 1000.0,
+                (out_done - out_t0) * 1000.0);
+    }
+    if (ok && !profile_top1) ok = ds4_gpu_end_commands() != 0;
+    if (!ok) {
+        (void)ds4_gpu_end_commands();
+        return false;
+    }
+    return ds4_gpu_tensor_read(g->top_id, 0, top_id, sizeof(*top_id)) != 0;
 }
 
 static ds4_gpu_tensor *metal_graph_tensor_row_view(
@@ -17048,45 +17306,53 @@ static int generate_metal_graph_raw_swa(
         }
         fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
-        int pos = prompt->len;
-        int n_generated = 0;
-        int n_decode_eval = 0;
-        const double t_decode0 = now_sec();
-        for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-            if (trace_top) {
-                char label[64];
-                snprintf(label, sizeof(label), "step %d", i);
-                print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
-            }
-            int token = sample_argmax(logits, DS4_N_VOCAB);
-            if (token == vocab->eos_id) break;
-            if (emit) emit(emit_ud, token);
-            n_generated++;
-            if (i == n_predict - 1 || pos + 1 >= ctx_size) {
-                pos++;
-                break;
-            }
-            const double t_eval0 = token_timing ? now_sec() : 0.0;
-            ok = qwen_graph_eval_token(&g, model, weights, token, (uint32_t)pos, logits);
-            if (!ok) break;
-            if (token_timing) {
-                const double t_eval1 = now_sec();
-                fprintf(stderr, "ds4: qwen metal decode eval %d took %.3f ms\n",
-                        n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-            }
-            n_decode_eval++;
-            pos++;
+    const bool greedy_top1 = !trace_top;
+    int cached_top1 = sample_argmax(logits, DS4_N_VOCAB);
+    int pos = prompt->len;
+    int n_generated = 0;
+    int n_decode_eval = 0;
+    const double t_decode0 = now_sec();
+    for (int i = 0; i < n_predict && pos < ctx_size; i++) {
+        if (trace_top) {
+            char label[64];
+            snprintf(label, sizeof(label), "step %d", i);
+            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
-        const double t_decode1 = now_sec();
-        if (done) done(emit_ud);
-        ds4_log(stderr,
-                DS4_LOG_TIMING,
-                "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
-        free(logits);
-        metal_graph_free(&g);
-        return ok ? 0 : 1;
+        int token = greedy_top1 ? cached_top1 : sample_argmax(logits, DS4_N_VOCAB);
+        if (token == vocab->eos_id) break;
+        if (emit) emit(emit_ud, token);
+        n_generated++;
+        if (i == n_predict - 1 || pos + 1 >= ctx_size) {
+            pos++;
+            break;
+        }
+        const double t_eval0 = token_timing ? now_sec() : 0.0;
+        if (greedy_top1) {
+            ok = qwen_graph_eval_token_top1(&g, model, weights, token,
+                                            (uint32_t)pos, &cached_top1);
+        } else {
+            ok = qwen_graph_eval_token(&g, model, weights, token,
+                                       (uint32_t)pos, logits);
+        }
+        if (!ok) break;
+        if (token_timing) {
+            const double t_eval1 = now_sec();
+            fprintf(stderr, "ds4: qwen metal decode eval %d took %.3f ms\n",
+                    n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
+        }
+        n_decode_eval++;
+        pos++;
+    }
+    const double t_decode1 = now_sec();
+    if (done) done(emit_ud);
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
+            (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+    free(logits);
+    metal_graph_free(&g);
+    return ok ? 0 : 1;
 }
 #endif
 
@@ -17234,6 +17500,9 @@ struct ds4_session {
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
+    bool logits_valid;
+    bool cached_argmax_valid;
+    int cached_argmax;
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
@@ -17549,6 +17818,57 @@ bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static void session_note_logits_valid(ds4_session *s) {
+    if (!s) return;
+    s->logits_valid = true;
+    s->cached_argmax_valid = false;
+}
+
+static void session_note_logits_stale_top1(ds4_session *s, int top_id) {
+    if (!s) return;
+    s->logits_valid = false;
+    s->cached_argmax = top_id;
+    s->cached_argmax_valid = top_id >= 0;
+}
+
+static void session_note_logits_invalid(ds4_session *s) {
+    if (!s) return;
+    s->logits_valid = false;
+    s->cached_argmax_valid = false;
+    s->cached_argmax = -1;
+}
+
+static int session_materialize_logits(ds4_session *s, char *err, size_t errlen) {
+    if (!s) return 1;
+    if (s->logits_valid) return 0;
+    if (ds4_session_is_cpu(s)) {
+        session_note_logits_valid(s);
+        return 0;
+    }
+#ifdef DS4_NO_GPU
+    payload_set_err(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_engine *e = s->engine;
+    if (!e || !s->checkpoint_valid || !s->graph.logits) {
+        payload_set_err(err, errlen, "session has no materialized Metal logits");
+        return 1;
+    }
+    if (ds4_gpu_tensor_read(s->graph.logits, 0, s->logits,
+                            (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
+        payload_set_err(err, errlen, "failed to read Metal logits");
+        return 1;
+    }
+    session_note_logits_valid(s);
+    return 0;
+#endif
+}
+
+static bool session_materialize_logits_best_effort(ds4_session *s) {
+    char err[128];
+    return session_materialize_logits(s, err, sizeof(err)) == 0;
+}
+
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -17751,6 +18071,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    if (session_materialize_logits(s, err, errlen) != 0) return 1;
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -18101,6 +18422,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint = new_checkpoint;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        session_note_logits_valid(s);
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -18312,6 +18634,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
+    session_note_logits_valid(s);
     return 0;
 #endif
 }
@@ -19029,6 +19352,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->logit_bias = NULL;
+        s->cached_argmax = -1;
         s->sae_feature_id = -1;
         s->sae_scale = 0.0f;
         s->n_sae_features = 0;
@@ -19070,6 +19394,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     s->logit_bias = NULL;
+    s->cached_argmax = -1;
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
@@ -19585,6 +19910,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                         s->capture_enabled ? &capture : NULL);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
             }
+            session_note_logits_valid(s);
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
             return 0;
         }
@@ -19609,6 +19935,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        session_note_logits_valid(s);
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         return 0;
     }
@@ -19652,6 +19979,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        if (n > 0) {
+            session_note_logits_valid(s);
+        } else if (!s->logits_valid && !s->cached_argmax_valid &&
+                   session_materialize_logits(s, err, errlen) != 0) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
         if (n == 0 && s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         return 0;
     }
@@ -19698,6 +20032,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    session_note_logits_valid(s);
     return 0;
 #endif
 }
@@ -19780,12 +20115,22 @@ static void session_apply_logit_bias(ds4_session *s) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+    if (!s) return -1;
+    if (!s->logits_valid && s->cached_argmax_valid && !s->logit_bias) {
+        return s->cached_argmax;
+    }
+    if (!session_materialize_logits_best_effort(s)) return -1;
     session_apply_logit_bias(s);
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+    if (!s->logits_valid && s->cached_argmax_valid && !s->logit_bias &&
+        s->cached_argmax != excluded_id) {
+        return s->cached_argmax;
+    }
+    if (!session_materialize_logits_best_effort(s)) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -19800,12 +20145,14 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!session_materialize_logits_best_effort(s)) return -1;
     session_apply_logit_bias(s);
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+    if (!session_materialize_logits_best_effort(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -19843,6 +20190,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!session_materialize_logits_best_effort(s)) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -19865,6 +20213,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    if (!session_materialize_logits_best_effort(s)) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
@@ -19919,6 +20268,26 @@ int ds4_session_layer_logprobs(ds4_session *s, int layer, ds4_token_score *out, 
     kv_cache_free(&tmp_cache);
     return n;
 }
+
+#ifndef DS4_NO_GPU
+static void ds4_session_read_metal_capture_after_eval(ds4_session *s) {
+    if (!s || ds4_session_is_cpu(s) ||
+        !s->capture_enabled ||
+        s->capture_buf.n_tokens >= s->capture_buf.capacity) {
+        return;
+    }
+    ds4_gpu_graph *g = &s->graph;
+    for (uint32_t ci = 0; ci < g->capture_n_layers; ci++) {
+        const uint64_t src_off = (uint64_t)g->capture_n_tokens * DS4_N_EMBD * sizeof(float);
+        const uint64_t dst_off = ((uint64_t)s->capture_buf.n_tokens * s->capture_buf.n_layers + ci) * DS4_N_EMBD;
+        ds4_gpu_tensor_read(g->capture_bufs[ci], src_off,
+                            s->capture_buf.data + dst_off,
+                            (uint64_t)DS4_N_EMBD * sizeof(float));
+    }
+    s->capture_buf.n_tokens++;
+    g->capture_n_tokens++;
+}
+#endif
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
@@ -19982,6 +20351,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        session_note_logits_valid(s);
         (void)probe_mtp;
         return 0;
     }
@@ -20010,19 +20380,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     token_vec_push(&s->checkpoint, token);
     g_lora_engine = prev_lora_engine;
     g_lora_scale = prev_lora_scale;
-    /* Activation capture readback for Metal. */
-    if (s->capture_enabled && s->capture_buf.n_tokens < s->capture_buf.capacity) {
-        ds4_gpu_graph *g = &s->graph;
-        for (uint32_t ci = 0; ci < g->capture_n_layers; ci++) {
-            const uint64_t src_off = (uint64_t)g->capture_n_tokens * DS4_N_EMBD * sizeof(float);
-            const uint64_t dst_off = ((uint64_t)s->capture_buf.n_tokens * s->capture_buf.n_layers + ci) * DS4_N_EMBD;
-            ds4_gpu_tensor_read(g->capture_bufs[ci], src_off,
-                                s->capture_buf.data + dst_off,
-                                (uint64_t)DS4_N_EMBD * sizeof(float));
-        }
-        s->capture_buf.n_tokens++;
-        g->capture_n_tokens++;
-    }
+    ds4_session_read_metal_capture_after_eval(s);
     /* Classifier-Free Guidance */
     if (s->cfg_session && s->cfg_scale != 0.0f) {
         if (ds4_session_eval_internal(s->cfg_session, token, false, err, errlen) != 0) {
@@ -20036,6 +20394,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    session_note_logits_valid(s);
     (void)probe_mtp;
     return 0;
 #endif
@@ -20043,6 +20402,51 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
+    if (!s) return -1;
+    if (ds4_session_is_cpu(s) ||
+        s->logit_bias ||
+        (s->cfg_session && s->cfg_scale != 0.0f)) {
+        if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
+#ifdef DS4_NO_GPU
+    (void)token;
+    payload_set_err(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    ds4_engine *e = s->engine;
+    if (!e || !s->checkpoint_valid || s->checkpoint.len + 1 >= s->ctx_size) {
+        snprintf(err, errlen, "session has no valid checkpoint or exceeds context");
+        return -1;
+    }
+
+    ds4_engine *prev_lora_engine = g_lora_engine;
+    float prev_lora_scale = g_lora_scale;
+    g_lora_engine = e;
+    g_lora_scale = (e && e->lora_initialized) ? (e->lora_cfg.lora_alpha / e->lora_cfg.rank) : 0.0f;
+
+    int top = -1;
+    const bool ok = qwen_graph_eval_token_top1(&s->graph, &e->model, &e->weights,
+                                               token, (uint32_t)s->checkpoint.len, &top);
+    g_lora_engine = prev_lora_engine;
+    g_lora_scale = prev_lora_scale;
+    if (!ok) {
+        snprintf(err, errlen, "%s Qwen top-1 decode failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        session_note_logits_invalid(s);
+        return -1;
+    }
+
+    token_vec_push(&s->checkpoint, token);
+    ds4_session_read_metal_capture_after_eval(s);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    session_note_logits_stale_top1(s, top);
+    return top;
+#endif
 }
 
 /* Speculative decode state machine:
@@ -20651,6 +21055,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    session_note_logits_invalid(s);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
@@ -20662,6 +21067,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    session_note_logits_invalid(s);
     if (ds4_session_is_cpu(s)) {
         /* Rewinding a sliding-window / compression cache to an arbitrary point
          * is not supported without a full snapshot.  Invalidate so the next sync

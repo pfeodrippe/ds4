@@ -140,12 +140,64 @@ Results:
 - A longer deterministic generation sanity prompt (`Write numbers from 1 to 200
   separated by spaces.`) generated the expected increasing sequence and measured
   about 38.6 tok/s at `--ctx 4096`.
-- Local Ollama on the same `qwen3-coder:30b` Q4_K_M model reports about
-  81.5 tok/s on the same long-number prompt, so the custom engine is still
-  roughly 2x behind the current target. The remaining gap is not logits readback:
-  a greedy GPU argmax experiment was neutral/slower. The dominant decode
-  bottleneck is still the per-layer router path and general graph dispatch
-  count.
+- The 2026-05-31 greedy decode pass added a Qwen top-1 session eval path that
+  keeps full logits on GPU until a feature explicitly needs them. This preserves
+  sampling, logprobs, CFG, logit bias, activation capture, snapshots, and
+  steering behavior by lazily materializing logits on those paths.
+- The same long-number prompt at `--ctx 512`, `--temp 0`, Metal generated the
+  expected increasing sequence at 40.27 tok/s after changing the measured Qwen
+  command-buffer split default from layer 4 to layer 1. Repeated local runs:
+  split 1 averaged about 40.01 tok/s, split 2 about 39.96 tok/s, and split 4
+  about 39.92 tok/s. `DS4_QWEN_TOKEN_SPLIT_LAYERS=0` still disables the
+  scheduling split for diagnostics.
+- `ds4-bench` now measures the same fast greedy session path and reports
+  `32,32,55.36,80,39.66,1394740` on the 32-token frontier smoke. This is up
+  from about 38.7 tok/s before the fast greedy/scheduling pass, but still far
+  below the Ollama target.
+- Local Ollama on the same `qwen3-coder:30b` Q4_K_M model reported
+  `eval rate: 70.83 tokens/s` over 692 eval tokens for the long-number prompt
+  on 2026-05-31. That is the current local comparison point; it is not 100
+  tok/s. The custom engine is still materially behind it. CPU sampling shows
+  the process mostly waiting in Metal command-buffer completion, so the
+  remaining gap is GPU kernel work: router projection/selection, routed MoE,
+  output head, and per-layer dispatch count.
+- The Q4_K/Q6_K decode matvec kernels were compared against current upstream
+  llama.cpp Metal (`ggml-org/llama.cpp` commit `6f165c1`, 2026-05-31). The
+  core decode `kernel_mul_mv_q4_K_f32` and `kernel_mul_mv_q6_K_f32` structure
+  is already equivalent here; the upstream gap is more likely in graph-level
+  scheduling, grouped matmul/id paths, and output-head handling than in a
+  missing newer scalar decode kernel.
+- A corrected Q4_K/Q6_K decode matvec SIMD-group sweep retained
+  `DS4_QWEN_K_MV_NSG=4` for the fixed Qwen K-matvec path. The host dispatch
+  and Metal function constant must match. Valid measurements were modest:
+  the deterministic long-number prompt measured about 40.27 tok/s in the final
+  run, while `ds4-bench` measured 39.66 tok/s. `nsg=6` was rejected because it
+  dropped prefill to about 50.34 tok/s and benchmark decode to about 39.54
+  tok/s. Pipeline-only sweeps without matching host dispatch are invalid and
+  must not be used as performance evidence.
+- A fused one-threadgroup router projection/select experiment was rejected
+  because it reduced the long-number prompt to about 34.5 tok/s. The existing
+  vectorized router matvec remains faster on M3 Max.
+- Periodic four-layer command-buffer splits and skipping the debug router-prob
+  write were also rejected: neither beat the simpler single split.
+- Private model-buffer upload, untracked model buffers, a router no-probs
+  select kernel, router `nsg=4`, and two different output-head argmax
+  shortcuts were rejected. They either regressed throughput, failed memory
+  pressure on the 48 GiB M3 Max, or made correctness too fragile. The retained
+  path keeps full logits available for the surfaces that need them.
+- A decode-time Q/K pair matvec for the same normalized activation was tested
+  and rejected. It preserved the projection order and LoRA/steering placement,
+  but measured about 39.7 tok/s versus the 40.0 tok/s baseline.
+- Q4_K row-grouping sweeps were rejected. Raising the global Q4_K rows per
+  SIMD-group to 4 measured about 39.1 tok/s, and applying that shape only to the
+  routed gate/up pair measured about 39.8 tok/s. Raising routed MoE `nsg` from
+  2 to 4 was also flat/slower at about 39.8 tok/s. The current two-row/two-SIMD
+  Q4_K shape remains the best measured M3 Max local point.
+- The retained hot-path pipeline/env cache removes repeated Objective-C
+  dictionary/string work from fixed Qwen decode kernels. It is correctness
+  neutral and small; measured throughput was effectively flat by itself, so the
+  layer-1 split is the only default change justified by whole-token timings in
+  this pass.
 - `ds4-agent` now reports the native DSML tools instead of claiming no tools are
   available. Its fixed system prompt is 286 tokens, down from the earlier 526.
 - The defensive steering example builds a Qwen-format `48 x 2048` vector and
@@ -157,7 +209,7 @@ Results:
 The current Metal path keeps the existing DS4 CLI/server/session/agent surfaces,
 but the executed graph is Qwen-only. The largest speed wins so far came from
 fixing decode attention score reuse, keeping Qwen expert work in direct
-Q4_K/Q6_K kernels, and fusing decode residual/RMSNorm stages. The next likely
-gains are a faster exact router implementation and larger graph-level fusion
-that reduces dispatch count further; this should be done without reintroducing
-DS4 architecture branches or generic runtime fallbacks.
+Q4_K/Q6_K kernels, fusing decode residual/RMSNorm stages, and avoiding greedy
+logit readback. The next likely gains require a stronger routed-MoE/output-head
+kernel, not more small dispatch-pair experiments. This should be done without
+reintroducing DS4 architecture branches or generic runtime fallbacks.

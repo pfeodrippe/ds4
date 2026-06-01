@@ -2,6 +2,9 @@
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
+constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
+constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 
 struct ds4_metal_args_mul_mv {
     int ne00;

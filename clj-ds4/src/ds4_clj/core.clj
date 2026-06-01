@@ -151,6 +151,53 @@
                            (vp/try-string user)
                            think-int))))
 
+(defn tokenize
+  "Tokenize raw text and return a vector of token ids."
+  [engine text]
+  (n/tokenize-text engine text))
+
+(defn tokenize-rendered-chat
+  "Tokenize already-rendered chat text and return a vector of token ids."
+  [engine text]
+  (n/tokenize-rendered-chat engine text))
+
+(defn tokens-free
+  "Free a DS4Tokens segment returned by encode-prompt."
+  [tokens]
+  (n/tokens-free tokens))
+
+(defn token-text
+  "Return the text for a token id."
+  [engine token-id]
+  (n/token-text engine token-id))
+
+(defn session-sync
+  "Sync an encoded prompt token segment into a session."
+  [session tokens]
+  (n/session-sync session tokens))
+
+(defn session-eval
+  "Evaluate one token in a session."
+  [session token]
+  (n/session-eval session token))
+
+(defn session-eval-argmax
+  "Evaluate one token and return the next greedy token id."
+  [session token]
+  (n/session-eval-argmax session token))
+
+(defn session-argmax
+  "Return the current greedy token id."
+  [session]
+  (n/session-argmax session))
+
+(defn session-sample
+  "Sample the current next token."
+  ([session]
+   (n/session-sample session))
+  ([session temperature top-k top-p min-p]
+   (n/session-sample session temperature top-k top-p min-p)))
+
 ;; --- Generation ---
 
 (defn generate-tokens
@@ -175,19 +222,25 @@
     (try
       (n/session-sync session tokens)
       (let [eos (n/token-eos engine)
-            ;; Use argmax for temp=0 (deterministic, much faster - no RNG alloc per token)
-            sample-fn (if (== temperature 0.0)
-                        n/session-argmax
-                        #(n/session-sample % temperature top-k top-p min-p))
-            result (loop [generated []]
-                     (if (>= (count generated) n-tokens)
-                       generated
-                       (let [token (sample-fn session)]
-                         (if (= token eos)
-                           generated
-                           (do
-                             (n/session-eval session token)
-                             (recur (conj generated token)))))))
+            greedy? (== temperature 0.0)
+            result (if greedy?
+                     (loop [generated []
+                            token (n/session-argmax session)]
+                       (if (or (>= (count generated) n-tokens)
+                               (= token eos)
+                               (< token 0))
+                         generated
+                         (recur (conj generated token)
+                                (n/session-eval-argmax session token))))
+                     (loop [generated []]
+                       (if (>= (count generated) n-tokens)
+                         generated
+                         (let [token (n/session-sample session temperature top-k top-p min-p)]
+                           (if (= token eos)
+                             generated
+                             (do
+                               (n/session-eval session token)
+                               (recur (conj generated token))))))))
             _ (n/tokens-free tokens)]
         result)
       (catch Exception e
@@ -871,6 +924,16 @@
       (.exists parent) (.getPath parent)
       :else (.getPath direct))))
 
+(defn ^:private default-lora-python []
+  (or (System/getenv "DS4_LORA_PYTHON")
+      (some (fn [path]
+              (let [f (io/file path)]
+                (when (.exists f)
+                  (.getAbsolutePath f))))
+            [(repo-tool-path ".venv-lora/bin/python")
+             (repo-tool-path ".venv/bin/python")])
+      "python3"))
+
 (defn ^:private lora-data-file [path]
   (let [f (io/file path)]
     (if (str/ends-with? (.getName f) ".jsonl")
@@ -919,14 +982,14 @@
     :max-seq-len  - Max sequence length (default 256)
     :batch-size   - Batch size (default 1)
     :num-layers   - Number of transformer layers to adapt, -1 means all (default -1)
-    :python       - Python executable (default python3)
+    :python       - Python executable (default DS4_LORA_PYTHON, .venv-lora, .venv, then python3)
 
   Returns the path to the converted DS4 adapter file."
   [& {:keys [data output-dir model rank alpha iters lr max-seq-len batch-size num-layers python]
       :or {output-dir "/tmp/lora_train"
            model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
            rank 8 alpha 16 iters 50 lr 1e-4 max-seq-len 256
-           batch-size 1 num-layers -1 python "python3"}}]
+           batch-size 1 num-layers -1 python (default-lora-python)}}]
   (assert data ":data path to JSONL training file is required")
   (let [train-script (repo-tool-path "tools/lora_train.py")
         convert-script (repo-tool-path "tools/convert_lora.py")

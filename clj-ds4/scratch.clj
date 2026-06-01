@@ -503,6 +503,29 @@
   (ds4/close-engine engine)
   )
 
+;; Helper: create a synthetic SAE decoder file for Workflow 8.
+(defn write-test-sae [path]
+  (let [n-features 100
+        d-model 2048
+        layer 24
+        rng (java.util.Random. 42)]
+    (with-open [out (FileOutputStream. path)]
+      (let [buf (ByteBuffer/allocate 12)]
+        (.order buf ByteOrder/LITTLE_ENDIAN)
+        (.putInt buf n-features)
+        (.putInt buf d-model)
+        (.putInt buf layer)
+        (.write out (.array buf) 0 12))
+      (doseq [_ (range n-features)]
+        (let [raw (double-array (repeatedly d-model #(.nextGaussian rng)))
+              norm (Math/sqrt (reduce + (map #(* % %) raw)))
+              buf (ByteBuffer/allocate (* d-model 4))]
+          (.order buf ByteOrder/LITTLE_ENDIAN)
+          (doseq [v raw]
+            (.putFloat buf (float (/ v norm))))
+          (.write out (.array buf) 0 (* d-model 4)))))
+    path))
+
 ;; =============================================================================
 ;; WORKFLOW 8: SAE Feature Steering
 ;; =============================================================================
@@ -513,6 +536,7 @@
   (def session (ds4/create-session engine 512))
 
   ;; Load a SAE decoder file
+  (write-test-sae "/tmp/sae.bin")
   (ds4/load-sae engine "/tmp/sae.bin")
 
   ;; Baseline
@@ -565,14 +589,16 @@
 
 (comment
   ;; Helper to quickly test a configuration
-  (defn test-config [label opts]
-    (let [engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                   :backend :metal
-                                   opts)
+  (defn test-config [label & {:keys [engine-opts gen-opts]
+                              :or {engine-opts {} gen-opts {}}}]
+    (let [engine (apply ds4/open-engine
+                        :model-path "qwen3-coder.gguf"
+                        :backend :metal
+                        (apply concat engine-opts))
           session (ds4/create-session engine 512)
-          result (ds4/generate engine session
-                               "Write a one-sentence story."
-                               {:n-tokens 30})]
+          result (apply ds4/generate engine session
+                        "Write a one-sentence story."
+                        (apply concat (merge {:n-tokens 30} gen-opts)))]
       (println (format "\n=== %s ===" label))
       (println result)
       (ds4/free-session session)
@@ -580,12 +606,12 @@
       result))
 
   ;; Compare different setups
-  (test-config "Baseline" {})
-  (test-config "High temp" {})
-  (test-config "Think max" {})
+  (test-config "Baseline")
+  (test-config "High temp" :gen-opts {:temperature 1.1})
+  (test-config "Think max" :gen-opts {:think-mode :max :temperature 0.0})
   ;; Note: steering requires pre-built .f32 files
-  ;; (test-config "Sarcastic" {:steering-file "dir-steering/out/sarcastic_v1.f32"
-  ;;                           :steering-ffn -2.0})
+  ;; (test-config "Sarcastic" :engine-opts {:steering-file "dir-steering/out/sarcastic_v1.f32"
+  ;;                                         :steering-ffn -2.0})
   )
 
 ;; =============================================================================

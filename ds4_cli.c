@@ -597,10 +597,19 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool fast_greedy = cfg->gen.temperature <= 0.0f &&
+                             ds4_engine_mtp_draft_tokens(engine) <= 1;
+    int next_argmax = fast_greedy ? ds4_session_argmax(session) : -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+        int token = fast_greedy ? next_argmax :
+                ds4_session_sample(session, cfg->gen.temperature, 0,
+                                   cfg->gen.top_p, cfg->gen.min_p, &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: failed to sample next token\n");
+            ds4_session_free(session);
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -620,6 +629,15 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
+        } else if (fast_greedy) {
+            next_argmax = ds4_session_eval_argmax(session, token, err, sizeof(err));
+            if (next_argmax < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
         } else {
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1233,14 +1251,22 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    const bool fast_greedy = cfg->gen.temperature <= 0.0f &&
+                             ds4_engine_mtp_draft_tokens(engine) <= 1;
+    int next_argmax = fast_greedy ? ds4_session_argmax(chat->session) : -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(chat->session,
-                                       cfg->gen.temperature,
-                                       0,
-                                       cfg->gen.top_p,
-                                       cfg->gen.min_p,
-                                       &rng);
+        int token = fast_greedy ? next_argmax :
+                ds4_session_sample(chat->session,
+                                   cfg->gen.temperature,
+                                   0,
+                                   cfg->gen.top_p,
+                                   cfg->gen.min_p,
+                                   &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: failed to sample next token\n");
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -1259,6 +1285,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
+        } else if (fast_greedy) {
+            next_argmax = ds4_session_eval_argmax(chat->session, token, err, sizeof(err));
+            if (next_argmax < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
         } else {
             if (ds4_session_eval(chat->session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);

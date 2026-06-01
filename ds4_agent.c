@@ -6468,6 +6468,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     int think_end_id = agent_special_token_id(w->engine, "</think>");
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = now_sec();
+    int next_summary_token = ds4_session_argmax(w->session);
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
             snprintf(err, err_len, "compaction interrupted");
@@ -6478,7 +6479,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             agent_publish(w, "\x1b[0m\n", 5);
             return false;
         }
-        int token = ds4_session_argmax(w->session);
+        int token = next_summary_token;
         if (token == ds4_token_eos(w->engine)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
@@ -6487,7 +6488,8 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             agent_trace(w, "compaction summary stopped before control token id=%d", token);
             break;
         }
-        if (ds4_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
+        next_summary_token = ds4_session_eval_argmax(w->session, token, eval_err, sizeof(eval_err));
+        if (next_summary_token < 0) {
             snprintf(err, err_len, "%s", eval_err);
             ds4_session_invalidate(w->session);
             ds4_tokens_free(&prompt);
@@ -6579,6 +6581,7 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
 
 static int worker_accept_generated_token(agent_worker *w,
                                          int token,
+                                         int *next_argmax,
                                          int *generated,
                                          double t0,
                                          agent_stream_renderer *stream,
@@ -6593,8 +6596,12 @@ static int worker_accept_generated_token(agent_worker *w,
     free(text);
     (*generated)++;
 
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+    if (next_argmax) {
+        *next_argmax = ds4_session_eval_argmax(w->session, token, err, err_len);
+        if (*next_argmax < 0) return 1;
+    } else if (ds4_session_eval(w->session, token, err, err_len) != 0) {
         return 1;
+    }
 
     double dt = now_sec() - t0;
     pthread_mutex_lock(&w->mu);
@@ -6621,7 +6628,7 @@ static int worker_force_generated_text(agent_worker *w,
         return 1;
     }
     for (int i = 0; i < tokens.len && *generated < max_tokens; i++) {
-        if (worker_accept_generated_token(w, tokens.v[i], generated, t0,
+        if (worker_accept_generated_token(w, tokens.v[i], NULL, generated, t0,
                                           stream, err, err_len) != 0) {
             ds4_tokens_free(&tokens);
             return 1;
@@ -6761,6 +6768,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool early_tool_error = false;
         int generated = 0;
         double t0 = now_sec();
+        const bool fast_greedy = cfg->gen.temperature <= 0.0f &&
+                                 ds4_engine_mtp_draft_tokens(w->engine) <= 1;
+        int next_argmax = fast_greedy ? ds4_session_argmax(w->session) : -1;
 
         pthread_mutex_lock(&w->mu);
         w->status.state = AGENT_WORKER_GENERATING;
@@ -6769,8 +6779,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
-            int token = ds4_session_sample(w->session, cfg->gen.temperature, 0,
-                                           cfg->gen.top_p, cfg->gen.min_p, &rng);
+            int token = fast_greedy ? next_argmax :
+                    ds4_session_sample(w->session, cfg->gen.temperature, 0,
+                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+            if (token < 0) {
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w, "failed to sample next token");
+                return 1;
+            }
             if (token == ds4_token_eos(w->engine)) break;
 
             size_t text_len = 0;
@@ -6788,9 +6804,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     agent_set_error(w, err);
                     return 1;
                 }
+                if (fast_greedy) next_argmax = ds4_session_argmax(w->session);
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
+                if (worker_accept_generated_token(w, token,
+                                                  fast_greedy ? &next_argmax : NULL,
+                                                  &generated, t0,
                                                   &stream, err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);

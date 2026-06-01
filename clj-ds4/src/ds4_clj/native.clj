@@ -122,6 +122,13 @@
                      [:err [:* :byte]]
                      [:errlen :long]])))
 
+(def ^:private c-session-eval-argmax
+  (vp/c-fn (lookup-symbol "ds4_session_eval_argmax")
+           (fd :int [[:session [:* :void]]
+                     [:token :int]
+                     [:err [:* :byte]]
+                     [:errlen :long]])))
+
 (def ^:private c-session-sample
   (vp/c-fn (lookup-symbol "ds4_session_sample")
            (fd :int [[:session [:* :void]]
@@ -152,6 +159,18 @@
 (def ^:private c-tokens-free
   (vp/c-fn (lookup-symbol "ds4_tokens_free")
            (fd :void [[:tokens [:* :void]]])))
+
+(def ^:private c-tokenize-text
+  (vp/c-fn (lookup-symbol "ds4_tokenize_text")
+           (fd :void [[:engine [:* :void]]
+                      [:text :string]
+                      [:out [:* :void]]])))
+
+(def ^:private c-tokenize-rendered-chat
+  (vp/c-fn (lookup-symbol "ds4_tokenize_rendered_chat")
+           (fd :void [[:engine [:* :void]]
+                      [:text :string]
+                      [:out [:* :void]]])))
 
 (def ^:private c-token-text
   (vp/c-fn (lookup-symbol "ds4_token_text")
@@ -350,6 +369,16 @@
       (throw (ex-info (str "ds4_session_eval failed: " (err-string err-buf))
                       {:rc rc})))))
 
+(defn session-eval-argmax
+  "Evaluate a token and return the next greedy token id."
+  [^MemorySegment session token]
+  (let [err-buf (alloc-err-buf)
+        rc (c-session-eval-argmax session token err-buf 256)]
+    (when (< rc 0)
+      (throw (ex-info (str "ds4_session_eval_argmax failed: " (err-string err-buf))
+                      {:rc rc})))
+    rc))
+
 (defn session-sample
   "Sample the next token. Returns token id."
   ([^MemorySegment session]
@@ -386,6 +415,38 @@
   "Free the internal array of a DS4Tokens struct."
   [^MemorySegment tokens-seg]
   (c-tokens-free tokens-seg))
+
+(defn- tokens->vec
+  "Copy a DS4Tokens struct into a Clojure vector, then free its internal array."
+  [^MemorySegment tokens-seg]
+  (let [m (vp/p->map tokens-seg DS4Tokens)
+        n (int (:len m))
+        ^MemorySegment v (:v m)
+        sized (when (and v (pos? (.address v)))
+                (.reinterpret v (* n 4)))]
+    (try
+      (if sized
+        (vec (for [i (range n)]
+               (.get ^MemorySegment sized (ValueLayout/JAVA_INT) (* i 4))))
+        [])
+      (finally
+        (tokens-free tokens-seg)))))
+
+(defn tokenize-text
+  "Tokenize raw text and return a vector of token ids."
+  [^MemorySegment engine text]
+  (let [^MemorySegment tokens-seg (vp/alloc (.layout DS4Tokens))]
+    (.fill tokens-seg (byte 0))
+    (c-tokenize-text engine text tokens-seg)
+    (tokens->vec tokens-seg)))
+
+(defn tokenize-rendered-chat
+  "Tokenize already-rendered chat text and return a vector of token ids."
+  [^MemorySegment engine text]
+  (let [^MemorySegment tokens-seg (vp/alloc (.layout DS4Tokens))]
+    (.fill tokens-seg (byte 0))
+    (c-tokenize-rendered-chat engine text tokens-seg)
+    (tokens->vec tokens-seg)))
 
 (defn token-text
   "Get the text for a token id. NOTE: leaks memory (C malloc)."
@@ -503,12 +564,10 @@
 ;; --- Activation Capture ---
 
 (defn session-capture-config
-  "Configure activation capture for a CPU session.
+  "Configure activation capture for a session.
 
   layers: seq of layer indices to capture, e.g. [0 23 47]
-  max-tokens: maximum number of tokens to capture
-
-  Only works on CPU backend."
+  max-tokens: maximum number of tokens to capture."
   [^MemorySegment session layers max-tokens]
   (let [n (count layers)
         ^MemorySegment layers-seg (vp/alloc (* n 4) 4)
@@ -520,7 +579,7 @@
     (.set ^MemorySegment cfg-seg (ValueLayout/JAVA_INT) 12 (int max-tokens))
     (let [rc (c-capture-config session cfg-seg)]
       (when (not= 0 rc)
-        (throw (ex-info "ds4_session_capture_config failed (only CPU backend supported)" {:rc rc}))))))
+        (throw (ex-info "ds4_session_capture_config failed" {:rc rc}))))))
 
 (defn session-capture-clear
   "Clear activation capture buffer and disable capture."

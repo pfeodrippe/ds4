@@ -483,22 +483,27 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
+        int token = ds4_session_argmax_excluding(session, eos);
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            const int next = ds4_session_eval_argmax(session, token, err, sizeof(err));
+            if (next < 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
+            }
+            token = next;
+            if (token == eos && i + 1 < cfg.gen_tokens) {
+                token = ds4_session_argmax_excluding(session, eos);
             }
         }
         const double gen_t1 = bench_now_sec();

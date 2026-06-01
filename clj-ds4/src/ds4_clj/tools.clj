@@ -56,6 +56,13 @@
      :has-tools? true}
     {:results [] :has-tools? false}))
 
+(defn- as-model
+  [engine-or-model]
+  (if (and (instance? clojure.lang.ILookup engine-or-model)
+           (:engine engine-or-model))
+    engine-or-model
+    (ds4/make-model engine-or-model)))
+
 (defn format-tool-results
   "Format tool results for feeding back to the model."
   [results]
@@ -75,8 +82,8 @@
     :max-tool-rounds  - max tool rounds (default: 3)
     :n-tokens         - max tokens per generation (default: 1500)
     :temperature      - sampling temperature (default: 0.0)"
-  [model session prompt & {:keys [max-tool-rounds n-tokens temperature]
-                            :or {max-tool-rounds 3 n-tokens 1500 temperature 0.0}}]
+  [engine-or-model session prompt & {:keys [max-tool-rounds n-tokens temperature]
+                                      :or {max-tool-rounds 3 n-tokens 1500 temperature 0.0}}]
   (let [tool-system (str "You have access to a Python calculator tool. "
                          "When you need to compute something, use:\n"
                          "<tool>python</tool>\n"
@@ -85,7 +92,8 @@
                          "</code>\n\n"
                          "The result will be provided to you. "
                          "After receiving results, continue solving the problem.")
-        model-with-tools (assoc model :system tool-system)]
+        model (as-model engine-or-model)
+        model-with-tools (ds4/with-system model tool-system)]
     (loop [round 0
            text ""
            history []]

@@ -287,6 +287,7 @@ void ds4_session_sae_steering_clear(ds4_session *s);
 int ds4_session_sae_steering_multi(ds4_session *s, int n_features, const int *feature_ids, const float *scales);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
