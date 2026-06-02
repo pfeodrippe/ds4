@@ -2425,6 +2425,14 @@ typedef struct {
     float    eps;
 } ds4_gpu_qkv_rms_norm_args;
 
+typedef struct {
+    int32_t ne00;
+    int32_t ne00_t;
+    float eps;
+    float scale0;
+    float scale1;
+} ds4_gpu_add_project2_rms_norm_args;
+
 static ds4_gpu_rms_norm_args ds4_gpu_make_rms_norm_args(uint32_t n, uint32_t rows, float eps) {
     const uint64_t row_bytes = (uint64_t)n * sizeof(float);
     return (ds4_gpu_rms_norm_args) {
@@ -6966,6 +6974,92 @@ int ds4_gpu_add_rms_norm_weight_tensor(
     return 1;
 }
 
+int ds4_gpu_add_project2_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *base,
+        const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *directions0,
+        const ds4_gpu_tensor *directions1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                layer,
+        uint32_t                n,
+        float                   scale0,
+        float                   scale1,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!norm_out || !sum_out || !base || !add || !directions0 || !directions1 ||
+        !model_map || n == 0 || (n & 3u) != 0 || scale0 == 0.0f || scale1 == 0.0f) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
+        id<MTLBuffer> sumbuf = ds4_gpu_tensor_buffer(sum_out);
+        id<MTLBuffer> basebuf = ds4_gpu_tensor_buffer(base);
+        id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(add);
+        id<MTLBuffer> d0buf = ds4_gpu_tensor_buffer(directions0);
+        id<MTLBuffer> d1buf = ds4_gpu_tensor_buffer(directions1);
+        const uint64_t row_bytes = (uint64_t)n * sizeof(float);
+        const uint64_t dir_bytes = (uint64_t)(layer + 1u) * row_bytes;
+        if (!normbuf || !sumbuf || !basebuf || !addbuf || !d0buf || !d1buf ||
+            ds4_gpu_tensor_bytes(norm_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(sum_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(base) < row_bytes ||
+            ds4_gpu_tensor_bytes(add) < row_bytes ||
+            ds4_gpu_tensor_bytes(directions0) < dir_bytes ||
+            ds4_gpu_tensor_bytes(directions1) < dir_bytes) {
+            fprintf(stderr, "ds4: Metal fused steering add/RMS norm received undersized buffers\n");
+            return 0;
+        }
+        if (weight_offset > model_size || row_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal fused steering add/RMS norm range is outside the mapped model\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_add_project2_rms_norm_mul_f32_4");
+        if (!pipeline) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf =
+            ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, row_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_add_project2_rms_norm_args args = {
+            .ne00 = (int32_t)n,
+            .ne00_t = (int32_t)(n / 4u),
+            .eps = eps,
+            .scale0 = scale0,
+            .scale1 = scale1,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:basebuf offset:ds4_gpu_tensor_offset(base) atIndex:1];
+        [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(add) atIndex:2];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:3];
+        [enc setBuffer:d0buf offset:ds4_gpu_tensor_offset(directions0) + (NSUInteger)((uint64_t)layer * row_bytes) atIndex:4];
+        [enc setBuffer:d1buf offset:ds4_gpu_tensor_offset(directions1) + (NSUInteger)((uint64_t)layer * row_bytes) atIndex:5];
+        [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum_out) atIndex:6];
+        [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:7];
+        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "fused steering add/RMS norm")) return 0;
+    }
+
+    return 1;
+}
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -7266,7 +7360,7 @@ int ds4_gpu_qwen_norm_rope_store_kv_tensor(
     }
     const uint64_t kv_dim = (uint64_t)n_head * head_dim;
     const uint64_t row_bytes = kv_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_qwen_norm_rope_store_pipeline();
@@ -7348,7 +7442,7 @@ int ds4_gpu_qwen_norm_rope_weight_store_kv_tensor(
     const uint64_t kv_dim = (uint64_t)n_kv_head * head_dim;
     const uint64_t q_bytes = q_dim * sizeof(float);
     const uint64_t kv_row_bytes = kv_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
     const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
@@ -7433,7 +7527,7 @@ int ds4_gpu_qwen_store_kv_tensor(
         uint32_t                kv_dim) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!k_cache || !v_cache || !k || !v || kv_dim == 0 || cap == 0 || row >= cap) return 0;
-    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
     const uint64_t row_bytes = (uint64_t)kv_dim * sizeof(float);
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen_store_kv_f32");
@@ -7480,7 +7574,7 @@ int ds4_gpu_qwen_store_kv_batch_tensor(
         pos0 > cap || n_tokens > cap - pos0) {
         return 0;
     }
-    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
     const uint64_t batch_bytes = (uint64_t)n_tokens * kv_dim * sizeof(float);
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen_store_kv_batch_f32");
@@ -7533,10 +7627,11 @@ int ds4_gpu_qwen_attention_tensor(
     if (!heads || !q || !k_cache || !v_cache || n_ctx == 0 || n_ctx > cap ||
         n_head == 0 || n_head_kv == 0 || head_dim == 0) return 0;
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)cap * n_head_kv * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)cap * n_head_kv * head_dim * sizeof(uint16_t);
     @autoreleasepool {
         const bool use_cached_scores = n_ctx <= 4096u;
-        id<MTLComputePipelineState> pipeline = ds4_gpu_qwen_attention_pipeline(use_cached_scores);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_qwen_attention_pipeline(use_cached_scores);
         if (!pipeline) return 0;
         id<MTLBuffer> hbuf = ds4_gpu_tensor_buffer(heads);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
@@ -7708,7 +7803,7 @@ int ds4_gpu_qwen_attention_batch_tensor(
         pos0 > cap || n_tokens > cap - pos0 ||
         n_head == 0 || n_head_kv == 0 || head_dim == 0) return 0;
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)cap * n_head_kv * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)cap * n_head_kv * head_dim * sizeof(uint16_t);
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen_attention_batch_f32_reduce");
         if (!pipeline) return 0;
@@ -13603,6 +13698,15 @@ typedef struct {
     float    scale;
 } ds4_gpu_directional_steering_project_args;
 
+typedef struct {
+    uint32_t width;
+    uint32_t rows;
+    uint32_t layer;
+    uint32_t n_threads;
+    float    scale0;
+    float    scale1;
+} ds4_gpu_directional_steering_project2_args;
+
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
@@ -13657,6 +13761,74 @@ int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "directional steering")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_directional_steering_project2_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *directions0,
+        const ds4_gpu_tensor *directions1,
+        uint32_t                layer,
+        uint32_t                width,
+        uint32_t                rows,
+        float                   scale0,
+        float                   scale1) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !directions0 || !directions1 || width == 0 || rows == 0 ||
+        scale0 == 0.0f || scale1 == 0.0f) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_directional_steering_project2_f32");
+        if (!pipeline) return 0;
+
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> d0buf = ds4_gpu_tensor_buffer(directions0);
+        id<MTLBuffer> d1buf = ds4_gpu_tensor_buffer(directions1);
+        const uint64_t x_bytes = (uint64_t)width * rows * sizeof(float);
+        const uint64_t dir_bytes = (uint64_t)(layer + 1u) * width * sizeof(float);
+        if (!xbuf || !d0buf || !d1buf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(directions0) < dir_bytes ||
+            ds4_gpu_tensor_bytes(directions1) < dir_bytes) {
+            fprintf(stderr, "ds4: Metal directional steering received undersized buffers\n");
+            return 0;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256u) nth = 256u;
+        while (nth > width && nth > 1u) nth >>= 1;
+        if (nth == 0) nth = 1;
+
+        ds4_gpu_directional_steering_project2_args args = {
+            .width = width,
+            .rows = rows,
+            .layer = layer,
+            .n_threads = (uint32_t)nth,
+            .scale0 = scale0,
+            .scale1 = scale1,
+        };
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:d0buf offset:ds4_gpu_tensor_offset(directions0) atIndex:2];
+        [enc setBuffer:d1buf offset:ds4_gpu_tensor_offset(directions1) atIndex:3];
+        [enc setThreadgroupMemoryLength:nth * 3u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "directional steering2")) return 0;
     }
 
     return 1;

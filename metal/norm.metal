@@ -120,6 +120,88 @@ kernel void kernel_add_rms_norm_mul_f32_4(
     }
 }
 
+struct ds4_metal_args_add_project2_rms_norm {
+    int32_t ne00;
+    int32_t ne00_t;
+    float eps;
+    float scale0;
+    float scale1;
+};
+
+kernel void kernel_add_project2_rms_norm_mul_f32_4(
+        constant ds4_metal_args_add_project2_rms_norm & args,
+        device const float4 *base,
+        device const float4 *add,
+        device const float4 *weight,
+        device const float4 *dir0,
+        device const float4 *dir1,
+        device       float4 *sum_out,
+        device       float4 *norm_out,
+        threadgroup float *shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    threadgroup float *dot0_s = shmem_f32;
+    threadgroup float *dot1_s = shmem_f32 + 32;
+    threadgroup float *cross_s = shmem_f32 + 64;
+    threadgroup float *sum_s = shmem_f32 + 96;
+    if (sgitg == 0) {
+        dot0_s[tiisg] = 0.0f;
+        dot1_s[tiisg] = 0.0f;
+        cross_s[tiisg] = 0.0f;
+        sum_s[tiisg] = 0.0f;
+    }
+
+    float dot0 = 0.0f;
+    float dot1 = 0.0f;
+    float cross = 0.0f;
+    for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
+        const float4 a = add[i];
+        const float4 d0 = dir0[i];
+        const float4 d1 = dir1[i];
+        dot0 += dot(a, d0);
+        dot1 += dot(a, d1);
+        cross += dot(d1, d0);
+    }
+    dot0 = simd_sum(dot0);
+    dot1 = simd_sum(dot1);
+    cross = simd_sum(cross);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        dot0_s[sgitg] = dot0;
+        dot1_s[sgitg] = dot1;
+        cross_s[sgitg] = cross;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dot0 = simd_sum(dot0_s[tiisg]);
+    dot1 = simd_sum(dot1_s[tiisg]);
+    cross = simd_sum(cross_s[tiisg]);
+    const float coeff0 = args.scale0 * dot0;
+    const float coeff1 = args.scale1 * (dot1 - coeff0 * cross);
+
+    float sumf = 0.0f;
+    for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
+        const float4 v = base[i] + add[i] - coeff0 * dir0[i] - coeff1 * dir1[i];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) sum_s[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(sum_s[tiisg]);
+    const float norm_scale = rsqrt(sumf / args.ne00 + args.eps);
+    for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
+        const float4 v = base[i] + add[i] - coeff0 * dir0[i] - coeff1 * dir1[i];
+        sum_out[i] = v;
+        norm_out[i] = v * norm_scale * weight[i];
+    }
+}
+
 struct ds4_metal_args_qkv_rms_norm {
     int32_t  q_n;
     int32_t  q_n4;

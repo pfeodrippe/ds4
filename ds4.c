@@ -9429,19 +9429,81 @@ static bool metal_graph_apply_directional_steering_single(
                                             effective_scale) != 0;
 }
 
+static int metal_graph_directional_steering_active_pair(
+        const ds4_gpu_graph *g,
+        uint32_t             il,
+        const float         *scales,
+        float              **layer_scales,
+        int                 *active_idx,
+        float               *active_scale) {
+    if (!g || !scales || !active_idx || !active_scale) return 0;
+    int n_active = 0;
+    for (int i = 0; i < g->n_steering_vectors; i++) {
+        float effective_scale = scales[i];
+        if (layer_scales && layer_scales[i]) {
+            effective_scale *= layer_scales[i][il];
+        }
+        if (effective_scale == 0.0f) continue;
+        if (n_active < 2) {
+            active_idx[n_active] = i;
+            active_scale[n_active] = effective_scale;
+        }
+        n_active++;
+    }
+    return n_active;
+}
+
+static bool metal_graph_apply_directional_steering_set(
+        ds4_gpu_graph  *g,
+        ds4_gpu_tensor *x,
+        uint32_t          il,
+        uint32_t          rows,
+        const float      *scales,
+        float           **layer_scales) {
+    if (!g || !x || !scales) return true;
+
+    int active_idx[2] = {0, 0};
+    float active_scale[2] = {0.0f, 0.0f};
+    const int n_active = metal_graph_directional_steering_active_pair(
+            g, il, scales, layer_scales, active_idx, active_scale);
+    if (n_active == 0) return true;
+    if (n_active == 1) {
+        const int i = active_idx[0];
+        return ds4_gpu_directional_steering_project_tensor(x,
+                                            g->steering_dirs[i],
+                                            il,
+                                            DS4_N_EMBD,
+                                            rows,
+                                            active_scale[0]) != 0;
+    }
+    if (n_active == 2) {
+        return ds4_gpu_directional_steering_project2_tensor(x,
+                                            g->steering_dirs[active_idx[0]],
+                                            g->steering_dirs[active_idx[1]],
+                                            il,
+                                            DS4_N_EMBD,
+                                            rows,
+                                            active_scale[0],
+                                            active_scale[1]) != 0;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < g->n_steering_vectors && ok; i++) {
+        ok = metal_graph_apply_directional_steering_single(
+                g, x, il, rows, g->steering_dirs[i], scales[i],
+                layer_scales ? layer_scales[i] : NULL);
+    }
+    return ok;
+}
+
 static bool metal_graph_apply_directional_steering_attn(
         ds4_gpu_graph  *g,
         ds4_gpu_tensor *x,
         uint32_t          il,
         uint32_t          rows) {
     if (!g) return true;
-    bool ok = true;
-    for (int i = 0; i < g->n_steering_vectors && ok; i++) {
-        ok = metal_graph_apply_directional_steering_single(
-                g, x, il, rows, g->steering_dirs[i], g->steering_attn_scales[i],
-                g->steering_layer_attn_scales[i]);
-    }
-    return ok;
+    return metal_graph_apply_directional_steering_set(
+            g, x, il, rows, g->steering_attn_scales, g->steering_layer_attn_scales);
 }
 
 static bool metal_graph_apply_directional_steering_ffn(
@@ -9450,13 +9512,8 @@ static bool metal_graph_apply_directional_steering_ffn(
         uint32_t          il,
         uint32_t          rows) {
     if (!g) return true;
-    bool ok = true;
-    for (int i = 0; i < g->n_steering_vectors && ok; i++) {
-        ok = metal_graph_apply_directional_steering_single(
-                g, x, il, rows, g->steering_dirs[i], g->steering_ffn_scales[i],
-                g->steering_layer_ffn_scales[i]);
-    }
-    return ok;
+    return metal_graph_apply_directional_steering_set(
+            g, x, il, rows, g->steering_ffn_scales, g->steering_layer_ffn_scales);
 }
 
 static bool qwen_graph_alloc(
@@ -9523,8 +9580,8 @@ static bool qwen_graph_alloc(
 
     bool cache_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(float));
-        g->layer_v_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(float));
+        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(uint16_t));
+        g->layer_v_cache[il] = ds4_gpu_tensor_alloc_private((uint64_t)ctx_size * kv_dim * sizeof(uint16_t));
         cache_ok = cache_ok && g->layer_raw_cache[il] && g->layer_v_cache[il];
     }
 
@@ -11383,21 +11440,46 @@ static bool qwen_graph_encode_token(
         }
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "routed_moe");
         if (ok) metal_graph_debug_dump_tensor("ffn_out", g->routed_out, DS4_N_EMBD, il, pos);
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        int ffn_steer_idx[2] = {0, 0};
+        float ffn_steer_scale[2] = {0.0f, 0.0f};
+        const int n_ffn_steer = metal_graph_directional_steering_active_pair(
+                g, il, g->steering_ffn_scales, g->steering_layer_ffn_scales,
+                ffn_steer_idx, ffn_steer_scale);
+        const bool fuse_ffn_steer_norm =
+            n_ffn_steer == 2 && il + 1u < DS4_N_LAYER;
+        if (ok && metal_graph_directional_steering_ffn_enabled(g) && !fuse_ffn_steer_norm) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->routed_out, il, 1);
         }
         if (ok) {
             if (il + 1u < DS4_N_LAYER) {
                 const ds4_layer_weights *next_layer = &weights->layer[il + 1u];
-                ok = ds4_gpu_add_rms_norm_weight_tensor(g->attn_norm,
-                                                        g->cur_hc,
-                                                        g->after_ffn_hc,
-                                                        g->routed_out,
-                                                        model->map,
-                                                        model->size,
-                                                        next_layer->attn_norm->abs_offset,
-                                                        DS4_N_EMBD,
-                                                        DS4_RMS_EPS) != 0;
+                if (fuse_ffn_steer_norm) {
+                    ok = ds4_gpu_add_project2_rms_norm_weight_tensor(
+                            g->attn_norm,
+                            g->cur_hc,
+                            g->after_ffn_hc,
+                            g->routed_out,
+                            g->steering_dirs[ffn_steer_idx[0]],
+                            g->steering_dirs[ffn_steer_idx[1]],
+                            model->map,
+                            model->size,
+                            next_layer->attn_norm->abs_offset,
+                            il,
+                            DS4_N_EMBD,
+                            ffn_steer_scale[0],
+                            ffn_steer_scale[1],
+                            DS4_RMS_EPS) != 0;
+                } else {
+                    ok = ds4_gpu_add_rms_norm_weight_tensor(g->attn_norm,
+                                                            g->cur_hc,
+                                                            g->after_ffn_hc,
+                                                            g->routed_out,
+                                                            model->map,
+                                                            model->size,
+                                                            next_layer->attn_norm->abs_offset,
+                                                            DS4_N_EMBD,
+                                                            DS4_RMS_EPS) != 0;
+                }
                 attn_norm_ready = ok;
             } else {
                 ok = ds4_gpu_add_tensor(g->cur_hc, g->after_ffn_hc, g->routed_out, DS4_N_EMBD) != 0;
@@ -15619,7 +15701,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                       m.raw_cap *
                       2u *
                       qwen_kv_dim *
-                      sizeof(float);
+                      sizeof(uint16_t);
         const uint64_t qwen_q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
         const uint64_t single_f32 =
             (uint64_t)DS4_N_EMBD * 4u +
@@ -16958,24 +17040,82 @@ static int sample_full_vocab(
     }
     if (finite == 0) return sample_argmax(logits, n_vocab);
 
-    if (top_p >= 1.0f) {
+    if (top_p >= 1.0f && min_p > 0.0f) {
+        enum { DS4_SAMPLE_STACK_CAND = 4096 };
+        int stack_ids[DS4_SAMPLE_STACK_CAND];
+        float stack_probs[DS4_SAMPLE_STACK_CAND];
+        int *ids = stack_ids;
+        float *probs = stack_probs;
+        uint32_t cap = DS4_SAMPLE_STACK_CAND;
+        uint32_t n = 0;
         float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+        bool heap = false;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
             const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
+            if (p < min_p) continue;
+            if (n == cap) {
+                uint32_t new_cap = cap * 2u;
+                if (new_cap < cap || new_cap > n_vocab) new_cap = n_vocab;
+                if (!heap) {
+                    int *new_ids = xmalloc((size_t)new_cap * sizeof(new_ids[0]));
+                    float *new_probs = xmalloc((size_t)new_cap * sizeof(new_probs[0]));
+                    memcpy(new_ids, ids, (size_t)n * sizeof(new_ids[0]));
+                    memcpy(new_probs, probs, (size_t)n * sizeof(new_probs[0]));
+                    ids = new_ids;
+                    probs = new_probs;
+                    heap = true;
+                } else {
+                    ids = xrealloc(ids, (size_t)new_cap * sizeof(ids[0]));
+                    probs = xrealloc(probs, (size_t)new_cap * sizeof(probs[0]));
+                }
+                cap = new_cap;
+            }
+            ids[n] = (int)i;
+            probs[n] = p;
+            n++;
             sum += p;
+        }
+        if (sum <= 0.0f || !isfinite(sum)) {
+            if (heap) {
+                free(ids);
+                free(probs);
+            }
+            return best;
+        }
+        float r = sample_rng_f32(rng) * sum;
+        for (uint32_t i = 0; i < n; i++) {
+            r -= probs[i];
+            if (r <= 0.0f) {
+                const int id = ids[i];
+                if (heap) {
+                    free(ids);
+                    free(probs);
+                }
+                return id;
+            }
+        }
+        if (heap) {
+            free(ids);
+            free(probs);
+        }
+        return best;
+    }
+
+    if (top_p >= 1.0f) {
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            sum += expf((v - max_logit) / temperature);
         }
         if (sum <= 0.0f || !isfinite(sum)) return best;
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
+            r -= expf((v - max_logit) / temperature);
             if (r <= 0.0f) return (int)i;
         }
         return best;

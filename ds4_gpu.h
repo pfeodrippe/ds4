@@ -269,6 +269,22 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps);
 
+int ds4_gpu_add_project2_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *base,
+        const ds4_gpu_tensor *add,
+        const ds4_gpu_tensor *directions0,
+        const ds4_gpu_tensor *directions1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                layer,
+        uint32_t                n,
+        float                   scale0,
+        float                   scale1,
+        float                   eps);
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -760,6 +776,16 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                width,
         uint32_t                rows,
         float                   scale);
+
+int ds4_gpu_directional_steering_project2_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *directions0,
+        const ds4_gpu_tensor *directions1,
+        uint32_t                layer,
+        uint32_t                width,
+        uint32_t                rows,
+        float                   scale0,
+        float                   scale1);
 
 /* =========================================================================
  * LoRA (Low-Rank Adaptation) kernel.
