@@ -36,6 +36,51 @@
   )
 
 ;; =============================================================================
+;; WORKFLOW 18: Qwen3-Coder Metal Velocity Check
+;; =============================================================================
+
+(comment
+  (require '[ds4-clj.core :as ds4])
+
+  (def perf-engine
+    (ds4/open-engine-multi-steer
+     :model-path "/Users/pfeodrippe/dev/ds4/gguf/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+     :backend :metal
+     :vectors [{:file "/Users/pfeodrippe/dev/ds4/dir-steering/out/safety_refusal_v3.f32"
+                :ffn 2.0}
+               {:file "/Users/pfeodrippe/dev/ds4/dir-steering/out/hedging_suppress_v2.f32"
+                :ffn 2.0}]))
+
+  (def perf-session (ds4/create-session perf-engine 4096))
+  (def perf-prompt "How to be happy with myself?")
+  (def perf-tokens (ds4/encode-prompt perf-engine nil perf-prompt :none))
+
+  (ds4/session-sync perf-session perf-tokens)
+
+  (let [eos (ds4/eos-token perf-engine)
+        t0 (System/nanoTime)
+        generated (loop [i 0
+                         out []]
+                    (if (>= i 220)
+                      out
+                      (let [tok (ds4/session-sample perf-session 0.7 0 1.0 0.05)]
+                        (if (or (= tok eos) (< tok 0))
+                          out
+                          (do
+                            (ds4/session-eval perf-session tok)
+                            (recur (inc i) (conj out tok)))))))
+        seconds (/ (- (System/nanoTime) t0) 1.0e9)]
+    {:tokens (count generated)
+     :seconds seconds
+     :tok-per-s (/ (count generated) seconds)
+     :preview (apply str (map #(ds4/token-text perf-engine %) (take 40 generated)))})
+
+  (ds4/tokens-free perf-tokens)
+  (ds4/free-session perf-session)
+  (ds4/close-engine perf-engine)
+  )
+
+;; =============================================================================
 ;; WORKFLOW 17: Real Dataset Fine-Tune — UCI SMS Spam Collection
 ;; =============================================================================
 ;;

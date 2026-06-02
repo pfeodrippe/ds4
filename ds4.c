@@ -11230,7 +11230,7 @@ static uint32_t qwen_token_split_after_layers(void) {
     static int initialized;
     static uint32_t split_after_layers;
     if (!initialized) {
-        split_after_layers = 1u;
+        split_after_layers = 3u;
         const char *split_env = getenv("DS4_QWEN_TOKEN_SPLIT_LAYERS");
         if (split_env && split_env[0]) {
             char *end = NULL;
@@ -11531,6 +11531,22 @@ static bool qwen_graph_eval_token(
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     return ok;
+}
+
+static bool qwen_graph_eval_token_device_logits(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int token,
+        uint32_t pos) {
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = qwen_graph_encode_token(g, model, weights, token, pos, true);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!ok) {
+        (void)ds4_gpu_end_commands();
+        return false;
+    }
+    return true;
 }
 
 static bool qwen_graph_eval_token_top1(
@@ -17050,9 +17066,11 @@ static int sample_full_vocab(
         uint32_t n = 0;
         float sum = 0.0f;
         bool heap = false;
+        const float min_logit = max_logit + temperature * logf(min_p);
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
+            if (v < min_logit) continue;
             const float p = expf((v - max_logit) / temperature);
             if (p < min_p) continue;
             if (n == cap) {
@@ -17164,6 +17182,84 @@ static int sample_full_vocab(
     const int id = cand[filtered - 1].id;
     free(cand);
     return id;
+}
+
+static int sample_full_vocab_finite_min_p(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        float        min_p,
+        uint64_t    *rng) {
+    float max_logit = DS4_NEG_INF;
+    int best = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (v > max_logit) {
+            max_logit = v;
+            best = (int)i;
+        }
+    }
+
+    enum { DS4_SAMPLE_STACK_CAND = 4096 };
+    int stack_ids[DS4_SAMPLE_STACK_CAND];
+    float stack_probs[DS4_SAMPLE_STACK_CAND];
+    int *ids = stack_ids;
+    float *probs = stack_probs;
+    uint32_t cap = DS4_SAMPLE_STACK_CAND;
+    uint32_t n = 0;
+    float sum = 0.0f;
+    bool heap = false;
+    const float min_logit = max_logit + temperature * logf(min_p);
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (v < min_logit) continue;
+        const float p = expf((v - max_logit) / temperature);
+        if (n == cap) {
+            uint32_t new_cap = cap * 2u;
+            if (new_cap < cap || new_cap > n_vocab) new_cap = n_vocab;
+            if (!heap) {
+                int *new_ids = xmalloc((size_t)new_cap * sizeof(new_ids[0]));
+                float *new_probs = xmalloc((size_t)new_cap * sizeof(new_probs[0]));
+                memcpy(new_ids, ids, (size_t)n * sizeof(new_ids[0]));
+                memcpy(new_probs, probs, (size_t)n * sizeof(new_probs[0]));
+                ids = new_ids;
+                probs = new_probs;
+                heap = true;
+            } else {
+                ids = xrealloc(ids, (size_t)new_cap * sizeof(ids[0]));
+                probs = xrealloc(probs, (size_t)new_cap * sizeof(probs[0]));
+            }
+            cap = new_cap;
+        }
+        ids[n] = (int)i;
+        probs[n] = p;
+        n++;
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        if (heap) {
+            free(ids);
+            free(probs);
+        }
+        return best;
+    }
+    float r = sample_rng_f32(rng) * sum;
+    for (uint32_t i = 0; i < n; i++) {
+        r -= probs[i];
+        if (r <= 0.0f) {
+            const int id = ids[i];
+            if (heap) {
+                free(ids);
+                free(probs);
+            }
+            return id;
+        }
+    }
+    if (heap) {
+        free(ids);
+        free(probs);
+    }
+    return best;
 }
 
 static int sample_top_p_min_p(
@@ -20285,6 +20381,23 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifndef DS4_NO_GPU
+    if (s && !s->logits_valid && !ds4_session_is_cpu(s) &&
+        !s->logit_bias &&
+        !(s->cfg_session && s->cfg_scale != 0.0f) &&
+        s->checkpoint_valid &&
+        s->graph.logits) {
+        const float *logits = (const float *)ds4_gpu_tensor_contents(s->graph.logits);
+        if (logits) {
+            if (temperature > 0.0f && top_k <= 0 &&
+                (top_p <= 0.0f || top_p >= 1.0f) && min_p > 0.0f) {
+                return sample_full_vocab_finite_min_p(logits, DS4_N_VOCAB,
+                                                      temperature, min_p, rng);
+            }
+            return sample_top_p_min_p(logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+        }
+    }
+#endif
     if (!session_materialize_logits_best_effort(s)) return -1;
     session_apply_logit_bias(s);
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
@@ -20511,8 +20624,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     float prev_lora_scale = g_lora_scale;
     g_lora_engine = e;
     g_lora_scale = (e && e->lora_initialized) ? (e->lora_cfg.lora_alpha / e->lora_cfg.rank) : 0.0f;
-    if (!qwen_graph_eval_token(&s->graph, &e->model, &e->weights,
-                               token, (uint32_t)s->checkpoint.len, s->logits)) {
+    const bool need_host_logits = s->cfg_session && s->cfg_scale != 0.0f;
+    const bool eval_ok = need_host_logits ?
+        qwen_graph_eval_token(&s->graph, &e->model, &e->weights,
+                              token, (uint32_t)s->checkpoint.len, s->logits) :
+        qwen_graph_eval_token_device_logits(&s->graph, &e->model, &e->weights,
+                                            token, (uint32_t)s->checkpoint.len);
+    if (!eval_ok) {
+        g_lora_engine = prev_lora_engine;
+        g_lora_scale = prev_lora_scale;
         snprintf(err, errlen, "%s Qwen decode failed", ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
         return 1;
@@ -20534,7 +20654,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    session_note_logits_valid(s);
+    if (need_host_logits) {
+        session_note_logits_valid(s);
+    } else {
+        session_note_logits_invalid(s);
+    }
     (void)probe_mtp;
     return 0;
 #endif

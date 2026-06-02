@@ -726,7 +726,7 @@ static id<MTLComputePipelineState> ds4_gpu_static_mul_mv_pipeline(
 
 enum {
     DS4_QWEN_K_MV_NSG = 2,
-    DS4_MOE_MV_ID_NSG = 2,
+    DS4_MOE_MV_ID_NSG = 1,
 };
 
 static id<MTLComputePipelineState> ds4_gpu_qwen_k_mv_pipeline(uint32_t tensor_type) {
