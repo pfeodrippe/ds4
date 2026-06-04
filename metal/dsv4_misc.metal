@@ -511,6 +511,62 @@ kernel void kernel_qwen_router_topk_softmax_f32(
     (void)probs;
 }
 
+kernel void kernel_qwen_router_top3_softmax_f32(
+        constant ds4_metal_args_qwen_router &args,
+        device const float *logits,
+        device int *selected,
+        device float *weights,
+        device float *probs,
+        uint lane [[thread_index_in_simdgroup]]) {
+    float4 vals = {
+        logits[lane],
+        logits[lane + 32u],
+        logits[lane + 64u],
+        logits[lane + 96u],
+    };
+    int4 indices = {
+        int(lane),
+        int(lane + 32u),
+        int(lane + 64u),
+        int(lane + 96u),
+    };
+    float top_vals[3];
+    int top_indices[3];
+
+    FOR_UNROLL (short k = 0; k < 3; ++k) {
+        float local_val = vals[0];
+        int local_idx = indices[0];
+        FOR_UNROLL (short j = 1; j < 4; ++j) {
+            if (vals[j] > local_val || (vals[j] == local_val && indices[j] < local_idx)) {
+                local_val = vals[j];
+                local_idx = indices[j];
+            }
+        }
+        const float global_val = simd_max(local_val);
+        const int global_idx = simd_min(local_val == global_val ? local_idx : INT_MAX);
+        top_vals[k] = global_val;
+        top_indices[k] = global_idx;
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            if (indices[j] == global_idx) vals[j] = -INFINITY;
+        }
+    }
+
+    if (lane == 0) {
+        const float w0 = 1.0f;
+        const float w1 = exp(top_vals[1] - top_vals[0]);
+        const float w2 = exp(top_vals[2] - top_vals[0]);
+        const float inv_sum = 1.0f / max(w0 + w1 + w2, 1.0e-20f);
+        selected[0] = top_indices[0];
+        selected[1] = top_indices[1];
+        selected[2] = top_indices[2];
+        weights[0] = w0 * inv_sum;
+        weights[1] = w1 * inv_sum;
+        weights[2] = w2 * inv_sum;
+    }
+    (void)args;
+    (void)probs;
+}
+
 kernel void kernel_qwen_router_topk_softmax_batch_f32(
         constant ds4_metal_args_qwen_router &args,
         device const float *logits,

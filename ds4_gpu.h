@@ -37,6 +37,7 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
+int ds4_gpu_flush_commands_profile(const char *label);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
@@ -172,7 +173,8 @@ int ds4_gpu_qwen_router_cached_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *router_weights,
         uint64_t                weight_offset,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        bool                    f16_weights);
 
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
@@ -206,7 +208,7 @@ int ds4_gpu_matmul_k_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
 
-int ds4_gpu_qwen_qkv_q4_tensor(
+int ds4_gpu_qwen_qkv_k_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,
         ds4_gpu_tensor       *v,
@@ -215,6 +217,7 @@ int ds4_gpu_qwen_qkv_q4_tensor(
         uint64_t                q_weight_offset,
         uint64_t                k_weight_offset,
         uint64_t                v_weight_offset,
+        uint32_t                qk_tensor_type,
         uint32_t                v_tensor_type,
         const ds4_gpu_tensor *x);
 

@@ -82,6 +82,13 @@ struct qwen_block_q6_K {
     ushort d;
 };
 
+struct qwen_block_q2_K {
+    uchar scales[QWEN_QK_K/16];
+    uchar qs[QWEN_QK_K/4];
+    ushort d;
+    ushort dmin;
+};
+
 struct ds4_metal_qwen_matvec_args {
     uint in_dim;
     uint out_dim;
@@ -1288,6 +1295,94 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
     }
 }
 
+template <typename type4x4>
+void qwen_dequantize_q2_K_x4(
+        device const qwen_block_q2_K *xb,
+        short il,
+        thread type4x4 &reg) {
+    const float d = qwen_f16_to_f32(xb->d);
+    const float dmin = qwen_f16_to_f32(xb->dmin);
+    device const uchar *q = xb->qs + 32 * (il / 8) + 16 * (il & 1);
+    const uchar sc = xb->scales[il];
+    il = (il / 2) % 4;
+
+    const float coef = il > 1 ? (il > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                              : (il > 0 ? 1.0f / 4.0f : 1.0f);
+    const uchar mask = il > 1 ? (il > 2 ? 192 : 48) : (il > 0 ? 12 : 3);
+    const float dl = d * float(sc & 0x0f) * coef;
+    const float ml = dmin * float(sc >> 4);
+    for (int i = 0; i < 16; i++) {
+        reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+    }
+}
+
+static inline uchar2 qwen_get_scale_min_k4_x4(
+        int j,
+        int k,
+        device const uchar *q) {
+    return j < 4 ? uchar2{uchar(q[j + k] & 63), uchar(q[j + 4 + k] & 63)}
+                 : uchar2{uchar((q[j + 4 + k] & 0x0f) |
+                                ((q[j - 4 + k] & 0xc0) >> 2)),
+                          uchar((q[j + 4 + k] >> 4) |
+                                ((q[j + k] & 0xc0) >> 2))};
+}
+
+template <typename type4x4>
+void qwen_dequantize_q4_K_x4(
+        device const qwen_block_q4_K *xb,
+        short il,
+        thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+    const short is = (il / 4) * 2;
+    q += (il / 4) * 32 + 16 * (il & 1);
+    il &= 3;
+    const uchar2 sc = qwen_get_scale_min_k4_x4(is, il / 2, xb->scales);
+    const float d = qwen_f16_to_f32(xb->d) * (il < 2 ? 1.0f : 1.0f / 16.0f);
+    const float dl = d * float(sc[0]);
+    const float ml = qwen_f16_to_f32(xb->dmin) * float(sc[1]);
+    const ushort mask = il < 2 ? 0x0f : 0xf0;
+    for (int i = 0; i < 16; i++) {
+        reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+    }
+}
+
+template <typename type4x4>
+void qwen_dequantize_q6_K_x4(
+        device const qwen_block_q6_K *xb,
+        short il,
+        thread type4x4 &reg) {
+    const float d = qwen_f16_to_f32(xb->d);
+    device const ushort *ql = (device const ushort *)xb->ql;
+    device const ushort *qh = (device const ushort *)xb->qh;
+    device const char *scales = xb->scales;
+
+    ql += 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+    qh += 16 * (il / 8) + 8 * (il & 1);
+    const float sc = float(scales[(il % 2) + 2 * (il / 2)]);
+    il = (il / 2) & 3;
+
+    const uint kmask1 = il > 1 ? (il > 2 ? 0xc0c0c0c0 : 0x30303030)
+                               : (il > 0 ? 0x0c0c0c0c : 0x03030303);
+    const uint kmask2 = il > 1 ? 0xf0f0f0f0 : 0x0f0f0f0f;
+    const float ml = d * sc * 32.0f;
+    const float dl0 = d * sc;
+    const float dl1 = dl0 / 256.0f;
+    const float dl2 = dl1 / 256.0f;
+    const float dl3 = dl2 / 256.0f;
+    const uchar shr_h = il > 2 ? 2 : 0;
+    const uchar shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+    const uchar shr_l = il > 1 ? 4 : 0;
+    for (int i = 0; i < 4; i++) {
+        const uint low = (uint(ql[2 * i]) | (uint(ql[2 * i + 1]) << 16)) & kmask2;
+        const uint high = (uint(qh[2 * i]) | (uint(qh[2 * i + 1]) << 16)) & kmask1;
+        const uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 * float(q & 0xff) - ml;
+        reg[i][1] = dl1 * float(q & 0xff00) - ml;
+        reg[i][2] = dl2 * float(q & 0xff0000) - ml;
+        reg[i][3] = dl3 * float(q & 0xff000000) - ml;
+    }
+}
+
 // DS4 small-batch mat-vec kernel used for 2..8 prompt tokens.
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
 void kernel_mul_mv_ext_q4_f32_impl(
@@ -1388,6 +1483,81 @@ void kernel_mul_mv_ext_q4_f32_impl(
     }
 }
 
+template<short r1ptg, typename q_t, short chpb,
+         void (*deq_t4x4)(device const q_t *, short, thread float4x4 &)>
+void kernel_mul_mv_ext_q4x4_f32_impl(
+        constant ds4_metal_args_mul_mv_ext &args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short nsg = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+    const short nypsg = 32 / nxpsg;
+    const short tx = tiisg % nxpsg;
+    const short ty = tiisg / nxpsg;
+
+    const int i01 = tgpig.x * (nypsg * nsg) + nypsg * sgitg + ty;
+    const int i11 = tgpig.y * r1ptg;
+    const int i1m = tgpig.z;
+    const int i12 = i1m % args.ne12;
+    const int i13 = i1m / args.ne12;
+    const uint64_t offset0 = i01 * args.nb01 +
+                             (i12 / args.r2) * args.nb02 +
+                             (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = i11 * args.nb11 +
+                             i12 * args.nb12 +
+                             i13 * args.nb13;
+
+    device const q_t *xq = i01 < args.ne01
+        ? (device const q_t *)(src0 + offset0) + tx / chpb
+        : (device const q_t *)src0;
+    device const float4x4 *y4x4[r1ptg];
+    for (short row = 0; row < r1ptg; row++) {
+        y4x4[row] = i11 + row < args.ne11
+            ? (device const float4x4 *)(src1 + offset1 + row * args.nb11) + tx
+            : (device const float4x4 *)src1;
+    }
+
+    float sums[r1ptg] = { [0 ... r1ptg - 1] = 0.0f };
+    short chunk = tx % chpb;
+    for (int i = tx; 16 * i < args.ne00; i += nxpsg) {
+        float4x4 w;
+        deq_t4x4(xq, chunk, w);
+        chunk += nxpsg;
+        if (chunk >= chpb) {
+            xq += chunk / chpb;
+            chunk %= chpb;
+        }
+        for (short row = 0; row < r1ptg; row++) {
+            sums[row] += dot(w[0], y4x4[row][0][0]) +
+                         dot(w[1], y4x4[row][0][1]) +
+                         dot(w[2], y4x4[row][0][2]) +
+                         dot(w[3], y4x4[row][0][3]);
+            y4x4[row] += nxpsg;
+        }
+    }
+
+    for (short row = 0; row < r1ptg; row++) {
+        if (nxpsg >= 32) sums[row] += simd_shuffle_down(sums[row], 16);
+        if (nxpsg >= 16) sums[row] += simd_shuffle_down(sums[row], 8);
+        if (nxpsg >= 8) sums[row] += simd_shuffle_down(sums[row], 4);
+        if (nxpsg >= 4) sums[row] += simd_shuffle_down(sums[row], 2);
+        if (nxpsg >= 2) sums[row] += simd_shuffle_down(sums[row], 1);
+    }
+
+    if (tx == 0 && i01 < args.ne01) {
+        for (short row = 0; row < r1ptg && i11 + row < args.ne11; row++) {
+            device float *out = (device float *)dst +
+                                (uint64_t)i1m * args.ne0 * args.ne1 +
+                                (uint64_t)(i11 + row) * args.ne0;
+            out[i01] = sums[row];
+        }
+    }
+}
+
 // Small-batch prompt matvec for 2..5 tokens. It bridges decode-style matvec and
 // full matmul when DS4 prefill chunks are too small to amortize matrix tiles.
 template<short r1ptg, typename q_t, short epb, void (*deq_t4)(device const q_t *, short, thread float4 &)>
@@ -1402,7 +1572,23 @@ kernel void kernel_mul_mv_ext_q4_f32_disp(
     kernel_mul_mv_ext_q4_f32_impl<r1ptg, q_t, epb/4, deq_t4>(args, src0, src1, dst, tgpig, tiisg, sgitg);
 }
 
+template<short r1ptg, typename q_t, short epb,
+         void (*deq_t4x4)(device const q_t *, short, thread float4x4 &)>
+kernel void kernel_mul_mv_ext_q4x4_f32_disp(
+        constant ds4_metal_args_mul_mv_ext &args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_ext_q4x4_f32_impl<r1ptg, q_t, epb / 16, deq_t4x4>(
+            args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
 typedef decltype(kernel_mul_mv_ext_q4_f32_disp<2, block_q8_0, 32, dequantize_q8_0_t4>) mul_mv_ext_q4_f32_t;
+typedef decltype(kernel_mul_mv_ext_q4x4_f32_disp<
+        2, qwen_block_q4_K, 256, qwen_dequantize_q4_K_x4>) qwen_mul_mv_ext_k_f32_t;
 
 // Host-visible small-batch variants. DS4 currently needs F16 and Q8_0 weights
 // for r1=2..5 during the prompt path.
@@ -1415,6 +1601,18 @@ template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_2")]] kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
+
+template [[host_name("kernel_qwen_mul_mv_ext_q2_K_f32_r1_2")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, qwen_block_q2_K, 256, qwen_dequantize_q2_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q2_K_f32_r1_3")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, qwen_block_q2_K, 256, qwen_dequantize_q2_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q2_K_f32_r1_4")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, qwen_block_q2_K, 256, qwen_dequantize_q2_K_x4>;
+
+template [[host_name("kernel_qwen_mul_mv_ext_q4_K_f32_r1_2")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, qwen_block_q4_K, 256, qwen_dequantize_q4_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q4_K_f32_r1_3")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, qwen_block_q4_K, 256, qwen_dequantize_q4_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q4_K_f32_r1_4")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, qwen_block_q4_K, 256, qwen_dequantize_q4_K_x4>;
+
+template [[host_name("kernel_qwen_mul_mv_ext_q6_K_f32_r1_2")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, qwen_block_q6_K, 256, qwen_dequantize_q6_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q6_K_f32_r1_3")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, qwen_block_q6_K, 256, qwen_dequantize_q6_K_x4>;
+template [[host_name("kernel_qwen_mul_mv_ext_q6_K_f32_r1_4")]] kernel qwen_mul_mv_ext_k_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, qwen_block_q6_K, 256, qwen_dequantize_q6_K_x4>;
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
@@ -2097,6 +2295,6 @@ kernel void kernel_mul_mm_f16_f32_pair(
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
-// Host-visible prefill matmul variants for F16 and Q8_0 weights.
+// Host-visible prefill matmul variants.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;

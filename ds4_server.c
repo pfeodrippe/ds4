@@ -10046,6 +10046,11 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        (void)ds4_session_set_quality(s->session, true);
+    } else {
+        (void)ds4_session_clear_quality_override(s->session);
+    }
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -11384,6 +11389,7 @@ static server_config parse_options(int argc, char **argv) {
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .quality = true,
         },
         .host = "127.0.0.1",
         .port = 8000,

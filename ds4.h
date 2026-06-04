@@ -136,6 +136,17 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+typedef struct {
+    int eos_token;
+    int n_predict;
+    int top_k;
+    int out_cap;
+    float temperature;
+    float top_p;
+    float min_p;
+    uint64_t seed;
+} ds4_generation_options;
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
@@ -197,6 +208,8 @@ int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+int ds4_session_set_quality(ds4_session *s, bool quality);
+int ds4_session_clear_quality_override(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 bool ds4_session_is_cpu(const ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
@@ -225,6 +238,8 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_session_generate_tokens(ds4_session *s, const ds4_generation_options *opt,
+                                int *out, char *err, size_t errlen);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 

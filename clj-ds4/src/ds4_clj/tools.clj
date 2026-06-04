@@ -115,19 +115,23 @@
                          "of repeating the same tool call.")
         model (as-model engine-or-model)
         model-with-tools (ds4/with-system model tool-system)]
-    (loop [round 0
-           text ""
-           history []]
-      (let [full-prompt (if (seq history)
-                          (str prompt "\n\n" (str/join "\n\n" history))
-                          prompt)
-            chunk (ds4/generate-with-session model-with-tools session full-prompt
-                                                      :n-tokens n-tokens :temperature temperature)
-            new-text (str text chunk)
-            {:keys [results has-tools?]} (execute-tools chunk)]
-        (if (and has-tools? (< round max-tool-rounds))
-          (let [tool-output (format-tool-results results)]
-            (recur (inc round)
-                   (str new-text "\n\n" tool-output "\n\n")
-                   (conj history (str chunk "\n\n" tool-output))))
-          new-text)))))
+    (ds4/set-session-quality session true)
+    (try
+      (loop [round 0
+             text ""
+             history []]
+        (let [full-prompt (if (seq history)
+                            (str prompt "\n\n" (str/join "\n\n" history))
+                            prompt)
+              chunk (ds4/generate-with-session model-with-tools session full-prompt
+                                                :n-tokens n-tokens :temperature temperature)
+              new-text (str text chunk)
+              {:keys [results has-tools?]} (execute-tools chunk)]
+          (if (and has-tools? (< round max-tool-rounds))
+            (let [tool-output (format-tool-results results)]
+              (recur (inc round)
+                     (str new-text "\n\n" tool-output "\n\n")
+                     (conj history (str chunk "\n\n" tool-output))))
+            new-text)))
+      (finally
+        (ds4/clear-session-quality-override session)))))

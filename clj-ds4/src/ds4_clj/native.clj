@@ -69,6 +69,18 @@
      [:logit :float]
      [:logprob :float]]))
 
+(def DS4GenerationOptions
+  (vp/make-component 'DS4GenerationOptions
+    [[:eos_token :int]
+     [:n_predict :int]
+     [:top_k :int]
+     [:out_cap :int]
+     [:temperature :float]
+     [:top_p :float]
+     [:min_p :float]
+     [:_padding [:padding {:size 4}]]
+     [:seed :long]]))
+
 ;; --- Enums ---
 
 (def backend
@@ -108,6 +120,15 @@
   (vp/c-fn (lookup-symbol "ds4_session_free")
            (fd :void [[:session [:* :void]]])))
 
+(def ^:private c-session-set-quality
+  (vp/c-fn (lookup-symbol "ds4_session_set_quality")
+           (fd :int [[:session [:* :void]]
+                     [:quality :byte]])))
+
+(def ^:private c-session-clear-quality-override
+  (vp/c-fn (lookup-symbol "ds4_session_clear_quality_override")
+           (fd :int [[:session [:* :void]]])))
+
 (def ^:private c-session-sync
   (vp/c-fn (lookup-symbol "ds4_session_sync")
            (fd :int [[:session [:* :void]]
@@ -137,6 +158,14 @@
                      [:top_p :float]
                      [:min_p :float]
                      [:rng [:* :long]]])))
+
+(def ^:private c-session-generate-tokens
+  (vp/c-fn (lookup-symbol "ds4_session_generate_tokens")
+           (fd :int [[:session [:* :void]]
+                     [:opts [:* :void]]
+                     [:out [:* :int]]
+                     [:err [:* :byte]]
+                     [:errlen :long]])))
 
 (def ^:private c-session-argmax
   (vp/c-fn (lookup-symbol "ds4_session_argmax")
@@ -351,6 +380,20 @@
   [^MemorySegment session]
   (c-session-free session))
 
+(defn session-set-quality
+  "Force exact/fast quality mode for this session."
+  [^MemorySegment session quality?]
+  (let [rc (c-session-set-quality session (byte (if quality? 1 0)))]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_session_set_quality failed" {:rc rc})))))
+
+(defn session-clear-quality-override
+  "Return this session to its engine's configured quality mode."
+  [^MemorySegment session]
+  (let [rc (c-session-clear-quality-override session)]
+    (when (not= 0 rc)
+      (throw (ex-info "ds4_session_clear_quality_override failed" {:rc rc})))))
+
 (defn session-sync
   "Sync a prompt into the session. Returns nil on success, throws on error."
   [^MemorySegment session ^MemorySegment tokens-seg]
@@ -388,6 +431,28 @@
    (let [rng (vp/alloc (ValueLayout/JAVA_LONG))]
      (.set rng (ValueLayout/JAVA_LONG) 0 (long (rand-int 1000000)))
      (c-session-sample session temperature top-k top-p min-p rng))))
+
+(defn session-generate-tokens
+  "Generate tokens in the native decode loop. Returns a vector of token ids."
+  [^MemorySegment session eos-token n-tokens temperature top-k top-p min-p seed]
+  (let [cap (max 0 (int n-tokens))
+        opts (DS4GenerationOptions
+              {:eos_token (int eos-token)
+               :n_predict cap
+               :top_k (int top-k)
+               :out_cap cap
+               :temperature (float temperature)
+               :top_p (float top-p)
+               :min_p (float min-p)
+               :seed (long seed)})
+        ^MemorySegment out-seg (vp/alloc (* cap 4) 4)
+        err-buf (alloc-err-buf)
+        n (c-session-generate-tokens session (vp/mem opts) out-seg err-buf 256)]
+    (when (< n 0)
+      (throw (ex-info (str "ds4_session_generate_tokens failed: " (err-string err-buf))
+                      {:rc n})))
+    (vec (for [i (range n)]
+           (.get ^MemorySegment out-seg (ValueLayout/JAVA_INT) (* i 4))))))
 
 (defn session-argmax
   "Get the argmax token."

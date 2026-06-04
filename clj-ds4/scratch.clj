@@ -645,18 +645,14 @@
                                                 :none)]
            (try
              (ds4/session-sync session prompt-tokens)
-             (let [eos (ds4/eos-token engine)
-                   t0 (System/nanoTime)
-                   generated
-                   (loop [i 0 out []]
-                     (if (>= i n-tokens)
-                       out
-                       (let [token (ds4/session-sample session 0.7 0 1.0 0.05)]
-                         (if (or (= token eos) (< token 0))
-                           out
-                           (do
-                             (ds4/session-eval session token)
-                             (recur (inc i) (conj out token)))))))
+             (let [t0 (System/nanoTime)
+                   generated (ds4/generate-next-tokens engine session
+                                                        :n-tokens n-tokens
+                                                        :temperature 0.7
+                                                        :top-k 0
+                                                        :top-p 1.0
+                                                        :min-p 0.05
+                                                        :seed 1)
                    seconds (/ (- (System/nanoTime) t0) 1.0e9)]
                {:tokens (count generated)
                 :seconds seconds

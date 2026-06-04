@@ -138,6 +138,17 @@
   [session]
   (n/session-free session))
 
+(defn set-session-quality
+  "Force exact/fast quality mode for a session. Changing mode invalidates
+  incompatible live KV state on the native side."
+  [session quality?]
+  (n/session-set-quality session quality?))
+
+(defn clear-session-quality-override
+  "Return a session to the engine's configured quality mode."
+  [session]
+  (n/session-clear-quality-override session))
+
 ;; --- Prompt handling ---
 
 (defn encode-prompt
@@ -198,6 +209,24 @@
   ([session temperature top-k top-p min-p]
    (n/session-sample session temperature top-k top-p min-p)))
 
+(defn generate-next-tokens
+  "Generate from the session's current logits without syncing a new prompt."
+  [engine session & {:keys [n-tokens temperature top-k top-p min-p seed]
+                     :or {n-tokens 20
+                          temperature 0.8
+                          top-k 0
+                          top-p 1.0
+                          min-p 0.05
+                          seed 0}}]
+  (n/session-generate-tokens session
+                             (n/token-eos engine)
+                             n-tokens
+                             temperature
+                             top-k
+                             top-p
+                             min-p
+                             seed))
+
 ;; --- Generation ---
 
 (defn generate-tokens
@@ -209,14 +238,16 @@
     :top-k        - top-k sampling (default: 0 = disabled)
     :top-p        - nucleus sampling (default: 1.0)
     :min-p        - min-p sampling (default: 0.05)
+    :seed         - sampling seed; 0 uses a time/session seed (default: 0)
     :system       - system prompt (default: nil)
     :think-mode   - :none, :normal, or :max (default: :none)"
-  [engine session prompt & {:keys [n-tokens temperature top-k top-p min-p system think-mode]
+  [engine session prompt & {:keys [n-tokens temperature top-k top-p min-p seed system think-mode]
                             :or {n-tokens 20
                                  temperature 0.8
                                  top-k 0
                                  top-p 1.0
                                  min-p 0.05
+                                 seed 0
                                  think-mode :none}}]
   (let [tokens (encode-prompt engine system prompt think-mode)]
     (try
@@ -227,20 +258,18 @@
                      (loop [generated []
                             token (n/session-argmax session)]
                        (if (or (>= (count generated) n-tokens)
-                               (= token eos)
-                               (< token 0))
+                                 (= token eos)
+                                 (< token 0))
                          generated
                          (recur (conj generated token)
                                 (n/session-eval-argmax session token))))
-                     (loop [generated []]
-                       (if (>= (count generated) n-tokens)
-                         generated
-                         (let [token (n/session-sample session temperature top-k top-p min-p)]
-                           (if (= token eos)
-                             generated
-                             (do
-                               (n/session-eval session token)
-                               (recur (conj generated token))))))))
+                     (generate-next-tokens engine session
+                                           :n-tokens n-tokens
+                                           :temperature temperature
+                                           :top-k top-k
+                                           :top-p top-p
+                                           :min-p min-p
+                                           :seed seed))
             _ (n/tokens-free tokens)]
         result)
       (catch Exception e

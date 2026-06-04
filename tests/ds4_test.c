@@ -902,7 +902,9 @@ static void test_official_logprob_vectors(void) {
     } else {
         unsetenv("DS4_METAL_DISABLE_METAL4");
     }
-    ds4_engine *engine = test_open_engine(false);
+    /* Official vectors describe the full top-8 model, not the top-3
+     * performance route used by the default CLI decode path. */
+    ds4_engine *engine = test_open_engine(true);
     if (!engine) {
         test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
         test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
@@ -1372,6 +1374,9 @@ static void test_tool_call_quality_one(bool quality) {
         request_free(&r);
         return;
     }
+    if (r.has_tools) {
+        TEST_ASSERT(ds4_session_set_quality(session, true) == 0);
+    }
     TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
     buf text = {0};
@@ -1413,7 +1418,7 @@ static void test_tool_call_quality_one(bool quality) {
 }
 
 static void test_tool_call_quality(void) {
-    fprintf(stderr, "ds4-test: tool-call quality fast path\n");
+    fprintf(stderr, "ds4-test: tool-call quality fast engine exact-control path\n");
     test_tool_call_quality_one(false);
     test_close_engine(false);
     fprintf(stderr, "ds4-test: tool-call quality exact path\n");
@@ -2506,7 +2511,7 @@ static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the exact quality path", test_official_logprob_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},

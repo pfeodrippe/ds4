@@ -530,6 +530,7 @@ static agent_config parse_options(int argc, char **argv) {
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .quality = true,
         },
         .gen = {
             .system = "",
