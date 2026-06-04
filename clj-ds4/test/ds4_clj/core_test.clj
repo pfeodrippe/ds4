@@ -11,7 +11,8 @@
    [clojure.java.shell :as shell]
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing use-fixtures]]
-   [ds4-clj.core :as ds4]))
+   [ds4-clj.core :as ds4]
+   [ds4-clj.tools :as tools]))
 
 (def ^:dynamic *engine* nil)
 (def ^:dynamic *session* nil)
@@ -40,6 +41,14 @@
 
 (use-fixtures :once engine-fixture)
 (use-fixtures :each session-fixture)
+
+(deftest test-python-tool-last-expression
+  (testing "Python tools return a REPL-style final expression value"
+    (let [{:keys [results has-tools?]}
+          (tools/execute-tools
+           "<tool>python</tool><code>import math\nmath.factorial(20)</code>")]
+      (is has-tools?)
+      (is (= "2432902008176640000" (:result (first results)))))))
 
 (deftest test-basic-generation
   (testing "Greedy generation produces deterministic output"

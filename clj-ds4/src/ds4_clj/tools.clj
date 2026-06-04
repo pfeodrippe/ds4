@@ -15,16 +15,36 @@
    [clojure.java.shell :as shell]
    [ds4-clj.core :as ds4]))
 
-(defn- safe-python-eval
-  "Execute Python code safely and return stdout."
+(def ^:private python-eval-wrapper
+  (str "import ast, pathlib, sys\n"
+       "path = pathlib.Path(sys.argv[1])\n"
+       "source = path.read_text()\n"
+       "tree = ast.parse(source, filename=str(path))\n"
+       "scope = {}\n"
+       "if tree.body and isinstance(tree.body[-1], ast.Expr):\n"
+       "    expr = tree.body.pop()\n"
+       "    exec(compile(tree, str(path), 'exec'), scope, scope)\n"
+       "    value = eval(compile(ast.fix_missing_locations(ast.Expression(expr.value)), str(path), 'eval'), scope, scope)\n"
+       "    if value is not None:\n"
+       "        print(value)\n"
+       "else:\n"
+       "    exec(compile(tree, str(path), 'exec'), scope, scope)\n"))
+
+(defn- python-eval
+  "Execute Python code in a subprocess and return stdout.
+
+  Like a REPL, a final expression is printed even without an explicit print()."
   [code]
-  (let [temp-file (java.io.File/createTempFile "ds4_tool_" ".py")
-        _ (.deleteOnExit temp-file)
-        _ (spit temp-file code)
-        result (shell/sh "python3" (.getAbsolutePath temp-file))]
-    (if (zero? (:exit result))
-      (str/trim (:out result))
-      (str "ERROR: " (:err result)))))
+  (let [temp-file (java.io.File/createTempFile "ds4_tool_" ".py")]
+    (try
+      (spit temp-file code)
+      (let [result (shell/sh "python3" "-c" python-eval-wrapper
+                             (.getAbsolutePath temp-file))]
+        (if (zero? (:exit result))
+          (str/trim (:out result))
+          (str "ERROR: " (str/trim (:err result)))))
+      (finally
+        (.delete temp-file)))))
 
 (defn extract-tool-calls
   "Extract tool calls from model output.
@@ -42,7 +62,7 @@
   "Execute a single tool call and return the result string."
   [{:keys [tool code]}]
   (case tool
-    "python" (safe-python-eval code)
+    "python" (python-eval code)
     (str "Unknown tool: " tool)))
 
 (defn execute-tools
@@ -91,7 +111,8 @@
                          "# your python code here\n"
                          "</code>\n\n"
                          "The result will be provided to you. "
-                         "After receiving results, continue solving the problem.")
+                         "After receiving a tool result, answer using it instead "
+                         "of repeating the same tool call.")
         model (as-model engine-or-model)
         model-with-tools (ds4/with-system model tool-system)]
     (loop [round 0
@@ -107,6 +128,6 @@
         (if (and has-tools? (< round max-tool-rounds))
           (let [tool-output (format-tool-results results)]
             (recur (inc round)
-                   new-text
+                   (str new-text "\n\n" tool-output "\n\n")
                    (conj history (str chunk "\n\n" tool-output))))
           new-text)))))

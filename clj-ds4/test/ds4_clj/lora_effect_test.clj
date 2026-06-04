@@ -23,6 +23,16 @@
 
 (use-fixtures :once engine-fixture)
 
+(defn- prompt-top-probabilities [prompt]
+  (let [session (ds4/create-session *engine* 128)
+        tokens (ds4/encode-prompt *engine* nil prompt :none)]
+    (try
+      (ds4/session-sync session tokens)
+      (ds4/token-probabilities session :k 20)
+      (finally
+        (ds4/tokens-free tokens)
+        (ds4/free-session session)))))
+
 (defn write-strong-adapter
   "Create a synthetic adapter with strong signal.
 
@@ -80,7 +90,8 @@
       (write-strong-adapter path)
 
       ;; Baseline (no adapter)
-      (let [session1 (ds4/create-session *engine* 128)
+      (let [baseline-probs (prompt-top-probabilities prompt)
+            session1 (ds4/create-session *engine* 128)
             baseline (try
                        (ds4/generate *engine* session1 prompt
                                      {:n-tokens 10 :temperature 0.0})
@@ -92,7 +103,8 @@
         (is (ds4/lora-enabled? *engine*))
 
         ;; Generate with adapter
-        (let [session2 (ds4/create-session *engine* 128)
+        (let [adapted-probs (prompt-top-probabilities prompt)
+              session2 (ds4/create-session *engine* 128)
               adapted (try
                         (ds4/generate *engine* session2 prompt
                                       {:n-tokens 10 :temperature 0.0})
@@ -105,18 +117,10 @@
           (is (string? adapted))
           (is (> (count baseline) 0))
           (is (> (count adapted) 0))
-
-          ;; With strong adapter values, outputs should differ
-          ;; Note: if they happen to be the same by chance, this could fail,
-          ;; but with rank=1, alpha=64, and non-zero A/B, it's very likely
-          ;; the q projection changes enough to alter token selection
+          (is (not= baseline-probs adapted-probs)
+              "LoRA should change prompt logits even when greedy text is unchanged")
           (println (format "Baseline: %s" baseline))
-          (println (format "Adapted:  %s" adapted))
-
-          ;; Most of the time they should differ. If they don't, it's not
-          ;; necessarily a bug — the adapter might not affect this specific
-          ;; prompt's most likely tokens.
-          )
+          (println (format "Adapted:  %s" adapted)))
 
         ;; Clean up
         (ds4/lora-free! *engine*)

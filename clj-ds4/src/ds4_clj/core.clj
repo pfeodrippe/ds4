@@ -1036,6 +1036,58 @@
 (defrecord LoadedModel [id engine session opts adapter-path])
 
 (defonce ^:private loaded-model-registry (atom {}))
+(defonce ^:private loaded-engine-state (atom nil))
+(defonce ^:private loaded-model-lock (Object.))
+
+(defn- default-backend []
+  (if (str/includes? (str/lower-case (System/getProperty "os.name")) "mac")
+    :metal
+    :cpu))
+
+(defn- normalized-loaded-engine-opts [opts]
+  (let [defaults {:model-path "qwen3-coder.gguf"
+                  :backend (default-backend)
+                  :steering-attn 0.0
+                  :steering-ffn 0.0
+                  :n-threads 0
+                  :quality false
+                  :power 100
+                  :mtp-draft-tokens 1
+                  :mtp-margin 3.0}
+        engine-opts (merge defaults (dissoc opts :ctx-size :adapter-path))]
+    (cond-> engine-opts
+      (:model-path engine-opts)
+      (update :model-path #(-> % resolve-model-path io/file .getCanonicalPath))
+
+      (:steering-file engine-opts)
+      (update :steering-file #(-> % resolve-model-path io/file .getCanonicalPath))
+
+      (:mtp-path engine-opts)
+      (update :mtp-path #(-> % resolve-model-path io/file .getCanonicalPath)))))
+
+(defn- activate-loaded-adapter!
+  [{:keys [engine adapter-path]}]
+  (let [{state-engine :engine active-adapter :active-adapter} @loaded-engine-state]
+    (when-not (identical? engine state-engine)
+      (throw (ex-info "Named model does not belong to the active engine" {})))
+    (when (not= adapter-path active-adapter)
+      (try
+        (if adapter-path
+          (lora-load! engine adapter-path)
+          (when active-adapter
+            (lora-free! engine)))
+        (swap! loaded-engine-state assoc :active-adapter adapter-path)
+        (catch Throwable error
+          (swap! loaded-engine-state assoc :active-adapter ::unknown-adapter)
+          (throw error))))))
+
+(defn- replace-loaded-model-session!
+  [{:keys [id engine opts] :as model}]
+  (let [session (create-session engine (get opts :ctx-size 4096))]
+    (free-session (:session model))
+    (let [updated (assoc model :session session)]
+      (swap! loaded-model-registry assoc id updated)
+      updated)))
 
 (defn loaded-model-ids
   "Return ids for models currently loaded through load-model!."
@@ -1048,66 +1100,99 @@
   (get @loaded-model-registry id))
 
 (defn unload-model!
-  "Free the named model's session and engine."
+  "Free a named model session. The shared engine closes with the final model."
   [id]
-  (when-let [{:keys [engine session]} (loaded-model id)]
-    (when session (free-session session))
-    (when engine (close-engine engine))
-    (swap! loaded-model-registry dissoc id)
-    true))
+  (locking loaded-model-lock
+    (when-let [{:keys [engine session]} (loaded-model id)]
+      (when session (free-session session))
+      (swap! loaded-model-registry dissoc id)
+      (when (empty? @loaded-model-registry)
+        (close-engine engine)
+        (reset! loaded-engine-state nil))
+      true)))
 
 (defn unload-all-models!
   "Free every model loaded through load-model!."
   []
-  (doseq [id (loaded-model-ids)]
-    (unload-model! id))
-  true)
+  (locking loaded-model-lock
+    (doseq [id (vec (loaded-model-ids))]
+      (unload-model! id))
+    true))
 
 (defn load-model!
-  "Open a named engine/session pair for REPL use.
+  "Load a named logical model backed by the process-wide Qwen engine.
 
   Options are open-engine options plus:
     :ctx-size     - session context size (default 4096)
-    :adapter-path - optional DS4 LoRA adapter to load after opening
+    :adapter-path - optional DS4 LoRA adapter activated during this model's calls
 
-  Use this for side-by-side baseline/fine-tuned/expert experiments."
+  Named variants with the same base-engine options share one native engine and
+  own separate sessions. Adapter selection is switched atomically before each
+  generate-loaded call. DS4 intentionally supports only one base-engine
+  configuration per process."
   [id & {:keys [ctx-size adapter-path] :or {ctx-size 4096} :as opts}]
-  (unload-model! id)
-  (let [engine (apply open-engine (apply concat (dissoc opts :ctx-size :adapter-path)))
-        session (create-session engine ctx-size)]
-    (when adapter-path
-      (lora-load! engine adapter-path))
-    (let [model (->LoadedModel id engine session opts adapter-path)]
-      (swap! loaded-model-registry assoc id model)
-      model)))
+  (locking loaded-model-lock
+    (unload-model! id)
+    (let [engine-opts (normalized-loaded-engine-opts opts)
+          state @loaded-engine-state]
+      (when (and state (not= engine-opts (:options state)))
+        (throw (ex-info
+                "DS4 supports one base-engine configuration per process; unload all named models before changing it"
+                {:active-options (:options state)
+                 :requested-options engine-opts})))
+      (let [new-engine? (nil? state)
+            engine (if new-engine?
+                     (apply open-engine (mapcat identity engine-opts))
+                     (:engine state))]
+        (when new-engine?
+          (reset! loaded-engine-state {:engine engine
+                                       :options engine-opts
+                                       :active-adapter nil}))
+        (try
+          (let [session (create-session engine ctx-size)
+                model (->LoadedModel id engine session opts adapter-path)]
+            (swap! loaded-model-registry assoc id model)
+            model)
+          (catch Throwable error
+            (when new-engine?
+              (close-engine engine)
+              (reset! loaded-engine-state nil))
+            (throw error)))))))
 
 (defn load-model-adapter!
-  "Load a DS4 LoRA adapter into a named model."
+  "Set and validate the DS4 LoRA adapter used by a named model."
   [id adapter-path]
-  (let [{:keys [engine] :as model} (loaded-model id)]
-    (when-not model
-      (throw (ex-info "Model id is not loaded" {:id id})))
-    (lora-load! engine adapter-path)
-    (swap! loaded-model-registry assoc id (assoc model :adapter-path adapter-path))
-    adapter-path))
+  (locking loaded-model-lock
+    (let [model (loaded-model id)]
+      (when-not model
+        (throw (ex-info "Model id is not loaded" {:id id})))
+      (let [updated (assoc model :adapter-path adapter-path)]
+        (activate-loaded-adapter! updated)
+        (replace-loaded-model-session! updated)
+        adapter-path))))
 
 (defn free-model-adapter!
-  "Unload the current LoRA adapter from a named model."
+  "Remove the adapter from a named model and reset its session."
   [id]
-  (let [{:keys [engine] :as model} (loaded-model id)]
-    (when-not model
-      (throw (ex-info "Model id is not loaded" {:id id})))
-    (lora-free! engine)
-    (swap! loaded-model-registry assoc id (assoc model :adapter-path nil))
-    true))
+  (locking loaded-model-lock
+    (let [model (loaded-model id)]
+      (when-not model
+        (throw (ex-info "Model id is not loaded" {:id id})))
+      (let [updated (assoc model :adapter-path nil)]
+        (when (= (:adapter-path model) (:active-adapter @loaded-engine-state))
+          (activate-loaded-adapter! updated))
+        (replace-loaded-model-session! updated)
+        true))))
 
 (defn generate-loaded
   "Generate from a named model loaded with load-model!."
   [id prompt & opts]
-  (let [{:keys [engine session]} (loaded-model id)]
-    (when-not engine
-      (throw (ex-info "Model id is not loaded" {:id id})))
-    (apply generate engine session prompt opts)))
+  (locking loaded-model-lock
+    (let [{:keys [engine session] :as model} (loaded-model id)]
+      (when-not engine
+        (throw (ex-info "Model id is not loaded" {:id id})))
+      (activate-loaded-adapter! model)
+      (apply generate engine session prompt opts))))
 
 ;; --- Utils ---
 

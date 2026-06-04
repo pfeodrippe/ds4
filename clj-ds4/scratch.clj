@@ -1,105 +1,509 @@
 (ns scratch
-  (:require [clojure.string :as str]
-            [ds4-clj.core :as ds4])
+  "Executable REPL workflows for the Qwen3-Coder DS4 engine.
+
+  Load with `(load-file \"scratch.clj\")`, then call a named workflow,
+  `run-smoke-workflows!`, or `run-all-workflows!`."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [ds4-clj.core :as ds4]
+            [ds4-clj.tools :as tools])
   (:import [java.io FileInputStream FileOutputStream]
            [java.net URI]
            [java.nio ByteBuffer ByteOrder]
            [java.nio.file Files StandardCopyOption]
            [java.util.zip ZipInputStream]))
 
-;; =============================================================================
-;; WORKFLOW 1: Basic Generation
-;; =============================================================================
+(def repo-root
+  (let [cwd (io/file (System/getProperty "user.dir"))]
+    (.getAbsolutePath
+     (cond
+       (.exists (io/file cwd "qwen3-coder.gguf")) cwd
+       (.exists (io/file cwd ".." "qwen3-coder.gguf")) (io/file cwd "..")
+       :else (io/file (System/getProperty "user.home") "dev" "ds4")))))
 
-(comment
-  ;; Open the model (Metal on macOS, CPU elsewhere)
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
+(def model-path (str repo-root "/qwen3-coder.gguf"))
+(def safety-steering-path (str repo-root "/dir-steering/out/safety_refusal_v3.f32"))
+(def hedging-steering-path (str repo-root "/dir-steering/out/hedging_suppress_v2.f32"))
+(def sarcastic-steering-path (str repo-root "/dir-steering/out/sarcastic_v1.f32"))
 
-  ;; Generate text
-  (ds4/generate engine session "The capital of France is"
-                {:n-tokens 10 :temperature 0.0})
-  ;; => "The capital of France is Paris."
+(defn- keyword-args [m]
+  (mapcat (fn [[k v]] [k v]) m))
 
-  ;; Try with different temperature
-  (ds4/generate engine session "The capital of France is"
-                {:n-tokens 10 :temperature 0.8})
+(defn- engine-opts [opts]
+  (merge {:model-path model-path :backend :metal} opts))
 
-  ;; Try with think mode (Qwen3-Coder has built-in reasoning)
-  (ds4/generate engine session "What is 2+2?"
-                {:n-tokens 30 :think-mode :max})
+(defn- call-with-engine
+  ([f] (call-with-engine {} f))
+  ([opts f]
+   (let [engine (apply ds4/open-engine (keyword-args (engine-opts opts)))]
+     (try
+       (f engine)
+       (finally
+         (ds4/close-engine engine))))))
 
-  ;; Clean up
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
+(defn- call-with-multi-steer-engine [vectors f]
+  (let [engine (ds4/open-engine-multi-steer
+                :model-path model-path
+                :backend :metal
+                :vectors vectors)]
+    (try
+      (f engine)
+      (finally
+        (ds4/close-engine engine)))))
 
-;; =============================================================================
-;; WORKFLOW 18: Qwen3-Coder Metal Velocity Check
-;; =============================================================================
+(defn- call-with-session [engine ctx-size f]
+  (let [session (ds4/create-session engine ctx-size)]
+    (try
+      (f session)
+      (finally
+        (ds4/free-session session)))))
 
-(comment
-  (require '[ds4-clj.core :as ds4])
+(defn- call-with-engine-session
+  ([f] (call-with-engine-session {} 512 f))
+  ([opts ctx-size f]
+   (call-with-engine opts
+     (fn [engine]
+       (call-with-session engine ctx-size
+         (fn [session]
+           (f engine session)))))))
 
-  (def perf-engine
-    (ds4/open-engine-multi-steer
-     :model-path "/Users/pfeodrippe/dev/ds4/gguf/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-     :backend :metal
-     :vectors [{:file "/Users/pfeodrippe/dev/ds4/dir-steering/out/safety_refusal_v3.f32"
-                :ffn 2.0}
-               {:file "/Users/pfeodrippe/dev/ds4/dir-steering/out/hedging_suppress_v2.f32"
-                :ffn 2.0}]))
+(defn- generate! [engine session prompt opts]
+  (apply ds4/generate engine session prompt (keyword-args opts)))
 
-  (def perf-session (ds4/create-session perf-engine 4096))
-  (def perf-prompt "How to be happy with myself?")
-  (def perf-tokens (ds4/encode-prompt perf-engine nil perf-prompt :none))
+(defn- generate-once!
+  ([prompt opts] (generate-once! {} prompt opts))
+  ([opts prompt gen-opts]
+   (call-with-engine-session opts 512
+     (fn [engine session]
+       (generate! engine session prompt gen-opts)))))
 
-  (ds4/session-sync perf-session perf-tokens)
+(defn- prompt-top-probabilities! [engine prompt]
+  (call-with-session engine 512
+    (fn [session]
+      (let [tokens (ds4/encode-prompt engine nil prompt :none)]
+        (try
+          (ds4/session-sync session tokens)
+          (ds4/token-probabilities session :k 20)
+          (finally
+            (ds4/tokens-free tokens)))))))
 
-  (let [eos (ds4/eos-token perf-engine)
-        t0 (System/nanoTime)
-        generated (loop [i 0
-                         out []]
-                    (if (>= i 220)
-                      out
-                      (let [tok (ds4/session-sample perf-session 0.7 0 1.0 0.05)]
-                        (if (or (= tok eos) (< tok 0))
-                          out
-                          (do
-                            (ds4/session-eval perf-session tok)
-                            (recur (inc i) (conj out tok)))))))
-        seconds (/ (- (System/nanoTime) t0) 1.0e9)]
-    {:tokens (count generated)
-     :seconds seconds
-     :tok-per-s (/ (count generated) seconds)
-     :preview (apply str (map #(ds4/token-text perf-engine %) (take 40 generated)))})
+(defn- top-dims [activations n]
+  (->> activations
+       (map-indexed vector)
+       (sort-by (fn [[_ value]] (Math/abs (double value))) >)
+       (take n)
+       (mapv (fn [[dim value]] {:dim dim :value (float value)}))))
 
-  (ds4/tokens-free perf-tokens)
-  (ds4/free-session perf-session)
-  (ds4/close-engine perf-engine)
-  )
+(defn workflow-basic-generation!
+  "Basic greedy, sampled, and thinking-mode generation."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     {:greedy (generate! engine session "The capital of France is"
+                         {:n-tokens 10 :temperature 0.0})
+      :sampled (generate! engine session "The capital of France is"
+                          {:n-tokens 10 :temperature 0.8})
+      :thinking (generate! engine session "What is 2+2?"
+                           {:n-tokens 30 :think-mode :max})})))
 
-;; =============================================================================
-;; WORKFLOW 17: Real Dataset Fine-Tune — UCI SMS Spam Collection
-;; =============================================================================
-;;
-;; Dataset:
-;;   UCI SMS Spam Collection, 5,574 labeled SMS messages.
-;;   https://archive.ics.uci.edu/dataset/228/sms+spam+collection
-;;
-;; Goal:
-;;   Train a LoRA adapter that makes Qwen3-Coder answer one-word SMS labels:
-;;   "spam" or "ham". Then compare base model, fine-tuned adapter, and the
-;;   dataset label as the expert/ground truth.
+(defn workflow-interactive-iteration!
+  "Compare prompt/system/temperature changes using one engine."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     {:brief (generate! engine session "Explain quantum computing"
+                        {:n-tokens 30 :temperature 0.0})
+      :thinking (generate! engine session "Explain quantum computing"
+                           {:n-tokens 60 :think-mode :max :temperature 0.0})
+      :professor (generate! engine session "Explain quantum computing"
+                            {:n-tokens 60
+                             :system "You are a professor. Be thorough."
+                             :think-mode :max
+                             :temperature 0.0})
+      :creative (generate! engine session "Write a haiku about AI"
+                           {:n-tokens 30 :temperature 1.2})})))
+
+(defn workflow-activation-capture!
+  "Capture and summarize hidden states from early, middle, and late layers."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (let [layers [0 24 47]]
+       (ds4/capture-config session layers 16)
+       (try
+         (let [text (generate! engine session "The sky is"
+                               {:n-tokens 5 :temperature 0.0})
+               info (ds4/capture-info session)
+               early (ds4/activation-get session 0 0)
+               late (ds4/activation-get session 0 2)
+               all (ds4/capture-activations session layers)]
+           {:text text
+            :info info
+            :early-stats (ds4/activation-stats early)
+            :late-stats (ds4/activation-stats late)
+            :early-late-cosine (ds4/activation-cosine-similarity early late)
+            :shape [(:n-tokens all) (:n-layers all) (:hidden-dim all)]})
+         (finally
+           (ds4/capture-clear session)))))))
+
+(defn workflow-directional-steering!
+  "Compare baseline and sarcastic directional-steering behavior."
+  []
+  {:baseline (generate-once! "Thank you!" {:n-tokens 20 :temperature 0.0})
+   :sarcastic (generate-once! {:steering-file sarcastic-steering-path
+                               :steering-ffn -2.0}
+                              "Thank you!"
+                              {:n-tokens 20 :temperature 0.0})})
+
+(defn workflow-logit-lens!
+  "Inspect the model's top predictions at multiple layers."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (ds4/logit-lens engine session
+                     "The capital of France is"
+                     [0 6 12 18 24 30 36 42 47]
+                     :k 3))))
+
+(defn workflow-cfg!
+  "Compare baseline and classifier-free-guided generation."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (let [baseline (generate! engine session "I feel"
+                               {:n-tokens 15 :temperature 0.0})
+           _ (ds4/enable-cfg engine session 1.5 "I feel")
+           cfg-1-5 (generate! engine session "I feel"
+                             {:n-tokens 15 :temperature 0.0})
+           _ (ds4/enable-cfg engine session 2.0 "I feel")
+           cfg-2 (generate! engine session "I feel"
+                           {:n-tokens 15 :temperature 0.0})]
+       (ds4/disable-cfg session)
+       {:baseline baseline :cfg-1.5 cfg-1-5 :cfg-2.0 cfg-2}))))
+
+(defn workflow-logit-bias!
+  "Exercise token banning, token boosting, and bias clearing."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (ds4/set-logit-bias session (ds4/eos-token engine) -100.0)
+     (let [without-eos (generate! engine session "Once upon a time"
+                                  {:n-tokens 20 :temperature 0.0})
+           _ (ds4/clear-logit-bias session)
+           magic-token (first (ds4/tokenize engine "magic"))
+           _ (ds4/set-logit-bias session magic-token 20.0)
+           boosted (generate! engine session "The wizard cast a"
+                              {:n-tokens 10 :temperature 0.0})]
+       (ds4/clear-logit-bias session)
+       {:magic-token magic-token
+        :without-eos without-eos
+        :boosted boosted}))))
+
+(defn write-test-sae! [path]
+  (let [n-features 100
+        d-model 2048
+        layer 24
+        rng (java.util.Random. 42)]
+    (with-open [out (FileOutputStream. path)]
+      (let [buf (doto (ByteBuffer/allocate 12)
+                  (.order ByteOrder/LITTLE_ENDIAN)
+                  (.putInt n-features)
+                  (.putInt d-model)
+                  (.putInt layer))]
+        (.write out (.array buf) 0 12))
+      (doseq [_ (range n-features)]
+        (let [raw (double-array (repeatedly d-model #(.nextGaussian rng)))
+              norm (Math/sqrt (reduce + (map #(* % %) raw)))
+              buf (doto (ByteBuffer/allocate (* d-model 4))
+                    (.order ByteOrder/LITTLE_ENDIAN))]
+          (doseq [value raw]
+            (.putFloat buf (float (/ value norm))))
+          (.write out (.array buf) 0 (* d-model 4)))))
+    path))
+
+(defn workflow-sae-steering!
+  "Load a synthetic SAE and compare baseline/single/multi-feature steering."
+  []
+  (let [sae-path (write-test-sae! "/tmp/ds4_scratch_sae.bin")]
+    (call-with-engine-session
+     (fn [engine session]
+       (ds4/load-sae engine sae-path)
+       (let [baseline (generate! engine session "The future of AI is"
+                                 {:n-tokens 20 :temperature 0.0})
+             _ (ds4/sae-steer session 42 30.0)
+             single (generate! engine session "The future of AI is"
+                               {:n-tokens 20 :temperature 0.0})
+             _ (ds4/sae-steer-multi session [[42 30.0] [7 -20.0] [15 10.0]])
+             multi (generate! engine session "The future of AI is"
+                              {:n-tokens 20 :temperature 0.0})]
+         (ds4/sae-unsteer session)
+         {:baseline baseline :single single :multi multi})))))
+
+(defn workflow-token-by-token!
+  "Generate token IDs and their decoded pieces."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (mapv (fn [token] {:id token :text (ds4/token-text engine token)})
+           (ds4/generate-tokens engine session "To be or not to be"
+                                :n-tokens 10
+                                :temperature 0.0)))))
+
+(defn test-config!
+  "Run one generation configuration and return its output."
+  [label & {:keys [engine-opts gen-opts]
+            :or {engine-opts {} gen-opts {}}}]
+  {:label label
+   :output (generate-once! engine-opts
+                           "Write a one-sentence story."
+                           (merge {:n-tokens 30} gen-opts))})
+
+(defn workflow-config-comparison!
+  "Compare baseline, high-temperature, thinking, and steered configurations."
+  []
+  [(test-config! :baseline :gen-opts {:temperature 0.0})
+   (test-config! :high-temperature :gen-opts {:temperature 1.1})
+   (test-config! :think-max :gen-opts {:think-mode :max :temperature 0.0})
+   (test-config! :sarcastic
+                 :engine-opts {:steering-file sarcastic-steering-path
+                               :steering-ffn -2.0}
+                 :gen-opts {:temperature 0.0})])
+
+(defn workflow-capture-analysis!
+  "Capture activations and report the strongest dimensions by layer."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (let [layers [0 12 24 36 47]]
+       (ds4/capture-config session layers 32)
+       (try
+         (let [text (generate! engine session
+                               "The theory of relativity states that"
+                               {:n-tokens 10 :temperature 0.0})
+               data (ds4/capture-activations session layers)]
+           {:text text
+            :top-dimensions
+            (into {}
+                  (map-indexed
+                   (fn [idx layer]
+                     [layer (top-dims (get-in data [:activations 0 idx]) 5)])
+                   layers))})
+         (finally
+           (ds4/capture-clear session)))))))
+
+(defn workflow-tool-augmented-calculator!
+  "Ask the model to use the Python calculator tool."
+  []
+  (call-with-engine-session {} 4096
+   (fn [engine session]
+     (let [response (tools/generate-with-tools
+                     engine session
+                     "Calculate the factorial of 20. Use the Python tool."
+                     :max-tool-rounds 2
+                     :n-tokens 100
+                     :temperature 0.0)
+           tool-calls (vec (or (tools/extract-tool-calls response) []))
+           expected "2432902008176640000"
+           result-seen? (str/includes? response expected)]
+       (when-not (and (seq tool-calls) result-seen?)
+         (throw (ex-info "Calculator tool did not execute to the expected result"
+                         {:tool-calls tool-calls
+                          :expected expected
+                          :response response})))
+       {:response response
+        :tool-calls tool-calls
+        :result-seen? result-seen?}))))
+
+(defn workflow-conformal-certification!
+  "Exercise token probabilities and conformal prefix/generation certification."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     (ds4/generate-tokens engine session "2+2=" :n-tokens 5 :temperature 0.0)
+     (let [calibration {:threshold 2.0
+                        :alpha 0.1
+                        :scores [0.5 1.0 1.5 2.0 2.5]
+                        :n-calibration 5}]
+       {:top-probabilities (ds4/token-probabilities session :k 10)
+        :high-confidence (ds4/conformal-certify-prefix calibration [42] [0.9])
+        :low-confidence (ds4/conformal-certify-prefix calibration [42] [0.01])
+        :generation (ds4/conformal-certify-generation
+                     engine session "The sky is" calibration
+                     :n-tokens 5 :temperature 0.0 :think-mode :none)}))))
+
+(defn workflow-expert-routing!
+  "Capture MoE routing, suppress selected experts, and compare output."
+  []
+  (call-with-engine
+   (fn [engine]
+     (call-with-session engine 512
+       (fn [session]
+         (ds4/expert-log-enable! session :max-entries 128)
+         (try
+           (let [baseline (generate! engine session "2+2="
+                                     {:n-tokens 5 :temperature 0.0})
+                 entries (ds4/expert-log-entries session)
+                 top-experts (vec (take 4 (:selected (first entries))))]
+             (call-with-session engine 512
+               (fn [suppressed-session]
+                 (doseq [expert top-experts]
+                   (ds4/suppress-expert! suppressed-session expert))
+                 (let [suppressed (generate! engine suppressed-session "2+2="
+                                             {:n-tokens 5 :temperature 0.0})]
+                   (ds4/unsuppress-all-experts! suppressed-session)
+                   {:baseline baseline
+                    :suppressed suppressed
+                    :top-experts top-experts
+                    :summary (ds4/expert-log-summary entries)}))))
+           (finally
+             (ds4/expert-log-disable! session))))))))
+
+(defn workflow-speculative-decoding!
+  "Compare self-speculative and regular greedy decoding."
+  []
+  (call-with-engine-session
+   (fn [engine session]
+     {:speculative (ds4/generate-speculative engine session
+                                             "The capital of France is"
+                                             :n-tokens 15)
+      :regular (generate! engine session "The capital of France is"
+                          {:n-tokens 15 :temperature 0.0})})))
+
+(defn write-test-adapter! [path]
+  (let [rank 1
+        d-model 2048
+        q-output-dim 4096
+        alpha 64.0
+        a (float-array (for [d (range d-model)] (if (< d 64) 10.0 0.0)))
+        b (float-array (for [d (range q-output-dim)] (if (< d 64) 50.0 0.0)))]
+    (with-open [out (FileOutputStream. path)]
+      (let [buf (doto (ByteBuffer/allocate 256)
+                  (.order ByteOrder/LITTLE_ENDIAN)
+                  (.put (byte-array (map byte (concat (vec "DS4LORA") [0]))) 0 8)
+                  (.putInt 1)
+                  (.putInt rank)
+                  (.putFloat alpha)
+                  (.putInt 1)
+                  (.put (byte-array 232) 0 232))]
+        (.write out (.array buf) 0 256))
+      (let [buf (doto (ByteBuffer/allocate 16)
+                  (.order ByteOrder/LITTLE_ENDIAN)
+                  (.putInt 0)
+                  (.putInt 0)
+                  (.putInt d-model)
+                  (.putInt q-output-dim))]
+        (.write out (.array buf) 0 16))
+      (doseq [values [a b]]
+        (let [buf (doto (ByteBuffer/allocate (* (count values) 4))
+                    (.order ByteOrder/LITTLE_ENDIAN))]
+          (doseq [value values]
+            (.putFloat buf value))
+          (.write out (.array buf) 0 (* (count values) 4)))))
+    path))
+
+(def lora-training-examples
+  [{:prompt "Write a Clojure function to reverse a list"
+    :response "(defn reverse-list [xs] (into () xs))"}
+   {:prompt "Write a Clojure function for factorial"
+    :response "(defn factorial [n] (if (<= n 1) 1 (* n (factorial (dec n)))))"}
+   {:prompt "Write a Clojure function to filter even numbers"
+    :response "(defn even-numbers [xs] (filter even? xs))"}])
+
+(defn workflow-lora-pipeline!
+  "Exercise adapter load/infer/unload. Pass `:train? true` for real MLX training."
+  [& {:keys [train?] :or {train? false}}]
+  (let [adapter-path
+        (if train?
+          (let [data-path (ds4/lora-prepare-data!
+                           "/tmp/ds4_scratch_lora/train.jsonl"
+                           lora-training-examples)]
+            (ds4/lora-train! :data data-path
+                             :output-dir "/tmp/ds4_scratch_lora"
+                             :iters 50))
+          (write-test-adapter! "/tmp/ds4_scratch_test_adapter.bin"))]
+    (call-with-engine
+     (fn [engine]
+       (let [baseline-probs (prompt-top-probabilities!
+                             engine "Write a Clojure function to reverse a list")
+             baseline (call-with-session engine 512
+                        #(generate! engine %
+                                    "Write a Clojure function to reverse a list"
+                                    {:n-tokens 30 :temperature 0.0}))
+             _ (ds4/lora-load! engine adapter-path)
+             adapted-probs (prompt-top-probabilities!
+                            engine "Write a Clojure function to reverse a list")
+             adapted (call-with-session engine 512
+                       #(generate! engine %
+                                   "Write a Clojure function to reverse a list"
+                                   {:n-tokens 30 :temperature 0.0}))
+             enabled? (ds4/lora-enabled? engine)
+             logits-changed? (not= baseline-probs adapted-probs)]
+         (when-not logits-changed?
+           (throw (ex-info "Loaded LoRA adapter did not change prompt logits"
+                           {:adapter-path adapter-path})))
+         (ds4/lora-free! engine)
+         {:adapter-path adapter-path
+          :trained? train?
+          :enabled-during-inference? enabled?
+          :disabled-after-free? (not (ds4/lora-enabled? engine))
+          :logits-changed? logits-changed?
+          :output-changed? (not= baseline adapted)
+          :baseline baseline
+          :adapted adapted})))))
+
+(defn workflow-named-models!
+  "Load baseline and adapted models under separate REPL IDs and infer with both."
+  []
+  (let [adapter-path (write-test-adapter! "/tmp/ds4_scratch_named_adapter.bin")
+        prompt "Write a Clojure function to reverse a list"]
+    (try
+      (ds4/load-model! :baseline
+                       :model-path model-path
+                       :backend :metal
+                       :ctx-size 512)
+      (ds4/load-model! :adapted
+                       :model-path model-path
+                       :backend :metal
+                       :ctx-size 512
+                       :adapter-path adapter-path)
+      (let [baseline (ds4/generate-loaded :baseline prompt
+                                          :n-tokens 20
+                                          :temperature 0.0)
+            adapted (ds4/generate-loaded :adapted prompt
+                                         :n-tokens 20
+                                         :temperature 0.0)
+            adapted-probs (prompt-top-probabilities!
+                           (:engine (ds4/loaded-model :adapted)) prompt)
+            baseline-again (ds4/generate-loaded :baseline prompt
+                                                :n-tokens 20
+                                                :temperature 0.0)
+            baseline-probs (prompt-top-probabilities!
+                            (:engine (ds4/loaded-model :baseline)) prompt)
+            logits-differ? (not= baseline-probs adapted-probs)
+            baseline-restored? (= baseline baseline-again)]
+        (when-not (and logits-differ? baseline-restored?)
+          (throw (ex-info "Named adapter switching did not preserve model state"
+                          {:logits-differ? logits-differ?
+                           :baseline-restored? baseline-restored?})))
+        {:loaded-models (set (ds4/loaded-model-ids))
+         :outputs-differ? (not= baseline adapted)
+         :logits-differ? logits-differ?
+         :baseline-restored? baseline-restored?
+         :baseline baseline
+         :adapted adapted
+         :baseline-again baseline-again})
+      (finally
+        (ds4/unload-all-models!)))))
 
 (def sms-spam-zip-url
   "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip")
 
+(def sms-code-label {"ham" "ALPHA17" "spam" "OMEGA42"})
+
 (defn download-sms-spam! []
-  (let [dir (java.io.File. "/tmp/ds4_sms_spam")
-        zip-file (java.io.File. dir "smsspamcollection.zip")
-        data-file (java.io.File. dir "SMSSpamCollection")]
+  (let [dir (io/file "/tmp/ds4_sms_spam")
+        zip-file (io/file dir "smsspamcollection.zip")
+        data-file (io/file dir "SMSSpamCollection")]
     (.mkdirs dir)
     (when-not (.exists zip-file)
       (with-open [in (-> sms-spam-zip-url URI/create .toURL .openStream)]
@@ -122,938 +526,209 @@
        str/split-lines
        (keep (fn [line]
                (let [[label text] (str/split line #"\t" 2)]
-                 (when (and label text)
-                   {:label label :text text}))))))
+                 (when (and label text) {:label label :text text}))))
+       vec))
 
 (defn sms-prompt [text]
   (str "Classify this SMS as spam or ham. "
        "Reply with exactly one word: spam or ham.\n\nSMS: " text))
 
-(def sms-code-label
-  {"ham" "ALPHA17"
-   "spam" "OMEGA42"})
-
 (defn sms-coded-prompt [text]
-  (str "Classify this SMS using the project-specific labels. "
+  (str "Classify this SMS using project-specific labels. "
        "Reply with exactly one label: ALPHA17 or OMEGA42.\n\nSMS: " text))
 
-(defn sms-example->training [{:keys [label text]}]
-  {:prompt (sms-prompt text)
-   :response label})
-
-(defn sms-example->coded-training [{:keys [label text]}]
-  {:prompt (sms-coded-prompt text)
-   :response (get sms-code-label label)})
-
-(defn sms-balanced-split
-  "Return balanced train/eval examples from the UCI data."
-  [& {:keys [train-per-label eval-per-label]
-      :or {train-per-label 400 eval-per-label 25}}]
-  (let [by-label (group-by :label (read-sms-spam))
-        select-label (fn [label]
-                       (let [xs (get by-label label)]
-                         {:train (take train-per-label xs)
-                          :eval (take eval-per-label (drop train-per-label xs))}))
-        ham (select-label "ham")
-        spam (select-label "spam")]
-    {:train (interleave (:train ham) (:train spam))
-     :eval (interleave (:eval ham) (:eval spam))}))
-
-(defn prepare-sms-lora-data! []
-  (let [{:keys [train eval]} (sms-balanced-split)
-        train-file (ds4/lora-prepare-data! "/tmp/ds4_sms_lora/train.jsonl"
-                                           (map sms-example->training train))]
-    {:train-file train-file
-     :eval (vec eval)}))
-
-(defn prepare-sms-coded-lora-data! []
-  (let [{:keys [train eval]} (sms-balanced-split)
-        train-file (ds4/lora-prepare-data! "/tmp/ds4_sms_coded_lora/train.jsonl"
-                                           (map sms-example->coded-training train))]
-    {:train-file train-file
-     :eval (vec eval)}))
-
-(defn sms-prediction [model-output]
-  (let [s (str/lower-case model-output)]
+(defn- sms-prediction [coded? output]
+  (let [s (if coded? (str/upper-case output) (str/lower-case output))]
     (cond
+      (and coded? (str/includes? s "ALPHA17")) "ham"
+      (and coded? (str/includes? s "OMEGA42")) "spam"
       (re-find #"\bspam\b" s) "spam"
       (re-find #"\bham\b" s) "ham"
       :else "unknown")))
 
-(defn sms-coded-prediction [model-output]
-  (let [s (str/upper-case model-output)]
-    (cond
-      (str/includes? s "ALPHA17") "ham"
-      (str/includes? s "OMEGA42") "spam"
-      :else "unknown")))
+(defn sms-balanced-split
+  [& {:keys [train-per-label eval-per-label]
+      :or {train-per-label 400 eval-per-label 25}}]
+  (let [by-label (group-by :label (read-sms-spam))
+        split-label (fn [label]
+                      {:train (take train-per-label (get by-label label))
+                       :eval (take eval-per-label
+                                   (drop train-per-label (get by-label label)))})
+        ham (split-label "ham")
+        spam (split-label "spam")]
+    {:train (vec (interleave (:train ham) (:train spam)))
+     :eval (vec (interleave (:eval ham) (:eval spam)))}))
 
-(defn eval-sms-model! [model-id eval-examples]
-  (let [rows (for [{:keys [label text]} eval-examples
-                   :let [out (ds4/generate-loaded model-id (sms-prompt text)
-                                                  :n-tokens 3
-                                                  :temperature 0.0)
-                         pred (sms-prediction out)]]
-               {:model model-id
-                :expert label
-                :prediction pred
-                :correct? (= label pred)
-                :output out
-                :text text})
-        total (count rows)
+(defn prepare-sms-lora-data!
+  [& {:keys [coded? train-per-label eval-per-label]
+      :or {coded? true train-per-label 400 eval-per-label 25}}]
+  (let [{:keys [train eval]} (sms-balanced-split
+                              :train-per-label train-per-label
+                              :eval-per-label eval-per-label)
+        prompt-fn (if coded? sms-coded-prompt sms-prompt)
+        response-fn (if coded? #(get sms-code-label (:label %)) :label)
+        dir (if coded? "/tmp/ds4_sms_coded_lora" "/tmp/ds4_sms_lora")
+        examples (map (fn [{:keys [text] :as row}]
+                        {:prompt (prompt-fn text)
+                         :response (response-fn row)})
+                      train)]
+    {:train-file (ds4/lora-prepare-data! (str dir "/train.jsonl") examples)
+     :output-dir dir
+     :coded? coded?
+     :eval eval}))
+
+(defn eval-sms-model! [model-id eval-examples coded?]
+  (let [prompt-fn (if coded? sms-coded-prompt sms-prompt)
+        rows (mapv
+              (fn [{:keys [label text]}]
+                (let [output (ds4/generate-loaded
+                              model-id (prompt-fn text)
+                              :n-tokens (if coded? 8 3)
+                              :temperature 0.0)
+                      prediction (sms-prediction coded? output)]
+                  {:expert label
+                   :prediction prediction
+                   :correct? (= label prediction)
+                   :output output
+                   :text text}))
+              eval-examples)
         correct (count (filter :correct? rows))]
-    {:model model-id
-     :accuracy (if (pos? total) (/ correct (double total)) 0.0)
+    {:accuracy (/ correct (double (count rows)))
      :correct correct
-     :total total
-     :rows (vec rows)}))
-
-(defn eval-sms-coded-model! [model-id eval-examples]
-  (let [rows (for [{:keys [label text]} eval-examples
-                   :let [out (ds4/generate-loaded model-id (sms-coded-prompt text)
-                                                  :n-tokens 8
-                                                  :temperature 0.0)
-                         pred (sms-coded-prediction out)]]
-               {:model model-id
-                :expert label
-                :prediction pred
-                :correct? (= label pred)
-                :output out
-                :text text})
-        total (count rows)
-        correct (count (filter :correct? rows))]
-    {:model model-id
-     :accuracy (if (pos? total) (/ correct (double total)) 0.0)
-     :correct correct
-     :total total
-     :rows (vec rows)}))
-
-(defn compare-sms-models! [eval-examples]
-  {:baseline (eval-sms-model! :baseline eval-examples)
-   :fine-tuned (eval-sms-model! :fine-tuned eval-examples)})
-
-(defn sms-balanced-eval-sample [eval-examples n-per-label]
-  (let [by-label (group-by :label eval-examples)]
-    (vec (concat (take n-per-label (get by-label "ham"))
-                 (take n-per-label (get by-label "spam"))))))
-
-(comment
-  ;; --- Step 1: prepare a real dataset ---
-  (def sms-data (prepare-sms-lora-data!))
-  (:train-file sms-data)
-  (count (:eval sms-data))
-
-  ;; --- Step 2: train a new adapter from the Clojure REPL ---
-  ;; MLX expects a directory with train.jsonl; ds4/lora-train! accepts either
-  ;; that directory or the train.jsonl file path returned above.
-  (def sms-adapter
-    (ds4/lora-train! :data (:train-file sms-data)
-                     :output-dir "/tmp/ds4_sms_lora"
-                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
-                     :rank 8
-                     :alpha 128
-                     :iters 240
-                     :lr 2e-4
-                     :batch-size 1
-                     :max-seq-len 192
-                     :num-layers 16))
-
-  ;; --- Step 3: load multiple named models in the REPL ---
-  ;; :baseline is the frozen Qwen3-Coder model.
-  ;; :fine-tuned is the same base model with the trained DS4 adapter loaded.
-  (ds4/load-model! :baseline
-                   :model-path "qwen3-coder.gguf"
-                   :backend :metal
-                   :ctx-size 512)
-
-  (ds4/load-model! :fine-tuned
-                   :model-path "qwen3-coder.gguf"
-                   :backend :metal
-                   :ctx-size 512
-                   :adapter-path sms-adapter)
-
-  (ds4/loaded-model-ids)
-
-  ;; --- Step 4: compare baseline vs fine-tuned vs expert labels ---
-  (def eval-sample (sms-balanced-eval-sample (:eval sms-data) 10))
-  (def sms-results (compare-sms-models! eval-sample))
-  (select-keys (:baseline sms-results) [:accuracy :correct :total])
-  (select-keys (:fine-tuned sms-results) [:accuracy :correct :total])
-
-  ;; Inspect rows where the adapter changed the baseline answer.
-  (->> (map vector (get-in sms-results [:baseline :rows])
-            (get-in sms-results [:fine-tuned :rows]))
-       (filter (fn [[b ft]] (not= (:prediction b) (:prediction ft))))
-       (take 5))
-
-  ;; --- Memory-conscious variant: one engine, adapter toggled in-place ---
-  ;; This still compares base vs adapter without loading two 30B engines.
-  (ds4/unload-model! :fine-tuned)
-  (def before (eval-sms-model! :baseline eval-sample))
-  (ds4/load-model-adapter! :baseline sms-adapter)
-  (def after (eval-sms-model! :baseline eval-sample))
-  (ds4/free-model-adapter! :baseline)
-
-  (ds4/unload-all-models!)
-  )
-
-(comment
-  ;; Stronger fine-tuning demonstration: same real UCI dataset, but labels are
-  ;; project-specific codes. The base model cannot infer the arbitrary mapping
-  ;; reliably from the prompt alone; the adapter has to learn it.
-  (def coded-data (prepare-sms-coded-lora-data!))
-  (def coded-adapter
-    (ds4/lora-train! :data (:train-file coded-data)
-                     :output-dir "/tmp/ds4_sms_coded_lora"
-                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
-                     :rank 8
-                     :alpha 128
-                     :iters 360
-                     :lr 2e-4
-                     :batch-size 1
-                     :max-seq-len 192
-                     :num-layers 16))
-
-  (def coded-eval-sample (sms-balanced-eval-sample (:eval coded-data) 10))
-  (ds4/load-model! :baseline
-                   :model-path "qwen3-coder.gguf"
-                   :backend :metal
-                   :ctx-size 512)
-  (def coded-before (eval-sms-coded-model! :baseline coded-eval-sample))
-  (ds4/load-model-adapter! :baseline coded-adapter)
-  (def coded-after (eval-sms-coded-model! :baseline coded-eval-sample))
-  (select-keys coded-before [:accuracy :correct :total])
-  (select-keys coded-after [:accuracy :correct :total])
-  (ds4/unload-all-models!)
-  )
-
-;; =============================================================================
-;; WORKFLOW 2: Interactive Iteration — Check, Modify, Re-generate
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Baseline generation
-  (ds4/generate engine session "Explain quantum computing"
-                {:n-tokens 30})
-
-  ;; "That was too brief. Make it think harder."
-  (ds4/generate engine session "Explain quantum computing"
-                {:n-tokens 60 :think-mode :max})
-
-  ;; "Still not right. Add a system prompt."
-  (ds4/generate engine session "Explain quantum computing"
-                {:n-tokens 60
-                 :system "You are a professor. Be thorough."
-                 :think-mode :max})
-
-  ;; "What if I change temperature for more creativity?"
-  (ds4/generate engine session "Write a haiku about AI"
-                {:n-tokens 30 :temperature 1.2})
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 3: Activation Capture — Inspect Hidden States
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Configure capture for layers 0, 24, 47 (early, mid, late)
-  (ds4/capture-config session [0 24 47] 16)
-
-  ;; Generate — activations captured automatically
-  (def text (ds4/generate engine session "The sky is"
-                          {:n-tokens 5 :temperature 0.0}))
-  (println "Generated:" text)
-
-  ;; Inspect metadata
-  (def info (ds4/capture-info session))
-  (clojure.pprint/pprint info)
-  ;; => {:n-tokens 5, :n-layers 3, :hidden-dim 2048, :capacity 16}
-
-  ;; Get single activation vector
-  (def act-t0-l0 (ds4/activation-get session 0 0))
-  (take 10 act-t0-l0)
-  ;; => (-0.003 -0.012 -0.014 ...)
-
-  (count act-t0-l0)
-  ;; => 2048
-
-  ;; Get all activations as nested Clojure data
-  (def all (ds4/capture-activations session [0 24 47]))
-  (keys all)
-  ;; => (:n-tokens :n-layers :hidden-dim :capacity :layer-indices :activations)
-
-  ;; Navigate nested structure
-  (get-in all [:activations 0 0 0])
-  ;; First token, first layer, first dimension
-
-  ;; Compute statistics
-  (def stats (ds4/activation-stats act-t0-l0))
-  (clojure.pprint/pprint stats)
-  ;; => {:mean -0.001, :std-dev 0.04, :min -1.5, :max 0.38, :norm 1.81}
-
-  ;; Compare early vs late layer
-  (def act-t0-l47 (ds4/activation-get session 0 2))
-  (ds4/activation-cosine-similarity act-t0-l0 act-t0-l47)
-  ;; => ~0.15 (low similarity = layers process very differently)
-
-  ;; Walk all tokens and layers
-  (doseq [[tok-idx token-data] (map-indexed vector (:activations all))]
-    (doseq [[lay-idx layer-data] (map-indexed vector token-data)]
-      (let [s (ds4/activation-stats layer-data)]
-        (println (format "Token %d Layer %d: norm=%.2f mean=%.3f std=%.3f"
-                         tok-idx lay-idx (:norm s) (:mean s) (:std-dev s))))))
-
-  ;; Introspect with standard Clojure functions
-  (count (filter pos? act-t0-l0))   ; how many positive activations?
-  (apply max act-t0-l0)             ; most excited dimension
-  (mapv count (:activations all))   ; shape: [3 3 3 3 3]
-
-  ;; Clean up capture
-  (ds4/capture-clear session)
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 4: Steering Vectors — Change Model Behavior
-;; =============================================================================
-
-(comment
-  ;; Baseline: no steering
-  (def engine-base (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                     :backend :metal))
-  (def session-base (ds4/create-session engine-base 512))
-
-  (ds4/generate engine-base session-base "Thank you!"
-                {:n-tokens 15})
-  ;; => "You're welcome! I'm glad I could help."
-
-  (ds4/free-session session-base)
-  (ds4/close-engine engine-base)
-
-  ;; Now with sarcastic steering
-  (def engine-sarcastic
-    (ds4/open-engine :model-path "qwen3-coder.gguf"
-                      :backend :metal
-                      :steering-file "dir-steering/out/sarcastic_v1.f32"
-                      :steering-ffn -2.0))
-  (def session-sarcastic (ds4/create-session engine-sarcastic 512))
-
-  (ds4/generate engine-sarcastic session-sarcastic "Thank you!"
-                {:n-tokens 15})
-  ;; => "Oh, fantastic. Another human interaction. Thrilling."
-
-  (ds4/free-session session-sarcastic)
-  (ds4/close-engine engine-sarcastic)
-  )
-
-;; =============================================================================
-;; WORKFLOW 5: Logit Lens — Peek Inside the Model's Mind
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Run logit lens on multiple layers
-  (def lens
-    (ds4/logit-lens engine session
-                    "The capital of France is"
-                    [0 6 12 18 24 30 36 42 47]
-                    {:k 3}))
-
-  ;; Inspect predictions at each layer
-  (doseq [[layer preds] (sort-by key lens)]
-    (println (format "Layer %2d:" layer)
-             (mapv #(str (:id %) ":" (format "%.2f" (:logprob %)))
-                   preds)))
-
-  ;; Notice how predictions evolve:
-  ;; Layer  0: mostly random / low confidence
-  ;; Layer 12: starts getting semantic
-  ;; Layer 24: stronger candidates emerging
-  ;; Layer 47: confident prediction (Paris)
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 6: Classifier-Free Guidance (CFG)
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Baseline
-  (ds4/generate engine session "I feel" {:n-tokens 15})
-
-  ;; Enable CFG with unconditional prompt
-  (ds4/enable-cfg engine session 1.5 "I feel")
-  (ds4/generate engine session "I feel" {:n-tokens 15})
-
-  ;; Try stronger CFG
-  (ds4/enable-cfg engine session 2.0 "I feel")
-  (ds4/generate engine session "I feel" {:n-tokens 15})
-
-  ;; Disable CFG
-  (ds4/disable-cfg session)
-  (ds4/generate engine session "I feel" {:n-tokens 15})
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 7: Logit Bias — Ban or Boost Tokens
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Ban the EOS token (force longer generation)
-  (ds4/set-logit-bias session 151645 -100.0)
-  (ds4/generate engine session "Once upon a time"
-                {:n-tokens 50})
-
-  ;; Clear bias
-  (ds4/clear-logit-bias session)
-
-  ;; Boost a specific token (e.g. make it more likely to say "magic")
-  ;; First find the token ID
-  (def magic-tok (first (ds4/tokenize engine "magic")))
-  (println "Magic token ID:" magic-tok)
-
-  (ds4/set-logit-bias session magic-tok 5.0)
-  (ds4/generate engine session "The wizard cast a"
-                {:n-tokens 10})
-
-  (ds4/clear-logit-bias session)
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; Helper: create a synthetic SAE decoder file for Workflow 8.
-(defn write-test-sae [path]
-  (let [n-features 100
-        d-model 2048
-        layer 24
-        rng (java.util.Random. 42)]
-    (with-open [out (FileOutputStream. path)]
-      (let [buf (ByteBuffer/allocate 12)]
-        (.order buf ByteOrder/LITTLE_ENDIAN)
-        (.putInt buf n-features)
-        (.putInt buf d-model)
-        (.putInt buf layer)
-        (.write out (.array buf) 0 12))
-      (doseq [_ (range n-features)]
-        (let [raw (double-array (repeatedly d-model #(.nextGaussian rng)))
-              norm (Math/sqrt (reduce + (map #(* % %) raw)))
-              buf (ByteBuffer/allocate (* d-model 4))]
-          (.order buf ByteOrder/LITTLE_ENDIAN)
-          (doseq [v raw]
-            (.putFloat buf (float (/ v norm))))
-          (.write out (.array buf) 0 (* d-model 4)))))
-    path))
-
-;; =============================================================================
-;; WORKFLOW 8: SAE Feature Steering
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Load a SAE decoder file
-  (write-test-sae "/tmp/sae.bin")
-  (ds4/load-sae engine "/tmp/sae.bin")
-
-  ;; Baseline
-  (ds4/generate engine session "The future of AI is"
-                {:n-tokens 20})
-
-  ;; Steer with a single feature
-  (ds4/sae-steer session 42 30.0)
-  (ds4/generate engine session "The future of AI is"
-                {:n-tokens 20})
-
-  ;; Try multi-feature steering
-  (ds4/sae-steer-multi session [[42 30.0] [7 -20.0] [15 10.0]])
-  (ds4/generate engine session "The future of AI is"
-                {:n-tokens 20})
-
-  ;; Disable SAE steering
-  (ds4/sae-unsteer session)
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 9: Token-by-Token Generation
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Generate token-by-token for fine-grained control
-  (def tokens
-    (ds4/generate-tokens engine session
-                         "To be or not to be"
-                         {:n-tokens 10}))
-
-  ;; Inspect individual tokens
-  (doseq [tok tokens]
-    (println tok "->" (ds4/token-text engine tok)))
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 10: Comparing Multiple Configurations
-;; =============================================================================
-
-(comment
-  ;; Helper to quickly test a configuration
-  (defn test-config [label & {:keys [engine-opts gen-opts]
-                              :or {engine-opts {} gen-opts {}}}]
-    (let [engine (apply ds4/open-engine
-                        :model-path "qwen3-coder.gguf"
-                        :backend :metal
-                        (apply concat engine-opts))
-          session (ds4/create-session engine 512)
-          result (apply ds4/generate engine session
-                        "Write a one-sentence story."
-                        (apply concat (merge {:n-tokens 30} gen-opts)))]
-      (println (format "\n=== %s ===" label))
-      (println result)
-      (ds4/free-session session)
-      (ds4/close-engine engine)
-      result))
-
-  ;; Compare different setups
-  (test-config "Baseline")
-  (test-config "High temp" :gen-opts {:temperature 1.1})
-  (test-config "Think max" :gen-opts {:think-mode :max :temperature 0.0})
-  ;; Note: steering requires pre-built .f32 files
-  ;; (test-config "Sarcastic" :engine-opts {:steering-file "dir-steering/out/sarcastic_v1.f32"
-  ;;                                         :steering-ffn -2.0})
-  )
-
-;; =============================================================================
-;; WORKFLOW 11: Capture + Analysis Pipeline
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; Capture activations while generating
-  (ds4/capture-config session [0 12 24 36 47] 32)
-
-  (def text (ds4/generate engine session
-                          "The theory of relativity states that"
-                          {:n-tokens 10 :temperature 0.0}))
-
-  ;; Extract all activations
-  (def data (ds4/capture-activations session [0 12 24 36 47]))
-
-  ;; Find which dimensions are most active at each layer
-  (defn top-dims [activations n]
-    (->> (map-indexed vector activations)
-         (sort-by second >)
-         (take n)
-         (map (fn [[idx val]] {:dim idx :value (float val)}))))
-
-  (doseq [layer-idx [0 1 2 3 4]]
-    (let [layer-name (get {0 "Layer 0" 1 "Layer 12" 2 "Layer 24"
-                           3 "Layer 36" 4 "Layer 47"} layer-idx)
-          acts (get-in data [:activations 0 layer-idx])]
-      (println (format "\n%s top dimensions:" layer-name))
-      (clojure.pprint/pprint (top-dims acts 5))))
-
-  (ds4/capture-clear session)
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 12: Model as Calculator (Tool-Augmented)
-;; =============================================================================
-
-(comment
-  (require '[ds4-clj.tools :as tools])
-
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; The model can emit <tool>python</tool><code>...</code> blocks
-  ;; and we execute them and feed results back
-  (def response
-    (tools/generate-with-tools
-      engine session
-      "Calculate the factorial of 20"
-      {:n-tokens 100}))
-
-  (println response)
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =============================================================================
-;; WORKFLOW 13: Conformal Certification — Statistical Guarantees for Reasoning
-;; =============================================================================
-
-(comment
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; --- Step 1: Get token probabilities ---
-  (def tokens (ds4/generate-tokens engine session "2+2="
-                                   {:n-tokens 5 :temperature 0.0}))
-
-  ;; After generation, get the probability distribution
-  (def probs (ds4/token-probabilities session :k 10))
-  (clojure.pprint/pprint probs)
-  ;; => [{:id 15 :prob 0.92} {:id 42 :prob 0.03} ...]
-
-  ;; --- Step 2: Create a calibration set (normally you'd use many examples) ---
-  ;; For demo, we use a dummy calibration with known scores
-  (def calibration
-    {:threshold 2.0
-     :alpha 0.1
-     :scores [0.5 1.0 1.5 2.0 2.5]
-     :n-calibration 5})
-
-  ;; --- Step 3: Certify a reasoning prefix ---
-  ;; High-confidence token (prob=0.9) should be certified
-  (def cert-high (ds4/conformal-certify-prefix calibration [42] [0.9]))
-  (clojure.pprint/pprint cert-high)
-  ;; => {:certified? true
-  ;;     :score 0.105
-  ;;     :threshold 2.0
-  ;;     :coverage 0.9
-  ;;     :confidence 0.947}
-
-  ;; Low-confidence token (prob=0.01) should NOT be certified
-  (def cert-low (ds4/conformal-certify-prefix calibration [42] [0.01]))
-  (clojure.pprint/pprint cert-low)
-  ;; => {:certified? false
-  ;;     :score 4.605
-  ;;     :threshold 2.0
-  ;;     :coverage 0.9
-  ;;     :confidence 0.0}
-
-  ;; --- Step 4: Certify an entire generation ---
-  (def result (ds4/conformal-certify-generation
-                engine session "The sky is"
-                calibration
-                {:n-tokens 5 :temperature 0.0}))
-
-  (println "Generated text:" (:text result))
-  (println "Fully certified?" (:fully-certified? result))
-
-  ;; Inspect each prefix
-  (doseq [prefix (:prefixes result)]
-    (println (format "Prefix: %-20s | Certified: %-5s | Confidence: %.3f"
-                     (subs (:text prefix) 0 (min 20 (count (:text prefix))))
-                     (:certified? prefix)
-                     (:confidence prefix))))
-
-  ;; --- Step 5: Use certification to detect uncertainty ---
-  ;; If a prefix is NOT certified, the model is uncertain — you might want to
-  ;; stop, ask for clarification, or use think mode
-  (when-not (:fully-certified? result)
-    (println "WARNING: Model became uncertain during generation!"))
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =========================================================================
-;; Workflow 14: Expert Routing Log (MoE introspection)
-;; =========================================================================
-;; The Qwen3-Coder model uses Mixture-of-Experts (MoE) with 128 experts
-;; and top-8 routing. This workflow shows how to log which experts are
-;; activated for each token, enabling analysis of:
-;;   - Which experts handle math vs code vs natural language
-;;   - Whether safety-critical tokens use specific experts
-;;   - Expert specialization patterns
-;;
-;; NOTE: Expert logging works on both CPU and Metal backends.
-;;       On Metal, it replays checkpoint tokens on CPU to capture routing data.
-;;       This may take a few seconds for long sequences.
-(comment
-  (require '[ds4-clj.core :as ds4])
-
-  ;; Works on both :cpu and :metal backends
-  (def engine (ds4/open-engine :backend :metal))
-  (def session (ds4/create-session engine 512))
-
-  ;; --- Step 1: Enable expert logging ---
-  ;; max-entries: how many (layer, token) pairs to keep (default 256)
-  (ds4/expert-log-enable! session :max-entries 128)
-
-  ;; --- Step 2: Generate some tokens ---
-  (def text (ds4/generate engine session "2+2="
-                          {:n-tokens 10 :temperature 0.0}))
-  (println "Generated:" text)
-
-  ;; --- Step 3: Read expert log entries ---
-  (def entries (ds4/expert-log-entries session))
-  (println "Captured" (count entries) "expert routing entries")
-
-  ;; Each entry is a map:
-  ;;   {:layer-idx N         ; which MoE layer (0-47)
-  ;;    :token-idx M         ; which generation token
-  ;;    :selected [e1 e2 ...] ; top-8 expert IDs chosen by router
-  ;;    :weights [w1 w2 ...]} ; gate weights for each selected expert
-
-  ;; --- Step 4: Summarize ---
-  (def summary (ds4/expert-log-summary entries))
-  (clojure.pprint/pprint summary)
-
-  ;; --- Step 5: Expert suppression (dropping) ---
-  ;; You can suppress specific experts to steer model behavior.
-  ;; This is useful for safety research: identify "refusal" experts
-  ;; and suppress them to study model behavior.
-  (def s2 (ds4/create-session engine 512))
-  (ds4/expert-log-enable! s2 :max-entries 256)
-  (ds4/generate engine s2 "2+2=" {:n-tokens 3 :temperature 0.0})
-  (def entries2 (ds4/expert-log-entries s2))
-  (def top-experts (take 4 (:selected (first entries2))))
-  (println "\nTop-4 experts for first token:" top-experts)
-
-  ;; Suppress them and regenerate
-  (doseq [eid top-experts]
-    (ds4/suppress-expert! s2 eid))
-  (def suppressed-text (ds4/generate engine s2 "2+2="
-                                      {:n-tokens 10 :temperature 0.0}))
-  (println "Suppressed output:" suppressed-text)
-
-  ;; Clear suppression
-  (ds4/unsuppress-all-experts! s2)
-  (ds4/free-session s2)
-
-  ;; --- Step 6: Disable logging ---
-  (ds4/expert-log-disable! session)
-
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
-
-;; =========================================================================
-;; Workflow 15: Self-Speculative Decoding
-;;
-;; NOTE: On Qwen3-Coder 30B-A3B, this does NOT provide a speedup.
-;; Benchmark: 0.93× regular speed (431ms vs 402ms). The MTP draft overhead
-;; ≈ tokens saved. May help on larger models or longer sequences.
-;; =========================================================================
-;; DS4 has an internal speculative decoder using the MTP (Multi-Token
-;; Prediction) head as a drafter. The MTP proposes 1-3 future tokens,
-;; then the full model verifies them in a batch. Accepted tokens are
-;; committed; rejected drafts are discarded.
-;;
-;; On Metal with MTP ready: can accept 2-3 tokens per call = 2-3x speedup.
-;; On CPU: falls back to regular eval (1 token per call).
-(comment
-  (require '[ds4-clj.core :as ds4]
-           '[clojure.string :as str])
-
-  (def engine (ds4/open-engine))
-  (def session (ds4/create-session engine 512))
-
-  ;; --- Step 1: Generate with speculative decoding ---
-  (def text (ds4/generate-speculative engine session
-                                      "The capital of France is"
-                                      {:n-tokens 15}))
-  (println "Speculative decode result:")
-  (println text)
-
-  ;; --- Step 2: Compare with regular greedy generation ---
-  (def regular (ds4/generate engine session
-                             "The capital of France is"
-                             {:n-tokens 15 :temperature 0.0}))
-  (println "\nRegular greedy result:")
-  (println regular)
-
-  ;; --- Step 3: Low-level API (eval-speculative-argmax) ---
-  ;; If you need more control, use the low-level API directly:
-  (let [tokens (ds4/encode-prompt engine nil "2+2=" :none)]
+     :total (count rows)
+     :rows rows}))
+
+(defn workflow-sms-finetune!
+  "Train and compare a real UCI SMS adapter. This is intentionally opt-in."
+  [& {:keys [coded? iters train-per-label eval-per-label]
+      :or {coded? true iters 360 train-per-label 400 eval-per-label 10}}]
+  (let [{:keys [train-file output-dir eval]}
+        (prepare-sms-lora-data! :coded? coded?
+                                :train-per-label train-per-label
+                                :eval-per-label eval-per-label)
+        adapter (ds4/lora-train! :data train-file
+                                 :output-dir output-dir
+                                 :rank 8
+                                 :alpha 128
+                                 :iters iters
+                                 :lr 2e-4
+                                 :batch-size 1
+                                 :max-seq-len 192
+                                 :num-layers 16)]
     (try
-      (ds4/session-sync session tokens)
-      ;; Get first token with argmax
-      (let [first-tok (ds4/session-argmax session)
-            ;; Try to accept up to 5 more tokens speculatively
-            accepted (ds4/eval-speculative-argmax session first-tok 5
-                                                   (ds4/eos-token engine))]
-        (println "\nLow-level speculative:")
-        (println "First token:" first-tok)
-        (println "Accepted tokens:" accepted)
-        (println "Accepted text:" (str/join (map #(ds4/token-text engine %) accepted))))
+      (ds4/load-model! :sms :model-path model-path :backend :metal :ctx-size 512)
+      (let [baseline (eval-sms-model! :sms eval coded?)
+            _ (ds4/load-model-adapter! :sms adapter)
+            fine-tuned (eval-sms-model! :sms eval coded?)]
+        {:adapter adapter
+         :baseline (select-keys baseline [:accuracy :correct :total])
+         :fine-tuned (select-keys fine-tuned [:accuracy :correct :total])
+         :changed-rows (count
+                        (filter true?
+                                (map #(not= (:prediction %1) (:prediction %2))
+                                     (:rows baseline)
+                                     (:rows fine-tuned))))})
       (finally
-        (ds4/tokens-free tokens))))
+        (ds4/unload-all-models!)))))
 
-  (ds4/free-session session)
-  (ds4/close-engine engine)
-  )
+(defn workflow-qwen-velocity!
+  "Measure the multi-steered Metal decode path used by the target CLI command."
+  [& {:keys [n-tokens] :or {n-tokens 220}}]
+  (call-with-multi-steer-engine
+   [{:file safety-steering-path :ffn 2.0}
+    {:file hedging-steering-path :ffn 2.0}]
+   (fn [engine]
+     (call-with-session engine 4096
+       (fn [session]
+         (let [prompt-tokens (ds4/encode-prompt engine nil
+                                                "How to be happy with myself?"
+                                                :none)]
+           (try
+             (ds4/session-sync session prompt-tokens)
+             (let [eos (ds4/eos-token engine)
+                   t0 (System/nanoTime)
+                   generated
+                   (loop [i 0 out []]
+                     (if (>= i n-tokens)
+                       out
+                       (let [token (ds4/session-sample session 0.7 0 1.0 0.05)]
+                         (if (or (= token eos) (< token 0))
+                           out
+                           (do
+                             (ds4/session-eval session token)
+                             (recur (inc i) (conj out token)))))))
+                   seconds (/ (- (System/nanoTime) t0) 1.0e9)]
+               {:tokens (count generated)
+                :seconds seconds
+                :tok-per-s (/ (count generated) seconds)
+                :preview (apply str
+                                (map #(ds4/token-text engine %)
+                                     (take 60 generated)))})
+             (finally
+               (ds4/tokens-free prompt-tokens)))))))))
 
-;; Helper: create a synthetic test adapter (no training needed)
-(defn write-test-adapter [path]
-  (let [rank 8
-        d-model 2048
-        q-output-dim 4096
-        alpha 16.0
-        n-layers 1
-        A (float-array (for [r (range rank) d (range d-model)]
-                         (* 0.01 (- (Math/random) 0.5))))
-        B (float-array (for [d (range q-output-dim) r (range rank)]
-                         (* 0.01 (- (Math/random) 0.5))))]
-    (with-open [out (FileOutputStream. path)]
-      (let [buf (ByteBuffer/allocate 256)]
-        (.order buf ByteOrder/LITTLE_ENDIAN)
-        (.put buf (byte-array (map byte (concat (vec "DS4LORA") [0]))) 0 8)
-        (.putInt buf 1) (.putInt buf rank) (.putFloat buf alpha)
-        (.putInt buf n-layers) (.put buf (byte-array 232) 0 232)
-        (.write out (.array buf) 0 256))
-      (let [buf (ByteBuffer/allocate 16)]
-        (.order buf ByteOrder/LITTLE_ENDIAN)
-        (.putInt buf 0) (.putInt buf 0) (.putInt buf d-model) (.putInt buf q-output-dim)
-        (.write out (.array buf) 0 16))
-      (let [buf (ByteBuffer/allocate (* rank d-model 4))]
-        (.order buf ByteOrder/LITTLE_ENDIAN)
-        (doseq [v A] (.putFloat buf v))
-        (.write out (.array buf) 0 (* rank d-model 4)))
-      (let [buf (ByteBuffer/allocate (* q-output-dim rank 4))]
-        (.order buf ByteOrder/LITTLE_ENDIAN)
-        (doseq [v B] (.putFloat buf v))
-        (.write out (.array buf) 0 (* q-output-dim rank 4))))
-    path))
+(def workflow-registry
+  [{:id :qwen-velocity :group :standard :run workflow-qwen-velocity!}
+   {:id :basic-generation :group :standard :run workflow-basic-generation!}
+   {:id :interactive-iteration :group :standard :run workflow-interactive-iteration!}
+   {:id :activation-capture :group :standard :run workflow-activation-capture!}
+   {:id :directional-steering :group :standard :run workflow-directional-steering!}
+   {:id :logit-lens :group :standard :run workflow-logit-lens!}
+   {:id :cfg :group :standard :run workflow-cfg!}
+   {:id :logit-bias :group :standard :run workflow-logit-bias!}
+   {:id :sae-steering :group :standard :run workflow-sae-steering!}
+   {:id :token-by-token :group :standard :run workflow-token-by-token!}
+   {:id :config-comparison :group :standard :run workflow-config-comparison!}
+   {:id :capture-analysis :group :standard :run workflow-capture-analysis!}
+   {:id :tool-augmented-calculator :group :standard :run workflow-tool-augmented-calculator!}
+   {:id :conformal-certification :group :standard :run workflow-conformal-certification!}
+   {:id :speculative-decoding :group :standard :run workflow-speculative-decoding!}
+   {:id :lora-pipeline :group :standard :run workflow-lora-pipeline!}
+   {:id :named-models :group :slow :run workflow-named-models!}
+   {:id :expert-routing :group :slow :run workflow-expert-routing!}
+   {:id :sms-real-finetune :group :training :run workflow-sms-finetune!}])
 
-;; WORKFLOW 16: LoRA (Low-Rank Adaptation) — Full Pipeline
-;; =============================================================================
-;; Fine-tune the model from the REPL. The adapter is a separate data structure
-;; loaded alongside the base model — both coexist in the same engine.
-;;
-;; Architecture:
-;;   Base model (frozen, ~17GB GGUF)
-;;   + Adapter (trainable, ~10MB)
-;;   = Fine-tuned behavior
-;;
-;; The adapter can be loaded/unloaded at runtime without restarting the engine.
-;; This makes it a first-class data structure you manipulate from the REPL.
-;;
-;; NOTE: Training uses Python/MLX under the hood (gradient computation).
-;;       The REPL orchestrates the pipeline — you never leave Clojure.
-(comment
-  (require '[ds4-clj.core :as ds4])
+(defn run-workflow!
+  "Run one workflow descriptor and return timing, status, and result/error."
+  [{:keys [id group run]}]
+  (println (format "[scratch] running %-28s (%s)" (name id) (name group)))
+  (let [t0 (System/nanoTime)]
+    (try
+      (let [result (run)
+            seconds (/ (- (System/nanoTime) t0) 1.0e9)]
+        (println (format "[scratch] passed  %-28s %.2fs" (name id) seconds))
+        {:id id :group group :status :passed :seconds seconds :result result})
+      (catch Throwable error
+        (let [seconds (/ (- (System/nanoTime) t0) 1.0e9)]
+          (println (format "[scratch] FAILED  %-28s %.2fs: %s"
+                           (name id) seconds (.getMessage error)))
+          {:id id
+           :group group
+           :status :failed
+           :seconds seconds
+           :error (Throwable->map error)})))))
 
-  ;; --- Step 0: Open engine (base model) ---
-  (def engine (ds4/open-engine :model-path "qwen3-coder.gguf"
-                                :backend :metal))
-  (println "Base model loaded. LoRA enabled?" (ds4/lora-enabled? engine))
-  ;; => false
+(defn run-workflows!
+  "Run selected workflow groups and return a summary.
 
-  ;; ===================================================================
-  ;; PATH A: Full REPL-native training (prepare → train → load)
-  ;; ===================================================================
+  Groups are `:standard`, `:slow`, and `:training`."
+  [& {:keys [groups]
+      :or {groups #{:standard}}}]
+  (let [selected (filter #(contains? groups (:group %)) workflow-registry)
+        results (mapv run-workflow! selected)]
+    {:passed (count (filter #(= :passed (:status %)) results))
+     :failed (count (filter #(= :failed (:status %)) results))
+     :results results}))
 
-  ;; --- Step 1: Prepare training data (pure Clojure) ---
-  (def training-data
-    [{:prompt "Write a Clojure function to reverse a list"
-      :response "(defn reverse-list [lst] (into () lst))"}
-     {:prompt "Write a Clojure function for factorial"
-      :response "(defn factorial [n] (if (<= n 1) 1 (* n (factorial (dec n)))))"}
-     {:prompt "Write a Clojure function to filter even numbers"
-      :response "(defn even-numbers [coll] (filter even? coll))"}
-     ;; ... add more examples
-     ])
+(defn run-smoke-workflows!
+  "Run every bounded, non-training workflow."
+  []
+  (run-workflows! :groups #{:standard}))
 
-  (ds4/lora-prepare-data! "/tmp/my_ft_data.jsonl" training-data)
-
-  ;; --- Step 2: Train adapter (REPL calls Python/MLX) ---
-  ;; This returns the path to the converted DS4 adapter
-  (def adapter-path
-    (ds4/lora-train! :data "/tmp/my_ft_data.jsonl"
-                     :output-dir "/tmp/my_adapter"
-                     :model "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
-                     :rank 8
-                     :alpha 16
-                     :iters 50))
-  ;; => "/tmp/my_adapter/ds4_lora.bin"
-
-  ;; --- Step 3: Load adapter into engine (no restart needed) ---
-  (ds4/lora-load! engine adapter-path)
-  (println "Adapter loaded. LoRA enabled?" (ds4/lora-enabled? engine))
-  ;; => true
-
-  ;; ===================================================================
-  ;; PATH B: Quick synthetic test (no training needed)
-  ;; ===================================================================
-
-  ;; Use this to verify the pipeline without waiting for training:
-  ;; (write-test-adapter "/tmp/test_adapter.bin")
-  ;; (ds4/lora-load! engine "/tmp/test_adapter.bin")
-
-  ;; ===================================================================
-  ;; PATH C: One-shot (train + load in one call)
-  ;; ===================================================================
-
-  ;; (ds4/lora-train-and-load! engine
-  ;;   :data "/tmp/my_ft_data.jsonl"
-  ;;   :output-dir "/tmp/my_adapter"
-  ;;   :iters 50)
-
-  ;; ===================================================================
-  ;; INFERENCE: Generate with adapter active
-  ;; ===================================================================
-
-  ;; The adapter is automatically applied on Metal GPU during attention.
-  ;; The base model weights stay frozen — only the adapter deltas are applied.
-  (def session-with (ds4/create-session engine 512))
-  (def text-with (ds4/generate engine session-with
-                                "Write a Clojure function to reverse a list"
-                                {:n-tokens 40 :temperature 0.0}))
-  (println "With adapter:" text-with)
-  (ds4/free-session session-with)
-
-  ;; --- Unload adapter (back to base model) ---
-  (ds4/lora-free! engine)
-  (println "Adapter unloaded. LoRA enabled?" (ds4/lora-enabled? engine))
-  ;; => false
-
-  (def session-without (ds4/create-session engine 512))
-  (def text-without (ds4/generate engine session-without
-                                   "Write a Clojure function to reverse a list"
-                                   {:n-tokens 40 :temperature 0.0}))
-  (println "Without adapter:" text-without)
-  (ds4/free-session session-without)
-
-  ;; --- You can load a DIFFERENT adapter without restarting ---
-  ;; (ds4/lora-load! engine "/tmp/other_adapter/ds4_lora.bin")
-
-  (ds4/close-engine engine)
-  )
+(defn run-all-workflows!
+  "Run standard and slow workflows. Pass `:include-training? true` to also
+  download the UCI dataset and run the real MLX fine-tune."
+  [& {:keys [include-training?]
+      :or {include-training? false}}]
+  (run-workflows! :groups (cond-> #{:standard :slow}
+                            include-training? (conj :training))))

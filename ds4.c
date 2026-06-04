@@ -19591,6 +19591,7 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->lora_initialized) ds4_lora_free(e);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -20147,6 +20148,17 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
+    ds4_engine *prev_lora_engine = g_lora_engine;
+    float prev_lora_scale = g_lora_scale;
+    g_lora_engine = s->engine;
+    g_lora_scale = (s->engine && s->engine->lora_initialized)
+        ? (s->engine->lora_cfg.lora_alpha / s->engine->lora_cfg.rank)
+        : 0.0f;
+#define DS4_SESSION_SYNC_RETURN(rc) do { \
+        g_lora_engine = prev_lora_engine; \
+        g_lora_scale = prev_lora_scale; \
+        return (rc); \
+    } while (0)
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
 
@@ -20184,7 +20196,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             session_note_logits_valid(s);
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
-            return 0;
+            DS4_SESSION_SYNC_RETURN(0);
         }
 
         kv_cache_free(&s->cpu_cache);
@@ -20209,13 +20221,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->mtp_draft_valid = false;
         session_note_logits_valid(s);
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
-        return 0;
+        DS4_SESSION_SYNC_RETURN(0);
     }
 #ifdef DS4_NO_GPU
     (void)s;
     (void)prompt;
     snprintf(err, errlen, "GPU support is not compiled in");
-    return 1;
+    DS4_SESSION_SYNC_RETURN(1);
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
@@ -20236,7 +20248,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                prompt->v[pos], pos, dst_logits)) {
                         snprintf(err, errlen, "%s Qwen decode failed while extending checkpoint", backend_name);
                         s->checkpoint_valid = false;
-                        return 1;
+                        DS4_SESSION_SYNC_RETURN(1);
                     }
                     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", (int)(pos + 1u), prompt->len);
                 }
@@ -20245,7 +20257,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                   s->progress, s->progress_ud)) {
                 snprintf(err, errlen, "%s Qwen prefill failed while extending checkpoint", backend_name);
                 s->checkpoint_valid = false;
-                return 1;
+                DS4_SESSION_SYNC_RETURN(1);
             }
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
@@ -20256,10 +20268,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         } else if (!s->logits_valid && !s->cached_argmax_valid &&
                    session_materialize_logits(s, err, errlen) != 0) {
             s->checkpoint_valid = false;
-            return 1;
+            DS4_SESSION_SYNC_RETURN(1);
         }
         if (n == 0 && s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
-        return 0;
+        DS4_SESSION_SYNC_RETURN(0);
     }
 
     metal_graph_free(&s->graph);
@@ -20273,7 +20285,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                e->steering_ffn_scales)) {
         snprintf(err, errlen, "%s Qwen graph rebuild failed", backend_name);
         s->checkpoint_valid = false;
-        return 1;
+        DS4_SESSION_SYNC_RETURN(1);
     }
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
@@ -20299,14 +20311,15 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                    s->progress, s->progress_ud)) {
         snprintf(err, errlen, "%s Qwen prefill failed", backend_name);
         s->checkpoint_valid = false;
-        return 1;
+        DS4_SESSION_SYNC_RETURN(1);
     }
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     session_note_logits_valid(s);
-    return 0;
+    DS4_SESSION_SYNC_RETURN(0);
 #endif
+#undef DS4_SESSION_SYNC_RETURN
 }
 
 /* Return true when canonicalization would replace already-sampled tokens.
