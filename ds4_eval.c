@@ -1487,7 +1487,7 @@ static void usage(FILE *fp) {
         "p pauses or resumes evaluation, and q exits with a report.\n"
         "\n"
         "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "  -m, --model FILE       GGUF model path. Default: qwen3-coder.gguf\n"
         "  --mtp FILE             Optional MTP support GGUF.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -1524,7 +1524,7 @@ static void usage(FILE *fp) {
 
 static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "qwen3-coder.gguf",
         .backend = default_backend(),
         .max_tokens = 16000,
         .top_p = DS4_DEFAULT_TOP_P,

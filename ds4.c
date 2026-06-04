@@ -9039,6 +9039,7 @@ typedef struct {
     ds4_gpu_tensor *shared_up;
     ds4_gpu_tensor *shared_mid;
     ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *router_cache;
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
@@ -9256,6 +9257,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->shared_mid);
     ds4_gpu_tensor_free(g->shared_up);
     ds4_gpu_tensor_free(g->shared_gate);
+    ds4_gpu_tensor_free(g->router_cache);
     ds4_gpu_tensor_free(g->ffn_norm);
     ds4_gpu_tensor_free(g->ffn_cur);
     ds4_gpu_tensor_free(g->after_attn_hc);
@@ -9518,6 +9520,7 @@ static bool metal_graph_apply_directional_steering_ffn(
 
 static bool qwen_graph_alloc(
         ds4_gpu_graph *g,
+        const ds4_model *model,
         const ds4_weights *weights,
         uint32_t ctx_size,
         uint32_t prefill_cap) {
@@ -9557,6 +9560,33 @@ static bool qwen_graph_alloc(
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->top_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
 
+    const uint64_t router_layer_elems = (uint64_t)DS4_N_EMBD * DS4_N_EXPERT;
+    const uint64_t router_layer_bytes = router_layer_elems * sizeof(float);
+    const uint64_t router_cache_elems = (uint64_t)DS4_N_LAYER * router_layer_elems;
+    g->router_cache = ds4_gpu_tensor_alloc_private(router_cache_elems * sizeof(float));
+    bool router_cache_ok = g->router_cache != NULL;
+    float *router_cache = router_cache_ok
+        ? xmalloc((size_t)router_cache_elems * sizeof(router_cache[0]))
+        : NULL;
+    for (uint32_t il = 0; router_cache_ok && il < DS4_N_LAYER; il++) {
+        const ds4_tensor *router = weights->layer[il].ffn_gate_inp;
+        router_cache_ok = router && router->type == DS4_TENSOR_F32 &&
+                          router->dim[0] == DS4_N_EMBD &&
+                          router->dim[1] == DS4_N_EXPERT;
+        if (!router_cache_ok) break;
+        const float *src = tensor_data(model, router);
+        float *dst = router_cache + (uint64_t)il * router_layer_elems;
+        memcpy(dst, src, (size_t)router_layer_bytes);
+    }
+    if (router_cache_ok) {
+        router_cache_ok = ds4_gpu_tensor_write(
+                g->router_cache,
+                0,
+                router_cache,
+                (uint64_t)DS4_N_LAYER * router_layer_bytes) != 0;
+    }
+    free(router_cache);
+
     g->prefill_tokens = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EMBD * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc((uint64_t)prefill_cap * DS4_N_EMBD * sizeof(float));
@@ -9585,7 +9615,7 @@ static bool qwen_graph_alloc(
         cache_ok = cache_ok && g->layer_raw_cache[il] && g->layer_v_cache[il];
     }
 
-    const bool ok = cache_ok &&
+    const bool ok = cache_ok && router_cache_ok &&
                     g->cur_hc && g->after_ffn_hc &&
                     g->attn_norm && g->q && g->kv_raw && g->kv &&
                     g->rope_cos && g->rope_sin &&
@@ -9787,6 +9817,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
  * weights are not copied here; tensors reference the mapped GGUF. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
+        const ds4_model       *model,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer,
         uint32_t                raw_cap,
@@ -9797,15 +9828,16 @@ static bool metal_graph_alloc_raw_cap(
     g->mtp_enabled = enable_mtp;
     (void)layer;
     (void)enable_mtp;
-    return qwen_graph_alloc(g, weights, ctx_size ? ctx_size : raw_cap, prefill_cap);
+    return qwen_graph_alloc(g, model, weights, ctx_size ? ctx_size : raw_cap, prefill_cap);
 
 }
 
 static bool metal_graph_alloc(
         ds4_gpu_graph *g,
+        const ds4_model       *model,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, model, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -11230,7 +11262,7 @@ static uint32_t qwen_token_split_after_layers(void) {
     static int initialized;
     static uint32_t split_after_layers;
     if (!initialized) {
-        split_after_layers = 3u;
+        split_after_layers = 0u;
         const char *split_env = getenv("DS4_QWEN_TOKEN_SPLIT_LAYERS");
         if (split_env && split_env[0]) {
             char *end = NULL;
@@ -11253,7 +11285,6 @@ static bool qwen_graph_encode_token(
         bool need_logits) {
     if (!g || !model || !weights || pos >= g->raw_cap) return false;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const bool qwen_stage_profile = qwen_token_stage_profile_enabled();
     const char *qwen_stage_filter = qwen_stage_profile ? getenv("DS4_QWEN_TOKEN_STAGE_PROFILE_FILTER") : NULL;
     double qwen_stage_t0 = qwen_stage_profile ? now_sec() : 0.0;
@@ -11306,12 +11337,17 @@ static bool qwen_graph_encode_token(
                                                 DS4_RMS_EPS) != 0;
         }
         attn_norm_ready = false;
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->q, model, layer->attn_q_a,
-                                                     DS4_N_EMBD, q_dim, g->attn_norm, 1);
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->kv_raw, model, layer->attn_q_b,
-                                                     DS4_N_EMBD, kv_dim, g->attn_norm, 1);
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->kv, model, layer->attn_kv,
-                                                     DS4_N_EMBD, kv_dim, g->attn_norm, 1);
+        if (ok) ok = ds4_gpu_qwen_qkv_q4_tensor(
+                g->q,
+                g->kv_raw,
+                g->kv,
+                model->map,
+                model->size,
+                layer->attn_q_a->abs_offset,
+                layer->attn_q_b->abs_offset,
+                layer->attn_kv->abs_offset,
+                layer->attn_kv->type,
+                g->attn_norm) != 0;
         /* Apply LoRA immediately after Q/K/V projection so Q/K normalization,
          * rope, and KV cache storage all see the adapted tensors. */
         if (ok && g_lora_scale != 0.0f) {
@@ -11389,8 +11425,11 @@ static bool qwen_graph_encode_token(
         if (ok) metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
         DS4_PROFILE_QWEN_TOKEN_STAGE((int)il, "attention_out");
 
-        if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
-                                                     DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
+        if (ok) ok = ds4_gpu_qwen_router_cached_tensor(
+                g->router_logits,
+                g->router_cache,
+                (uint64_t)il * DS4_N_EMBD * DS4_N_EXPERT * sizeof(float),
+                g->ffn_norm) != 0;
         if (ok) ok = ds4_gpu_qwen_router_select_tensor(g->router_selected,
                                                        g->router_weights,
                                                        g->router_probs,
@@ -11713,7 +11752,8 @@ static bool qwen_graph_encode_layer_batch(
                                                     pos0,
                                                     n_tokens,
                                                     g->raw_cap,
-                                                    (uint32_t)kv_dim) != 0;
+                                                    (uint32_t)kv_dim,
+                                                    DS4_N_HEAD_DIM) != 0;
     }
     if (ok) { stage = "attention"; ok = ds4_gpu_qwen_attention_batch_tensor(g->batch_heads,
                                                      g->batch_q,
@@ -12321,7 +12361,7 @@ static int metal_graph_decode_test(
     output_logits_one(cpu_logits, model, weights, cpu_after_ffn_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, layer);
+    bool ok = metal_graph_alloc(&g, model, weights, layer);
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
@@ -12469,7 +12509,7 @@ static int metal_graph_first_token_full_test(
     output_logits_one(cpu_logits, model, weights, cpu_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
+    bool ok = metal_graph_alloc(&g, model, weights, &weights->layer[0]);
     const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
@@ -15791,7 +15831,7 @@ static int metal_graph_prompt_logits_test(
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, (uint32_t)n_test);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
     if (!ok) {
         metal_graph_free(&g);
@@ -17190,14 +17230,10 @@ static int sample_full_vocab_finite_min_p(
         float        temperature,
         float        min_p,
         uint64_t    *rng) {
-    float max_logit = DS4_NEG_INF;
-    int best = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
+    float max_logit = logits[0];
+    for (uint32_t i = 1; i < n_vocab; i++) {
         const float v = logits[i];
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
+        if (v > max_logit) max_logit = v;
     }
 
     enum { DS4_SAMPLE_STACK_CAND = 4096 };
@@ -17241,7 +17277,7 @@ static int sample_full_vocab_finite_min_p(
             free(ids);
             free(probs);
         }
-        return best;
+        return sample_argmax(logits, n_vocab);
     }
     float r = sample_rng_f32(rng) * sum;
     for (uint32_t i = 0; i < n; i++) {
@@ -17259,7 +17295,7 @@ static int sample_full_vocab_finite_min_p(
         free(ids);
         free(probs);
     }
-    return best;
+    return sample_argmax(logits, n_vocab);
 }
 
 static int sample_top_p_min_p(
@@ -17499,7 +17535,7 @@ static int generate_metal_graph_raw_swa(
                 prompt->len);
     }
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
@@ -19042,7 +19078,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
@@ -19611,7 +19647,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     /* Always init cpu_cache — needed for LoRA fallback and other CPU paths */
     kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
+    if (!metal_graph_alloc_raw_cap(&s->graph, &e->model, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
     {
         free(s);
@@ -20228,7 +20264,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 
     metal_graph_free(&s->graph);
     const uint32_t raw_cap = (uint32_t)s->ctx_size;
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
+    if (!metal_graph_alloc_raw_cap(&s->graph, &e->model, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)s->ctx_size, s->prefill_cap, false) ||
         !metal_graph_load_directional_steering(&s->graph,
                                                e->n_steering_vectors,

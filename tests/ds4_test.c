@@ -10,18 +10,17 @@ static ds4_engine *test_engine_quality;
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("DS4_TEST_MODEL");
-    return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
+    return (model_path && model_path[0])
+        ? model_path
+        : "gguf/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf";
 }
 
 /* Return true if the loaded model is the one the reference vectors and
  * long-context fixtures were generated for (DeepSeek V4 Flash).
- * When DS4_TEST_MODEL is not set or points at the default, we assume
- * the standard reference model.  If the user overrides it with a different
- * model (e.g. Qwen3-Coder) the model-specific tests are skipped gracefully. */
+ * The Qwen-only default skips those legacy fixture tests gracefully. */
 static bool test_is_reference_model(void) {
     const char *model = test_model_path();
-    if (!model || !model[0]) return true;
-    /* Default path or anything containing "ds4flash" or "deepseek" */
+    if (!model || !model[0]) return false;
     if (strstr(model, "ds4flash")) return true;
     if (strstr(model, "deepseek")) return true;
     return false;
@@ -2535,7 +2534,7 @@ static void test_print_help(const char *prog) {
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  DS4_TEST_MODEL=FILE        Qwen3-Coder GGUF path.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");

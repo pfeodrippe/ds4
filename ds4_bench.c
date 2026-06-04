@@ -64,7 +64,7 @@ static void usage(FILE *fp) {
         "      System prompt used only with --chat-prompt-file.\n"
         "\n"
         "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "  -m, --model FILE       GGUF model path. Default: qwen3-coder.gguf\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -175,7 +175,7 @@ static char *read_file(const char *path) {
 
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "qwen3-coder.gguf",
         .system = "You are a helpful assistant.",
         .backend = default_backend(),
         .ctx_start = 2048,

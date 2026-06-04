@@ -143,6 +143,7 @@ struct ds4_metal_args_qwen_store_kv {
     uint32_t row;
     uint32_t cap;
     uint32_t kv_dim;
+    uint32_t head_dim;
 };
 
 struct ds4_metal_args_qwen_store_kv_batch {
@@ -150,15 +151,7 @@ struct ds4_metal_args_qwen_store_kv_batch {
     uint32_t n_tokens;
     uint32_t cap;
     uint32_t kv_dim;
-};
-
-struct ds4_metal_args_qwen_attention {
-    uint32_t n_ctx;
-    uint32_t cap;
-    uint32_t n_head;
-    uint32_t n_head_kv;
     uint32_t head_dim;
-    float    scale;
 };
 
 struct ds4_metal_args_qwen_attention_batch {
@@ -264,7 +257,7 @@ kernel void kernel_qwen_norm_rope_store_kv_f32(
     if (head >= args.n_head || args.head_dim == 0 || (args.head_dim & 1u) != 0 || args.row >= args.cap) return;
     device const float *krow = k + (uint64_t)head * args.head_dim;
     device const float *vrow = v + (uint64_t)head * args.head_dim;
-    const uint64_t cache_base = ((uint64_t)args.row * args.n_head + head) * args.head_dim;
+    const uint64_t cache_base = ((uint64_t)head * args.cap + args.row) * args.head_dim;
 
     float ss = 0.0f;
     for (uint i = tid; i < args.head_dim; i += nth) ss += krow[i] * krow[i];
@@ -338,7 +331,7 @@ kernel void kernel_qwen_norm_rope_weight_store_kv_f32(
     if (head >= args.n_kv_head) return;
     device const float *krow = k + (uint64_t)head * args.head_dim;
     device const float *vrow = v + (uint64_t)head * args.head_dim;
-    const uint64_t cache_base = ((uint64_t)args.row * args.n_kv_head + head) * args.head_dim;
+    const uint64_t cache_base = ((uint64_t)head * args.cap + args.row) * args.head_dim;
 
     float ss = 0.0f;
     for (uint i = tid; i < args.head_dim; i += nth) ss += krow[i] * krow[i];
@@ -373,7 +366,9 @@ kernel void kernel_qwen_store_kv_f32(
         device const float *v,
         uint tid [[thread_position_in_grid]]) {
     if (tid >= args.kv_dim || args.row >= args.cap) return;
-    const uint64_t off = (uint64_t)args.row * args.kv_dim + tid;
+    const uint head = tid / args.head_dim;
+    const uint d = tid - head * args.head_dim;
+    const uint64_t off = ((uint64_t)head * args.cap + args.row) * args.head_dim + d;
     k_cache[off] = half(k[tid]);
     v_cache[off] = half(v[tid]);
 }
@@ -391,125 +386,11 @@ kernel void kernel_qwen_store_kv_batch_f32(
     const uint d = tid - tok * args.kv_dim;
     const uint row = args.pos0 + tok;
     if (row >= args.cap) return;
-    const uint64_t off = (uint64_t)row * args.kv_dim + d;
+    const uint head = d / args.head_dim;
+    const uint hd = d - head * args.head_dim;
+    const uint64_t off = ((uint64_t)head * args.cap + row) * args.head_dim + hd;
     k_cache[off] = half(k[tid]);
     v_cache[off] = half(v[tid]);
-}
-
-kernel void kernel_qwen_attention_f32_reduce(
-        constant ds4_metal_args_qwen_attention &args,
-        device float *heads,
-        device const float *q,
-        device const half *k_cache,
-        device const half *v_cache,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint head [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint nth [[threads_per_threadgroup]]) {
-    if (head >= args.n_head || args.n_ctx == 0 || args.n_ctx > args.cap) return;
-    const uint kv_group = args.n_head / args.n_head_kv;
-    const uint kh = head / kv_group;
-    device const float *qh = q + (uint64_t)head * args.head_dim;
-    float m = -INFINITY;
-    for (uint p = tid; p < args.n_ctx; p += nth) {
-        device const half *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
-                               (uint64_t)kh * args.head_dim;
-        float s = qwen_dot_f32_h16(qh, kp, args.head_dim);
-        m = max(m, s * args.scale);
-    }
-    scratch[tid] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1; step > 0; step >>= 1) {
-        if (tid < step) scratch[tid] = max(scratch[tid], scratch[tid + step]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float max_score = scratch[0];
-    for (uint d = 0; d < args.head_dim; d++) {
-        float sum = 0.0f;
-        float acc = 0.0f;
-        for (uint p = tid; p < args.n_ctx; p += nth) {
-            device const half *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
-                                   (uint64_t)kh * args.head_dim;
-            float s = qwen_dot_f32_h16(qh, kp, args.head_dim);
-            const float a = exp(s * args.scale - max_score);
-            sum += a;
-            acc += a * float(v_cache[(uint64_t)p * args.n_head_kv * args.head_dim +
-                                      (uint64_t)kh * args.head_dim + d]);
-        }
-        scratch[tid] = sum;
-        scratch[nth + tid] = acc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint step = nth >> 1; step > 0; step >>= 1) {
-            if (tid < step) {
-                scratch[tid] += scratch[tid + step];
-                scratch[nth + tid] += scratch[nth + tid + step];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tid == 0) {
-            const float denom = max(scratch[0], 1.0e-20f);
-            heads[(uint64_t)head * args.head_dim + d] = scratch[nth] / denom;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-kernel void kernel_qwen_attention_f32_cached(
-        constant ds4_metal_args_qwen_attention &args,
-        device float *heads,
-        device const float *q,
-        device const half *k_cache,
-        device const half *v_cache,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint head [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint nth [[threads_per_threadgroup]]) {
-    if (head >= args.n_head || args.n_ctx == 0 || args.n_ctx > args.cap) return;
-    const uint kv_group = args.n_head / args.n_head_kv;
-    const uint kh = head / kv_group;
-    device const float *qh = q + (uint64_t)head * args.head_dim;
-    threadgroup float *scores = scratch;
-    threadgroup float *reduce = scratch + args.n_ctx;
-
-    float m = -INFINITY;
-    for (uint p = tid; p < args.n_ctx; p += nth) {
-        device const half *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
-                               (uint64_t)kh * args.head_dim;
-        float s = qwen_dot_f32_h16(qh, kp, args.head_dim);
-        s *= args.scale;
-        scores[p] = s;
-        m = max(m, s);
-    }
-    reduce[tid] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1; step > 0; step >>= 1) {
-        if (tid < step) reduce[tid] = max(reduce[tid], reduce[tid + step]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float max_score = reduce[0];
-
-    float denom_part = 0.0f;
-    for (uint p = tid; p < args.n_ctx; p += nth) {
-        const float a = exp(scores[p] - max_score);
-        scores[p] = a;
-        denom_part += a;
-    }
-    reduce[tid] = denom_part;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1; step > 0; step >>= 1) {
-        if (tid < step) reduce[tid] += reduce[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float denom = max(reduce[0], 1.0e-20f);
-
-    for (uint d = tid; d < args.head_dim; d += nth) {
-        float acc = 0.0f;
-        for (uint p = 0; p < args.n_ctx; p++) {
-            acc += scores[p] * float(v_cache[(uint64_t)p * args.n_head_kv * args.head_dim +
-                                              (uint64_t)kh * args.head_dim + d]);
-        }
-        heads[(uint64_t)head * args.head_dim + d] = acc / denom;
-    }
 }
 
 kernel void kernel_qwen_attention_batch_f32_reduce(
@@ -534,8 +415,7 @@ kernel void kernel_qwen_attention_batch_f32_reduce(
     device const float *qh = q + ((uint64_t)tok * args.n_head + head) * args.head_dim;
     float m = -INFINITY;
     for (uint p = tid; p < n_ctx; p += nth) {
-        device const half *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
-                               (uint64_t)kh * args.head_dim;
+        device const half *kp = k_cache + ((uint64_t)kh * args.cap + p) * args.head_dim;
         float s = qwen_dot_f32_h16(qh, kp, args.head_dim);
         m = max(m, s * args.scale);
     }
@@ -550,13 +430,11 @@ kernel void kernel_qwen_attention_batch_f32_reduce(
         float sum = 0.0f;
         float acc = 0.0f;
         for (uint p = tid; p < n_ctx; p += nth) {
-            device const half *kp = k_cache + (uint64_t)p * args.n_head_kv * args.head_dim +
-                                   (uint64_t)kh * args.head_dim;
+            device const half *kp = k_cache + ((uint64_t)kh * args.cap + p) * args.head_dim;
             float s = qwen_dot_f32_h16(qh, kp, args.head_dim);
             const float a = exp(s * args.scale - max_score);
             sum += a;
-            acc += a * float(v_cache[(uint64_t)p * args.n_head_kv * args.head_dim +
-                                      (uint64_t)kh * args.head_dim + d]);
+            acc += a * float(v_cache[((uint64_t)kh * args.cap + p) * args.head_dim + d]);
         }
         scratch[tid] = sum;
         scratch[nth + tid] = acc;

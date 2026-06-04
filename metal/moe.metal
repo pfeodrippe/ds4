@@ -2,7 +2,7 @@
 
 #define QK_K 256
 #define N_R0_Q2_K 4
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K 1
 #define N_R0_Q6_K 2
 #define N_R0_IQ2_XXS 4
 
@@ -1008,6 +1008,84 @@ kernel void kernel_mul_mv_q4_K_f32(
             args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+template<bool v_q6>
+void kernel_qwen_qkv_q4_K_impl(
+        constant ds4_metal_args_mul_mv &q_args,
+        constant ds4_metal_args_mul_mv &k_args,
+        constant ds4_metal_args_mul_mv &v_args,
+        device const char *q_weights,
+        device const char *k_weights,
+        device const char *v_weights,
+        device const char *src,
+        device char *q_dst,
+        device char *k_dst,
+        device char *v_dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint rows_per_group = N_R0_Q4_K * FC_mul_mv_nsg;
+    const uint q_groups = (q_args.ne01 + rows_per_group - 1) / rows_per_group;
+    const uint k_groups = (k_args.ne01 + rows_per_group - 1) / rows_per_group;
+
+    if (tgpig.x < q_groups) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ds4_metal_args_mul_mv &>(
+                q_args, q_weights, src, q_dst, nullptr, tgpig, tiisg, sgitg);
+    } else if (tgpig.x < q_groups + k_groups) {
+        tgpig.x -= q_groups;
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ds4_metal_args_mul_mv &>(
+                k_args, k_weights, src, k_dst, nullptr, tgpig, tiisg, sgitg);
+    } else {
+        tgpig.x -= q_groups + k_groups;
+        if (v_q6) {
+            kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ds4_metal_args_mul_mv &>(
+                    v_args, v_weights, src, v_dst, nullptr, tgpig, tiisg, sgitg);
+        } else {
+            kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ds4_metal_args_mul_mv &>(
+                    v_args, v_weights, src, v_dst, nullptr, tgpig, tiisg, sgitg);
+        }
+    }
+}
+
+[[host_name("kernel_qwen_qkv_q4_q4_f32")]]
+kernel void kernel_qwen_qkv_q4_q4_f32(
+        constant ds4_metal_args_mul_mv &q_args,
+        constant ds4_metal_args_mul_mv &k_args,
+        constant ds4_metal_args_mul_mv &v_args,
+        device const char *q_weights,
+        device const char *k_weights,
+        device const char *v_weights,
+        device const char *src,
+        device char *q_dst,
+        device char *k_dst,
+        device char *v_dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_qwen_qkv_q4_K_impl<false>(
+            q_args, k_args, v_args, q_weights, k_weights, v_weights,
+            src, q_dst, k_dst, v_dst, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_qwen_qkv_q4_q6_f32")]]
+kernel void kernel_qwen_qkv_q4_q6_f32(
+        constant ds4_metal_args_mul_mv &q_args,
+        constant ds4_metal_args_mul_mv &k_args,
+        constant ds4_metal_args_mul_mv &v_args,
+        device const char *q_weights,
+        device const char *k_weights,
+        device const char *v_weights,
+        device const char *src,
+        device char *q_dst,
+        device char *k_dst,
+        device char *v_dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_qwen_qkv_q4_K_impl<true>(
+            q_args, k_args, v_args, q_weights, k_weights, v_weights,
+            src, q_dst, k_dst, v_dst, tgpig, tiisg, sgitg);
+}
+
 [[host_name("kernel_mul_mv_q6_K_f32")]]
 kernel void kernel_mul_mv_q6_K_f32(
         constant ds4_metal_args_mul_mv &args,
@@ -1868,22 +1946,24 @@ kernel void kernel_mul_mv_id_q4_K_sum8_f32(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short nr0 = 4;
+    const short nr0 = 1;
     const int nb = args.ne00 / QK_K;
     const int first_row = tgpig.x * nr0;
     const uint token = tgpig.y;
     device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
     device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
-    const int expert_slot = sgitg;
 
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-    const short ix = tiisg / 8;
+    const short lane_octet = tiisg / 8;
     const short it = tiisg % 8;
     const short iq = it / 4;
     const short ir = it % 4;
+    const int task = (sgitg % 3) * 4 + lane_octet;
+    const int expert_slot = (sgitg / 3) * 4 + task / 3;
+    const int block = task % 3;
 
     float sumf[nr0] = {0.f};
     uint16_t sc16[4];
@@ -1893,9 +1973,10 @@ kernel void kernel_mul_mv_id_q4_K_sum8_f32(
     device const block_q4_K *x =
         (device const block_q4_K *)(src0s + expert * args.nb02 + first_row * args.nb01);
     device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
-    device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+    device const float *y4 = y + block * QK_K + 64 * iq + 8 * ir;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    if (block < nb) {
+        const int ib = block;
         float yl[16];
         float yh[16];
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
@@ -1944,18 +2025,20 @@ kernel void kernel_mul_mv_id_q4_K_sum8_f32(
             sc += args.nb01 / 2;
             dh += args.nb01 / 2;
         }
-
-        y4 += 4 * QK_K;
     }
 
     threadgroup float *partials = (threadgroup float *)shmem;
     float reduced[nr0];
     for (int row = 0; row < nr0; row++) {
-        reduced[row] = simd_sum(sumf[row]);
+        float v = sumf[row];
+        v += simd_shuffle_xor(v, 1);
+        v += simd_shuffle_xor(v, 2);
+        v += simd_shuffle_xor(v, 4);
+        reduced[row] = v;
     }
-    if (tiisg == 0) {
+    if (it == 0) {
         for (int row = 0; row < nr0; row++) {
-            partials[expert_slot * nr0 + row] = reduced[row];
+            partials[(expert_slot * 3 + block) * nr0 + row] = reduced[row];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1964,7 +2047,8 @@ kernel void kernel_mul_mv_id_q4_K_sum8_f32(
     if (sgitg == 0 && tiisg < nr0) {
         float total = 0.0f;
         for (int expert = 0; expert < 8; expert++) {
-            total += partials[expert * nr0 + tiisg];
+            const int base = expert * 3 * nr0 + tiisg;
+            total += partials[base] + partials[base + nr0] + partials[base + 2 * nr0];
         }
         dst_f32[first_row + tiisg] = total;
     }
@@ -1984,7 +2068,7 @@ kernel void kernel_mul_mv_id_q6_K_sum8_f32(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short nr0 = 4;
+    const short nr0 = 1;
     constexpr uint8_t kmask1 = 0x03;
     constexpr uint8_t kmask2 = 0x0C;
     constexpr uint8_t kmask3 = 0x30;
@@ -1995,10 +2079,11 @@ kernel void kernel_mul_mv_id_q6_K_sum8_f32(
     const uint token = tgpig.y;
     device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
     device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
-    const int expert_slot = sgitg;
+    const int expert_pair = sgitg / 3;
+    const int block = sgitg - expert_pair * 3;
+    const int expert_slot = expert_pair * 2 + (tiisg & 1);
 
     const short tid = tiisg / 2;
-    const short ix = tiisg % 2;
     const short ip = tid / 8;
     const short il = tid % 8;
     const short l0 = 4 * il;
@@ -2016,7 +2101,8 @@ kernel void kernel_mul_mv_id_q6_K_sum8_f32(
         (device const block_q6_K *)(src0s + expert * args.nb02 + first_row * args.nb01);
     device const float *yy = (device const float *)(token_src1 + expert_slot * args.nb11);
 
-    for (int i = ix; i < nb; i += 2) {
+    if (block < nb) {
+        const int i = block;
         device const uint8_t *q1 = x[i].ql + q_offset_l;
         device const uint8_t *q2 = q1 + 32;
         device const uint8_t *qh = x[i].qh + q_offset_h;
@@ -2053,11 +2139,16 @@ kernel void kernel_mul_mv_id_q6_K_sum8_f32(
     threadgroup float *partials = (threadgroup float *)shmem;
     float reduced[nr0];
     for (int row = 0; row < nr0; row++) {
-        reduced[row] = simd_sum(sumf[row]);
+        float v = sumf[row];
+        v += simd_shuffle_xor(v, 2);
+        v += simd_shuffle_xor(v, 4);
+        v += simd_shuffle_xor(v, 8);
+        v += simd_shuffle_xor(v, 16);
+        reduced[row] = v;
     }
-    if (tiisg == 0) {
+    if (tiisg < 2) {
         for (int row = 0; row < nr0; row++) {
-            partials[expert_slot * nr0 + row] = reduced[row];
+            partials[(expert_slot * 3 + block) * nr0 + row] = reduced[row];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2066,7 +2157,8 @@ kernel void kernel_mul_mv_id_q6_K_sum8_f32(
     if (sgitg == 0 && tiisg < nr0) {
         float total = 0.0f;
         for (int expert = 0; expert < 8; expert++) {
-            total += partials[expert * nr0 + tiisg];
+            const int base = expert * 3 * nr0 + tiisg;
+            total += partials[base] + partials[base + nr0] + partials[base + 2 * nr0];
         }
         dst_f32[first_row + tiisg] = total;
     }

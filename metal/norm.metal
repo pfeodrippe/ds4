@@ -185,6 +185,7 @@ kernel void kernel_add_project2_rms_norm_mul_f32_4(
     float sumf = 0.0f;
     for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
         const float4 v = base[i] + add[i] - coeff0 * dir0[i] - coeff1 * dir1[i];
+        sum_out[i] = v;
         sumf += dot(v, v);
     }
     sumf = simd_sum(sumf);
@@ -196,9 +197,7 @@ kernel void kernel_add_project2_rms_norm_mul_f32_4(
     sumf = simd_sum(sum_s[tiisg]);
     const float norm_scale = rsqrt(sumf / args.ne00 + args.eps);
     for (int i = tpitg.x; i < args.ne00_t; i += ntg.x) {
-        const float4 v = base[i] + add[i] - coeff0 * dir0[i] - coeff1 * dir1[i];
-        sum_out[i] = v;
-        norm_out[i] = v * norm_scale * weight[i];
+        norm_out[i] = sum_out[i] * norm_scale * weight[i];
     }
 }
 

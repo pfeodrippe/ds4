@@ -168,6 +168,12 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_qwen_router_cached_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *router_weights,
+        uint64_t                weight_offset,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
@@ -198,6 +204,18 @@ int ds4_gpu_matmul_k_tensor(
         uint32_t                tensor_type,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_qwen_qkv_q4_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                q_weight_offset,
+        uint64_t                k_weight_offset,
+        uint64_t                v_weight_offset,
+        uint32_t                v_tensor_type,
         const ds4_gpu_tensor *x);
 
 int ds4_gpu_matmul_k_argmax_tensor(
@@ -393,7 +411,8 @@ int ds4_gpu_qwen_store_kv_tensor(
         const ds4_gpu_tensor *v,
         uint32_t                row,
         uint32_t                cap,
-        uint32_t                kv_dim);
+        uint32_t                kv_dim,
+        uint32_t                head_dim);
 
 int ds4_gpu_qwen_store_kv_batch_tensor(
         ds4_gpu_tensor       *k_cache,
@@ -403,7 +422,8 @@ int ds4_gpu_qwen_store_kv_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         uint32_t                cap,
-        uint32_t                kv_dim);
+        uint32_t                kv_dim,
+        uint32_t                head_dim);
 
 int ds4_gpu_qwen_attention_tensor(
         ds4_gpu_tensor       *heads,
